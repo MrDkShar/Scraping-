@@ -16,11 +16,11 @@ from telebot.apihelper import ApiTelegramException
 # =========================================================
 # Configuration & Constants
 # =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8897758284:AAEOMrvaRfpjZmzcc91xkPnKr2nSOIQyUAA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 ADMIN_IDS = [
     int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "8753914631").split(",")
+    for x in os.environ.get("ADMIN_IDS", "123456789").split(",")
     if x.strip().isdigit()
 ]
 
@@ -30,6 +30,46 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 # Maintenance Mode (Admin can toggle ON/OFF)
 # =========================================================
 MAINTENANCE_MODE = False  # False = Bot active for all | True = Only admins can use
+
+# =========================================================
+# Proxy List (Rotating — used in With Proxy mode)
+# =========================================================
+PROXY_LIST = [
+    # Batch 1/5
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "ajU2MF6Ikj60_custom_zone_IN_st__city_sid_93300836_time_5",  "pass": "4977965"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "PaLh9cYLpA90_custom_zone_IN_st__city_sid_22770111_time_5",  "pass": "4977968"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "0G6DVvl50S40_custom_zone_IN_st__city_sid_12505227_time_5",  "pass": "4977972"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "UE2ig9iMXs10_custom_zone_IN_st__city_sid_59078548_time_5",  "pass": "4977974"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "sPpWHM9Tg540_custom_zone_IN_st__city_sid_30450690_time_5",  "pass": "4977983"},
+    # Batch 2/10
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "pebooWgHxv90_custom_zone_IN_st__city_sid_88761836_time_5",  "pass": "4977991"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "GIcnSVrFhK70_custom_zone_IN_st__city_sid_00424286_time_5",  "pass": "4977994"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "dqlSXBDbHV00_custom_zone_IN_st__city_sid_20960218_time_5",  "pass": "4978006"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "FcPEjOrZOv60_custom_zone_IN_st__city_sid_80005378_time_5",  "pass": "4978011"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "BIqvZSSZDt00_custom_zone_IN_st__city_sid_34537474_time_5",  "pass": "4978022"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "FJ9LIt6CC420_custom_zone_IN_st__city_sid_34981499_time_5",  "pass": "4978024"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "RD6lrZVHNZ20_custom_zone_IN_st__city_sid_94818226_time_5",  "pass": "4978026"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "psSd9woUXfA0_custom_zone_IN_st__city_sid_25741592_time_5",  "pass": "4978040"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "WSNBiFPYUk30_custom_zone_IN_st__city_sid_70400970_time_5",  "pass": "4978041"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "TByoEbSZUr60_custom_zone_IN_st__city_sid_89177696_time_5",  "pass": "4978052"},
+    # Batch 3/5
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "PgTVYMmNkfA0_custom_zone_IN_st__city_sid_97733468_time_5",  "pass": "4978056"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "FcYiPxQwMN40_custom_zone_IN_st__city_sid_95143370_time_5",  "pass": "4978069"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "drlsCv3yNK60_custom_zone_IN_st__city_sid_30589365_time_5",  "pass": "4978074"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "Nwlmr9e3XT00_custom_zone_IN_st__city_sid_27593950_time_5",  "pass": "4978083"},
+    {"host": "change4.owlproxy.com", "port": 7778, "user": "eenpbtufpN70_custom_zone_IN_st__city_sid_68883008_time_5",  "pass": "4978098"},
+]
+_proxy_index = 0
+_proxy_lock = threading.Lock()
+
+
+def get_next_proxy() -> dict:
+    """Returns next proxy in round-robin rotation."""
+    global _proxy_index
+    with _proxy_lock:
+        proxy = PROXY_LIST[_proxy_index % len(PROXY_LIST)]
+        _proxy_index += 1
+    return proxy
 
 # user_id -> {"url": str, "awaiting_url": bool, "awaiting_broadcast": bool}
 user_states: dict = {}
@@ -398,18 +438,45 @@ def extract_numbers_from_text(text: str) -> set[str]:
 # Intelligent Session with Anti-Bot Challenge Solving
 # =========================================================
 class RotatingScraperSession:
-    def __init__(self):
-        self.cj = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cj))
+    def __init__(self, proxy: dict = None):
+        """
+        proxy: dict with keys host, port, user, pass  — or None for direct.
+        In proxy mode a fresh opener (new IP) is built for every fetch() call.
+        """
+        self.proxy = proxy
         self.cached_test_cookie = None
         self.domain = None
+        # Build initial opener
+        self.cj, self.opener = self._make_opener(proxy)
 
-    def fetch(self, url: str) -> tuple[str, str, list[str]]:
+    def _make_opener(self, proxy: dict):
+        cj = http.cookiejar.CookieJar()
+        handlers = [urllib.request.HTTPCookieProcessor(cj)]
+        if proxy:
+            proxy_url = (
+                f"http://{proxy['user']}:{proxy['pass']}"
+                f"@{proxy['host']}:{proxy['port']}"
+            )
+            proxy_handler = urllib.request.ProxyHandler({
+                "http":  proxy_url,
+                "https": proxy_url,
+            })
+            handlers.insert(0, proxy_handler)
+        opener = urllib.request.build_opener(*handlers)
+        return cj, opener
+
+    def fetch(self, url: str, rotate_proxy: bool = False) -> tuple[str, str, list[str]]:
         """
         Visits the URL, solves any ByetHost / InfinityFree AES challenges,
         follows all HTTP redirects and client-side JavaScript / meta redirects,
         and returns: (final_url, final_body, all_visited_urls).
+
+        rotate_proxy=True: pick a brand-new proxy from the pool for this request.
         """
+        if rotate_proxy:
+            new_proxy = get_next_proxy()
+            self.cj, self.opener = self._make_opener(new_proxy)
+
         parsed = urllib.parse.urlparse(url)
         self.domain = parsed.hostname
 
@@ -507,9 +574,12 @@ def extraction_worker(
     url: str,
     count: int,
     message_id: int,
+    use_proxy: bool = False,
 ) -> None:
     active_jobs[user_id] = True
-    session = RotatingScraperSession()
+    # In proxy mode: pass first proxy; each cycle rotates inside fetch()
+    initial_proxy = get_next_proxy() if use_proxy else None
+    session = RotatingScraperSession(proxy=initial_proxy)
 
     found_numbers: set[str] = set()
     total_numbers_seen = 0
@@ -523,7 +593,8 @@ def extraction_worker(
 
         target = add_cache_buster(url, i)
         try:
-            final_url, body, visited_urls = session.fetch(target)
+            # rotate_proxy=True → new IP every request in proxy mode
+            final_url, body, visited_urls = session.fetch(target, rotate_proxy=use_proxy)
             total_ok += 1
 
             cycle_numbers: set[str] = set()
@@ -551,6 +622,7 @@ def extraction_worker(
                         f"⏳ *Extraction In Progress*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔗 *URL:* `{url[:38]}{'...' if len(url) > 38 else ''}`\n"
+                        f"{'🌐 *Mode:* `With Proxy (Rotating IP)`' if use_proxy else '⚡ *Mode:* `Direct (No Proxy)`'}\n"
                         f"📊 *Progress:* `[{bar}] {pct}%`\n"
                         f"🔄 *Requests:* `{i}/{count}`\n"
                         f"✅ *Successful:* `{total_ok}`\n"
@@ -741,6 +813,49 @@ def admin_keyboard() -> types.ReplyKeyboardMarkup:
 # =========================================================
 # Command Handlers
 # =========================================================
+
+# ── Callback: Proxy Mode Choice ──────────────────────────────────────
+@bot.callback_query_handler(func=lambda call: call.data.startswith("proxy:"))
+def callback_proxy_choice(call: types.CallbackQuery) -> None:
+    user    = call.from_user
+    chat_id = call.message.chat.id
+
+    # Maintenance check
+    if MAINTENANCE_MODE and user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "🔧 Bot is under maintenance.")
+        return
+
+    state = user_states.get(user.id, {})
+    if "url" not in state:
+        bot.answer_callback_query(call.id, "⚠️ Session expired. Please send the link again.")
+        return
+
+    use_proxy = (call.data == "proxy:yes")
+    user_states[user.id] = {"url": state["url"], "use_proxy": use_proxy}
+
+    mode_text = "🌐 *With Proxy* selected — Rotating IP per request" if use_proxy else "⚡ *Without Proxy* selected — Direct connection"
+    bot.answer_callback_query(call.id, "✅ Mode selected!")
+
+    # Remove inline buttons from previous message
+    try:
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+
+    bot.send_message(
+        chat_id,
+        (
+            f"{mode_text}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 *How many times should the bot visit this link?*\n\n"
+            f"• More visits = more rotating numbers collected\n"
+            f"• Duplicates are automatically removed"
+        ),
+        parse_mode="Markdown",
+        reply_markup=extraction_keyboard(),
+    )
+
+
 @bot.message_handler(commands=["start"])
 def cmd_start(message: types.Message) -> None:
     user = message.from_user
@@ -1066,34 +1181,43 @@ def handle_messages(message: types.Message) -> None:
             return
 
         user_states[user.id] = {"url": text}
+        proxy_markup = types.InlineKeyboardMarkup(row_width=2)
+        proxy_markup.add(
+            types.InlineKeyboardButton("⚡ Without Proxy", callback_data="proxy:no"),
+            types.InlineKeyboardButton("🌐 With Proxy",    callback_data="proxy:yes"),
+        )
         bot.send_message(
             chat_id,
             (
                 f"✅ *Link Received!*\n\n"
                 f"🔗 `{text}`\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 *How many times should the bot visit this link?*\n\n"
-                f"• More visits = more rotating numbers collected\n"
-                f"• Duplicates are automatically removed"
+                f"🌐 *Choose Extraction Mode:*\n\n"
+                f"⚡ *Without Proxy* — Fast, direct connection\n"
+                f"🌐 *With Proxy* — Rotating IP per request\n"
+                f"_(Best for airplane-mode style rotating links)_"
             ),
             parse_mode="Markdown",
-            reply_markup=extraction_keyboard(),
+            reply_markup=proxy_markup,
         )
         return
 
     # Extraction Count Selection
-    if "url" in state:
+    if "url" in state and "use_proxy" in state:
         count = _EXTRACTION_COUNT_MAP.get(text)
         if count is not None:
             target_url = state["url"]
+            use_proxy  = state["use_proxy"]
             user_states[user.id] = {}
 
+            mode_label = "🌐 With Proxy (Rotating IP)" if use_proxy else "⚡ Without Proxy (Direct)"
             start_msg = bot.send_message(
                 chat_id,
                 (
                     f"⏳ *Starting extraction...*\n\n"
                     f"🔗 URL: `{target_url[:40]}{'...' if len(target_url) > 40 else ''}`\n"
-                    f"🔄 Planned cycles: `{count}`\n\n"
+                    f"🔄 Planned cycles: `{count}`\n"
+                    f"📡 Mode: `{mode_label}`\n\n"
                     f"_Bypassing protections and extracting numbers. Please wait..._"
                 ),
                 parse_mode="Markdown",
@@ -1102,7 +1226,7 @@ def handle_messages(message: types.Message) -> None:
 
             threading.Thread(
                 target=extraction_worker,
-                args=(chat_id, user.id, target_url, count, start_msg.message_id),
+                args=(chat_id, user.id, target_url, count, start_msg.message_id, use_proxy),
                 daemon=True,
             ).start()
             return
