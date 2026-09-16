@@ -16,15 +16,20 @@ from telebot.apihelper import ApiTelegramException
 # =========================================================
 # Configuration & Constants
 # =========================================================
-BOT_TOKEN = "8897758284:AAEOMrvaRfpjZmzcc91xkPnKr2nSOIQyUAA"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 ADMIN_IDS = [
     int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "8753914631").split(",")
+    for x in os.environ.get("ADMIN_IDS", "123456789").split(",")
     if x.strip().isdigit()
 ]
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+
+# =========================================================
+# Maintenance Mode (Admin can toggle ON/OFF)
+# =========================================================
+MAINTENANCE_MODE = False  # False = Bot active for all | True = Only admins can use
 
 # user_id -> {"url": str, "awaiting_url": bool, "awaiting_broadcast": bool}
 user_states: dict = {}
@@ -589,6 +594,63 @@ def extraction_worker(
     )
 
     if unique_count > 0:
+        # ── 1. Show numbers directly in chat (with copy button) ──────
+        sorted_numbers = sorted(found_numbers)
+        numbers_text = "\n".join(f"+{num}" for num in sorted_numbers)
+
+        # Telegram message limit is 4096 chars; split if needed
+        CHUNK_SIZE = 3800
+        header = (
+            f"📱 *Extracted WhatsApp Numbers*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 *Total Unique:* `{unique_count}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+
+        # Split numbers into chunks so each message fits Telegram limit
+        lines = numbers_text.split("\n")
+        chunks = []
+        current_chunk = ""
+        for line in lines:
+            if len(current_chunk) + len(line) + 1 > CHUNK_SIZE:
+                chunks.append(current_chunk.strip())
+                current_chunk = line + "\n"
+            else:
+                current_chunk += line + "\n"
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+
+        # Send first chunk with header and copy button (inline keyboard)
+        copy_markup = types.InlineKeyboardMarkup()
+        copy_markup.add(
+            types.InlineKeyboardButton(
+                text="📋 Copy All Numbers",
+                switch_inline_query=numbers_text,
+            )
+        )
+
+        for idx, chunk in enumerate(chunks):
+            chunk_header = header if idx == 0 else f"📱 *Numbers (Part {idx + 1})*\n\n"
+            msg_text = chunk_header + f"`{chunk}`"
+            try:
+                if idx == 0:
+                    bot.send_message(
+                        chat_id,
+                        msg_text,
+                        parse_mode="Markdown",
+                        reply_markup=copy_markup,
+                    )
+                else:
+                    bot.send_message(
+                        chat_id,
+                        msg_text,
+                        parse_mode="Markdown",
+                    )
+            except Exception:
+                # If markdown fails, send plain
+                bot.send_message(chat_id, chunk)
+
+        # ── 2. Also send as .txt file ─────────────────────────────────
         file_name = f"whatsapp_numbers_{user_id}_{int(time.time())}.txt"
         try:
             with open(file_name, "w", encoding="utf-8") as f:
@@ -597,7 +659,7 @@ def extraction_worker(
                 f.write(f"Date & Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"Total Unique Numbers: {unique_count}\n")
                 f.write("=" * 45 + "\n\n")
-                for num in sorted(found_numbers):
+                for num in sorted_numbers:
                     f.write(f"+{num}\n")
 
             with open(file_name, "rb") as doc:
@@ -665,10 +727,12 @@ def extraction_keyboard() -> types.ReplyKeyboardMarkup:
 
 def admin_keyboard() -> types.ReplyKeyboardMarkup:
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    maintenance_label = "🔴 Maintenance: ON" if MAINTENANCE_MODE else "🟢 Maintenance: OFF"
     markup.add(
         types.KeyboardButton("📈 Bot Stats"),
         types.KeyboardButton("📢 Broadcast"),
         types.KeyboardButton("👥 Recent Users"),
+        types.KeyboardButton(maintenance_label),
         types.KeyboardButton("🔙 Main Menu"),
     )
     return markup
@@ -733,12 +797,28 @@ _EXTRACTION_COUNT_MAP = {
 
 @bot.message_handler(func=lambda m: True)
 def handle_messages(message: types.Message) -> None:
+    global MAINTENANCE_MODE
+
     user = message.from_user
     chat_id = message.chat.id
     text = (message.text or "").strip()
 
     register_user(user.id, user.username, user.first_name)
     state = user_states.get(user.id, {})
+
+    # ── Maintenance Mode Check ────────────────────────────────────────
+    if MAINTENANCE_MODE and user.id not in ADMIN_IDS:
+        bot.send_message(
+            chat_id,
+            (
+                "🔧 *Bot is under Maintenance*\n\n"
+                "We are currently improving the bot for a better experience.\n"
+                "Please try again later. Thank you for your patience! 🙏\n\n"
+                "_— DK Sharma Bot_"
+            ),
+            parse_mode="Markdown",
+        )
+        return
 
     # Global Cancel / Back to Main Menu
     if text in ("❌ Cancel", "🔙 Main Menu"):
@@ -839,6 +919,21 @@ def handle_messages(message: types.Message) -> None:
                     f"📱 {r['total_numbers_found']} numbers | @{uname}\n\n"
                 )
             bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=admin_keyboard())
+            return
+
+        if text in ("🟢 Maintenance: OFF", "🔴 Maintenance: ON"):
+            MAINTENANCE_MODE = not MAINTENANCE_MODE
+            status = "🔴 *ON* — Users cannot use the bot now." if MAINTENANCE_MODE else "🟢 *OFF* — Bot is active for all users."
+            bot.send_message(
+                chat_id,
+                (
+                    f"🔧 *Maintenance Mode Updated!*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Status: {status}"
+                ),
+                parse_mode="Markdown",
+                reply_markup=admin_keyboard(),
+            )
             return
 
     # Send New Link
