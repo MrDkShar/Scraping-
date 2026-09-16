@@ -5,20 +5,18 @@ import random
 import sqlite3
 import threading
 import urllib.parse
-import telebot
-from telebot import types
+import urllib.request
+import http.cookiejar
 from datetime import datetime
 
-# ── BeautifulSoup for HTML parsing ─────────────────────────────────────────
-from bs4 import BeautifulSoup
-
-# ── curl_cffi: real Chrome TLS fingerprint (bypasses Cloudflare) ───────────
-from curl_cffi import requests as cffi_requests
+import telebot
+from telebot import types
+from telebot.apihelper import ApiTelegramException
 
 # =========================================================
 # Configuration & Constants
 # =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8897758284:AAHXLHUjxLdH8ynWWsZpxmCwf8IsH1M69j0")
+BOT_TOKEN = "8897758284:AAEOMrvaRfpjZmzcc91xkPnKr2nSOIQyUAA"
 
 ADMIN_IDS = [
     int(x.strip())
@@ -26,21 +24,18 @@ ADMIN_IDS = [
     if x.strip().isdigit()
 ]
 
-# Railway.app: /data/ is persistent volume; fallback to current dir
-DB_DIR = "/data" if os.path.isdir("/data") else "."
-DB_FILE = os.path.join(DB_DIR, "bot_database.db")
-
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# user_id -> state dict
+# user_id -> {"url": str, "awaiting_url": bool, "awaiting_broadcast": bool}
 user_states: dict = {}
 
-# active jobs: user_id -> True/False (False = cancel requested)
+# active extraction jobs: user_id -> True (running) / False (cancelled)
 active_jobs: dict = {}
 
 # =========================================================
-# Database
+# Database Setup
 # =========================================================
+DB_FILE = "bot_database.db"
 _db_lock = threading.Lock()
 
 
@@ -64,6 +59,7 @@ def init_db() -> None:
                 joined_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_active           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
             CREATE TABLE IF NOT EXISTS extraction_history (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id         INTEGER,
@@ -75,6 +71,7 @@ def init_db() -> None:
                 completed_at    TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
+
             CREATE INDEX IF NOT EXISTS idx_history_user ON extraction_history(user_id);
             CREATE INDEX IF NOT EXISTS idx_history_date ON extraction_history(started_at);
         """)
@@ -120,7 +117,9 @@ def update_user_stats(user_id: int, unique_count: int) -> None:
             conn.close()
 
 
-def save_history(user_id, url, cycles, unique_numbers, duplicate_count):
+def save_history(
+    user_id: int, url: str, cycles: int, unique_numbers: int, duplicate_count: int
+) -> None:
     with _db_lock:
         conn = get_conn()
         try:
@@ -135,20 +134,25 @@ def save_history(user_id, url, cycles, unique_numbers, duplicate_count):
             conn.close()
 
 
-def get_user_stats(user_id: int):
+def get_user_stats(user_id: int) -> dict | None:
     conn = get_conn()
     try:
-        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
 
 
-def get_user_history(user_id: int, limit: int = 10):
+def get_user_history(user_id: int, limit: int = 10) -> list[dict]:
     conn = get_conn()
     try:
         rows = conn.execute(
-            "SELECT * FROM extraction_history WHERE user_id = ? ORDER BY started_at DESC LIMIT ?",
+            """SELECT * FROM extraction_history
+               WHERE user_id = ?
+               ORDER BY started_at DESC
+               LIMIT ?""",
             (user_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -156,12 +160,12 @@ def get_user_history(user_id: int, limit: int = 10):
         conn.close()
 
 
-def get_admin_stats():
+def get_admin_stats() -> dict:
     conn = get_conn()
     try:
         row = conn.execute(
-            """SELECT COUNT(*) AS total_users,
-                      SUM(total_extractions) AS total_ex,
+            """SELECT COUNT(*)            AS total_users,
+                      SUM(total_extractions)   AS total_ex,
                       SUM(total_numbers_found) AS total_nums
                FROM users"""
         ).fetchone()
@@ -170,7 +174,7 @@ def get_admin_stats():
         conn.close()
 
 
-def get_all_user_ids():
+def get_all_user_ids() -> list[int]:
     conn = get_conn()
     try:
         rows = conn.execute("SELECT user_id FROM users").fetchall()
@@ -180,313 +184,357 @@ def get_all_user_ids():
 
 
 # =========================================================
-# Keyboards
+# Pure Python AES-128-CBC Decryptor (Zero Dependency)
+# Solves ByetHost / InfinityFree / site.je __test Challenge
 # =========================================================
-def main_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        types.KeyboardButton("🔗 Send New Link"),
-        types.KeyboardButton("📋 My History"),
-        types.KeyboardButton("📊 My Stats"),
-        types.KeyboardButton("❓ Help"),
-        types.KeyboardButton("📞 Support"),
+_AES_SBOX = (
+    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
+    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
+    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
+    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
+    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
+    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
+    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
+    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
+    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
+    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
+    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
+    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
+    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
+    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
+    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
+    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
+)
+
+_AES_INV_SBOX = [0] * 256
+for _i, _v in enumerate(_AES_SBOX):
+    _AES_INV_SBOX[_v] = _i
+
+_AES_RCON = (0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
+
+
+def _sub_word(w: int) -> int:
+    return (
+        (_AES_SBOX[(w >> 24) & 0xFF] << 24)
+        | (_AES_SBOX[(w >> 16) & 0xFF] << 16)
+        | (_AES_SBOX[(w >> 8) & 0xFF] << 8)
+        | _AES_SBOX[w & 0xFF]
     )
-    return markup
 
 
-def extraction_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        types.KeyboardButton("🧪 Test (1x)"),
-        types.KeyboardButton("🚀 20 Times"),
-        types.KeyboardButton("⚡ 50 Times"),
-        types.KeyboardButton("💎 100 Times (Max)"),
-        types.KeyboardButton("❌ Cancel"),
-    )
-    return markup
+def _rot_word(w: int) -> int:
+    return ((w << 8) & 0xFFFFFFFF) | (w >> 24)
 
 
-def admin_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        types.KeyboardButton("📈 Bot Stats"),
-        types.KeyboardButton("📢 Broadcast"),
-        types.KeyboardButton("👥 Recent Users"),
-        types.KeyboardButton("🔙 Main Menu"),
-    )
-    return markup
+def _key_schedule(key_bytes: bytes) -> list[int]:
+    w = []
+    for i in range(4):
+        w.append(
+            (key_bytes[4 * i] << 24)
+            | (key_bytes[4 * i + 1] << 16)
+            | (key_bytes[4 * i + 2] << 8)
+            | key_bytes[4 * i + 3]
+        )
+    for i in range(4, 44):
+        temp = w[i - 1]
+        if i % 4 == 0:
+            temp = _sub_word(_rot_word(temp)) ^ (_AES_RCON[i // 4] << 24)
+        w.append(w[i - 4] ^ temp)
+    return w
 
 
-# =========================================================
-# WhatsApp Number Extraction Engine
-# =========================================================
-
-# Every known pattern where a WhatsApp number can appear
-_WA_PATTERNS = [
-    # wa.me/919876543210
-    re.compile(r'wa\.me/(?:message/[A-Z0-9]+[^"\'&\s]*?)?(\d{10,15})', re.IGNORECASE),
-    # ?phone=919876543210
-    re.compile(r'[?&]phone=(\d{10,15})', re.IGNORECASE),
-    # whatsapp://send?phone=
-    re.compile(r'whatsapp://send\?phone=(\d{10,15})', re.IGNORECASE),
-    # api.whatsapp.com/send?phone=
-    re.compile(r'api\.whatsapp\.com/send/?\?(?:[^"\'<>\s]*&)?phone=(\d{10,15})', re.IGNORECASE),
-    # JS window.location = "https://wa.me/..."
-    re.compile(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']*whatsapp[^"\']*)["\']', re.IGNORECASE),
-    re.compile(r'location\.replace\s*\(\s*["\']([^"\']*whatsapp[^"\']*)["\']', re.IGNORECASE),
-    re.compile(r'(?<!\w)location\.href\s*=\s*["\']([^"\']*whatsapp[^"\']*)["\']', re.IGNORECASE),
-    # href attributes
-    re.compile(r'href=["\']([^"\']*(?:wa\.me|whatsapp)[^"\']*)["\']', re.IGNORECASE),
-    # data-* attributes
-    re.compile(r'data-(?:url|href|link|action)=["\']([^"\']*(?:wa\.me|whatsapp)[^"\']*)["\']', re.IGNORECASE),
-    # onclick / onload
-    re.compile(r'on(?:click|load)=["\'][^"\']*(?:wa\.me|whatsapp)([^"\']*)["\']', re.IGNORECASE),
-    # meta refresh
-    re.compile(r'content=["\'][^"\']*URL=([^"\']*(?:wa\.me|whatsapp)[^"\']*)["\']', re.IGNORECASE),
-    # JSON fields
-    re.compile(r'"(?:url|link|redirect|whatsapp|href)"\s*:\s*"([^"]*(?:wa\.me|whatsapp)[^"]*)"', re.IGNORECASE),
-    # catch-all: any whatsapp/wa.me token followed by digits
-    re.compile(r'(?:wa\.me|whatsapp)[^\d]*(\d{10,15})', re.IGNORECASE),
-]
-
-# Real rotating browser User-Agents
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Android 14; Mobile; rv:125.0) Gecko/125.0 Firefox/125.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-]
+def _xtime(a: int) -> int:
+    return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else (a << 1)
 
 
-def _get_headers() -> dict:
-    """Rotate headers on every call to avoid fingerprinting."""
-    return {
-        "User-Agent": random.choice(_USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": random.choice(["en-US,en;q=0.9", "en-GB,en;q=0.9", "en-IN,en;q=0.9,hi;q=0.8"]),
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "DNT": "1",
-    }
+def _gmul(a: int, b: int) -> int:
+    p = 0
+    for _ in range(8):
+        if b & 1:
+            p ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return p
 
 
-def _extract_numbers_from_text(text: str):
-    """Run all regex patterns on raw text. Returns (set_of_numbers, raw_match_count)."""
-    found = set()
-    raw_count = 0
-    for pattern in _WA_PATTERNS:
-        for match in pattern.findall(text):
-            for num_str in re.findall(r'\d+', match):
-                clean = num_str.strip()
-                if 10 <= len(clean) <= 15:
-                    raw_count += 1
-                    found.add(clean)
-    return found, raw_count
+def _inv_mix_col(c: list[int]) -> list[int]:
+    return [
+        _gmul(c[0], 0x0E) ^ _gmul(c[1], 0x0B) ^ _gmul(c[2], 0x0D) ^ _gmul(c[3], 0x09),
+        _gmul(c[0], 0x09) ^ _gmul(c[1], 0x0E) ^ _gmul(c[2], 0x0B) ^ _gmul(c[3], 0x0D),
+        _gmul(c[0], 0x0D) ^ _gmul(c[1], 0x09) ^ _gmul(c[2], 0x0E) ^ _gmul(c[3], 0x0B),
+        _gmul(c[0], 0x0B) ^ _gmul(c[1], 0x0D) ^ _gmul(c[2], 0x09) ^ _gmul(c[3], 0x0E),
+    ]
 
 
-def _deep_html_parse(html: str):
-    """BeautifulSoup deep parse: <a>, <script>, <meta>, data-attrs, onclick."""
-    found = set()
-    raw_count = 0
+def _decrypt_single_block(block: bytes, w: list[int]) -> list[int]:
+    state = [[block[r + 4 * c] for c in range(4)] for r in range(4)]
+    for c in range(4):
+        rk = w[40 + c]
+        for r in range(4):
+            state[r][c] ^= (rk >> (24 - 8 * r)) & 0xFF
+
+    for round_num in range(9, 0, -1):
+        state[1] = state[1][3:] + state[1][:3]
+        state[2] = state[2][2:] + state[2][:2]
+        state[3] = state[3][1:] + state[3][:1]
+
+        for r in range(4):
+            for c in range(4):
+                state[r][c] = _AES_INV_SBOX[state[r][c]]
+
+        for c in range(4):
+            rk = w[round_num * 4 + c]
+            for r in range(4):
+                state[r][c] ^= (rk >> (24 - 8 * r)) & 0xFF
+
+        for c in range(4):
+            col = [state[r][c] for r in range(4)]
+            new_col = _inv_mix_col(col)
+            for r in range(4):
+                state[r][c] = new_col[r]
+
+    state[1] = state[1][3:] + state[1][:3]
+    state[2] = state[2][2:] + state[2][:2]
+    state[3] = state[3][1:] + state[3][:1]
+
+    for r in range(4):
+        for c in range(4):
+            state[r][c] = _AES_INV_SBOX[state[r][c]]
+
+    for c in range(4):
+        rk = w[c]
+        for r in range(4):
+            state[r][c] ^= (rk >> (24 - 8 * r)) & 0xFF
+
+    out = []
+    for c in range(4):
+        for r in range(4):
+            out.append(state[r][c])
+    return out
+
+
+def decrypt_byet_challenge(c_hex: str, a_hex: str, b_hex: str) -> str:
+    """
+    Solves ByetHost / InfinityFree / site.je slowAES.decrypt(c, 2, a, b).
+    Mode 2 = AES-128-CBC. Decrypts ciphertext 'c' using key 'a' and IV 'b'.
+    Returns hex string for document.cookie = '__test=' + hex.
+    """
+    # 1. Fast path: pycryptodome if installed
     try:
-        soup = BeautifulSoup(html, "html.parser")
-
-        # <a href>
-        for tag in soup.find_all("a", href=True):
-            nums, cnt = _extract_numbers_from_text(tag["href"])
-            found.update(nums); raw_count += cnt
-
-        # <script> — JS redirects
-        for script in soup.find_all("script"):
-            nums, cnt = _extract_numbers_from_text(script.get_text() or "")
-            found.update(nums); raw_count += cnt
-
-        # <meta content> — meta-refresh
-        for meta in soup.find_all("meta"):
-            content = meta.get("content", "")
-            if content:
-                nums, cnt = _extract_numbers_from_text(content)
-                found.update(nums); raw_count += cnt
-
-        # All data-* / onclick / onload / action attrs
-        for tag in soup.find_all(True):
-            for attr_name, attr_val in tag.attrs.items():
-                if isinstance(attr_val, str) and (
-                    attr_name.startswith("data-") or
-                    attr_name in ("onclick", "onload", "href", "action", "src")
-                ):
-                    nums, cnt = _extract_numbers_from_text(attr_val)
-                    found.update(nums); raw_count += cnt
-
-        # noscript tags
-        for ns in soup.find_all("noscript"):
-            nums, cnt = _extract_numbers_from_text(ns.get_text() or "")
-            found.update(nums); raw_count += cnt
-
+        from Crypto.Cipher import AES
+        cipher = AES.new(bytes.fromhex(a_hex), AES.MODE_CBC, bytes.fromhex(b_hex))
+        return cipher.decrypt(bytes.fromhex(c_hex)).hex()
     except Exception:
         pass
-    return found, raw_count
+
+    # 2. Fast path: OpenSSL command if available
+    import shutil
+    import subprocess
+    if shutil.which("openssl"):
+        try:
+            p = subprocess.Popen(
+                ["openssl", "enc", "-d", "-aes-128-cbc", "-K", a_hex, "-iv", b_hex, "-nopad"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            out, _ = p.communicate(bytes.fromhex(c_hex))
+            if p.returncode == 0 and len(out) == 16:
+                return out.hex()
+        except Exception:
+            pass
+
+    # 3. Guaranteed Pure Python path (zero dependencies, works anywhere)
+    c = bytes.fromhex(c_hex)
+    a = bytes.fromhex(a_hex)
+    b = bytes.fromhex(b_hex)
+    w = _key_schedule(a)
+    dec = _decrypt_single_block(c, w)
+    res = bytes([dec[i] ^ b[i] for i in range(16)])
+    return res.hex()
 
 
-def _detect_js_redirect(html: str, base_url: str):
-    """Detect JS / meta-refresh redirect URL from page source."""
-    # meta http-equiv refresh
-    m = re.search(
-        r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=([^"\';\s]+)',
-        html, re.IGNORECASE
-    )
-    if m:
-        return urllib.parse.urljoin(base_url, m.group(1).strip())
-
-    # window.location / window.location.href
-    m = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
-    if m:
-        return urllib.parse.urljoin(base_url, m.group(1).strip())
-
-    # location.replace(...)
-    m = re.search(r'location\.replace\s*\(\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
-    if m:
-        return urllib.parse.urljoin(base_url, m.group(1).strip())
-
-    # location.href = ...
-    m = re.search(r'(?<!\w)location\.href\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
-    if m:
-        return urllib.parse.urljoin(base_url, m.group(1).strip())
-
-    # setTimeout with location
-    m = re.search(r'setTimeout\s*\([^,]*["\']([^"\']*(?:wa\.me|whatsapp)[^"\']*)["\']', html, re.IGNORECASE)
-    if m:
-        return urllib.parse.urljoin(base_url, m.group(1).strip())
-
-    return None
+# =========================================================
+# WhatsApp URL & Pattern Matching
+# =========================================================
+_WA_PATTERNS = [
+    re.compile(r'wa\.me/(\+?\d+)', re.IGNORECASE),
+    re.compile(r'phone=(\+?\d+)', re.IGNORECASE),
+    re.compile(r'whatsapp://send\?phone=(\+?\d+)', re.IGNORECASE),
+    re.compile(r'api\.whatsapp\.com/send/?\??[^"\'\s]*phone=(\+?\d+)', re.IGNORECASE),
+    re.compile(r'whatsapp\.com/send/?\??[^"\'\s]*phone=(\+?\d+)', re.IGNORECASE),
+    re.compile(r'wa\.me/(?:message/[A-Z0-9]+.*?)?(\d{10,15})', re.IGNORECASE),
+    re.compile(r'web\.whatsapp\.com/send/?\??[^"\'\s]*phone=(\+?\d+)', re.IGNORECASE),
+]
 
 
-def _visit_once(url: str, session) -> tuple:
-    """
-    Visit URL once with curl_cffi (Chrome TLS impersonation).
-    Returns (found_numbers_set, raw_match_count, error_message_or_None).
-    """
-    found = set()
-    raw_count = 0
+def extract_numbers_from_text(text: str) -> set[str]:
+    """Extracts valid WhatsApp phone numbers (10 to 15 digits) from raw or URL-encoded text."""
+    found: set[str] = set()
+    if not text:
+        return found
 
-    try:
-        # Clear cookies → fresh independent visit every time
-        session.cookies.clear()
+    decoded = urllib.parse.unquote(text)
+    for sample in (text, decoded):
+        for pattern in _WA_PATTERNS:
+            for match in pattern.findall(sample):
+                if isinstance(match, tuple):
+                    match = match[0]
+                clean = re.sub(r'\D', '', match)
+                if 10 <= len(clean) <= 15:
+                    found.add(clean)
+    return found
 
-        resp = session.get(
-            url,
-            impersonate="chrome120",       # Real Chrome TLS fingerprint → bypasses Cloudflare
-            allow_redirects=True,
-            timeout=20,
-            headers=_get_headers(),
-            verify=False,                  # Skip SSL verify (some redirect sites have bad certs)
-        )
 
-        # ── 1. Numbers in final resolved URL ──────────────────────────────
-        nums, cnt = _extract_numbers_from_text(resp.url)
-        found.update(nums); raw_count += cnt
+# =========================================================
+# Intelligent Session with Anti-Bot Challenge Solving
+# =========================================================
+class RotatingScraperSession:
+    def __init__(self):
+        self.cj = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cj))
+        self.cached_test_cookie = None
+        self.domain = None
 
-        # ── 2. Numbers in every HTTP redirect hop ─────────────────────────
-        for r in resp.history:
-            nums, cnt = _extract_numbers_from_text(r.url)
-            found.update(nums); raw_count += cnt
-            # Also check Location header directly
-            loc = r.headers.get("Location", "")
-            if loc:
-                nums, cnt = _extract_numbers_from_text(loc)
-                found.update(nums); raw_count += cnt
+    def fetch(self, url: str) -> tuple[str, str, list[str]]:
+        """
+        Visits the URL, solves any ByetHost / InfinityFree AES challenges,
+        follows all HTTP redirects and client-side JavaScript / meta redirects,
+        and returns: (final_url, final_body, all_visited_urls).
+        """
+        parsed = urllib.parse.urlparse(url)
+        self.domain = parsed.hostname
 
-        body = resp.text
+        self.opener.addheaders = [
+            ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+            ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+            ("Accept-Language", "en-US,en;q=0.9"),
+            ("Sec-Ch-Ua", '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"'),
+            ("Sec-Ch-Ua-Mobile", "?0"),
+            ("Sec-Ch-Ua-Platform", '"Windows"'),
+            ("Upgrade-Insecure-Requests", "1"),
+        ]
 
-        # ── 3. Raw regex on entire HTML body ──────────────────────────────
-        nums, cnt = _extract_numbers_from_text(body)
-        found.update(nums); raw_count += cnt
+        # Reuse valid __test cookie if available for this domain
+        if self.cached_test_cookie and self.domain:
+            c_obj = http.cookiejar.Cookie(
+                version=0, name="__test", value=self.cached_test_cookie, port=None, port_specified=False,
+                domain=self.domain, domain_specified=True, domain_initial_dot=False,
+                path="/", path_specified=True, secure=False, expires=None, discard=True,
+                comment=None, comment_url=None, rest={"HttpOnly": None}, rfc2109=False,
+            )
+            self.cj.set_cookie(c_obj)
 
-        # ── 4. Deep BeautifulSoup parse ───────────────────────────────────
-        nums, cnt = _deep_html_parse(body)
-        found.update(nums); raw_count += cnt
+        visited_urls = [url]
+        req = urllib.request.Request(url)
+        resp = self.opener.open(req, timeout=12)
+        current_url = resp.geturl()
+        visited_urls.append(current_url)
+        body = resp.read().decode("utf-8", errors="ignore")
 
-        # ── 5. Follow JS / meta-refresh redirect ──────────────────────────
-        js_url = _detect_js_redirect(body, resp.url)
-        if js_url and js_url != resp.url:
-            nums, cnt = _extract_numbers_from_text(js_url)
-            found.update(nums); raw_count += cnt
-
-            # If it's not already a WhatsApp URL, fetch the redirect target too
-            if not any(kw in js_url.lower() for kw in ("whatsapp", "wa.me")):
-                try:
-                    session.cookies.clear()
-                    r2 = session.get(
-                        js_url,
-                        impersonate="chrome120",
-                        allow_redirects=True,
-                        timeout=15,
-                        headers=_get_headers(),
-                        verify=False,
+        # Detect and solve InfinityFree / ByetHost slowAES anti-bot challenge
+        if "slowAES" in body or ("toNumbers(" in body and "__test=" in body):
+            matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', body)
+            if len(matches) >= 3:
+                a_key, b_iv, c_cipher = matches[0], matches[1], matches[2]
+                self.cached_test_cookie = decrypt_byet_challenge(c_cipher, a_key, b_iv)
+                if self.domain:
+                    c_obj = http.cookiejar.Cookie(
+                        version=0, name="__test", value=self.cached_test_cookie, port=None, port_specified=False,
+                        domain=self.domain, domain_specified=True, domain_initial_dot=False,
+                        path="/", path_specified=True, secure=False, expires=None, discard=True,
+                        comment=None, comment_url=None, rest={"HttpOnly": None}, rfc2109=False,
                     )
-                    for hop in r2.history:
-                        nums, cnt = _extract_numbers_from_text(hop.url)
-                        found.update(nums); raw_count += cnt
-                        loc = hop.headers.get("Location", "")
-                        if loc:
-                            nums, cnt = _extract_numbers_from_text(loc)
-                            found.update(nums); raw_count += cnt
-                    nums, cnt = _extract_numbers_from_text(r2.url)
-                    found.update(nums); raw_count += cnt
-                    nums, cnt = _extract_numbers_from_text(r2.text)
-                    found.update(nums); raw_count += cnt
-                    nums, cnt = _deep_html_parse(r2.text)
-                    found.update(nums); raw_count += cnt
-                except Exception:
-                    pass
+                    self.cj.set_cookie(c_obj)
 
-        return found, raw_count, None
+                # Find redirect destination (e.g. ?i=1)
+                loc_match = re.search(r'location\.href\s*=\s*["\'](.*?)["\']', body)
+                next_dest = loc_match.group(1) if loc_match else (url + ("&i=1" if "?" in url else "?i=1"))
+                next_url = urllib.parse.urljoin(current_url, next_dest)
 
-    except Exception as e:
-        return set(), 0, str(e)
+                visited_urls.append(next_url)
+                resp2 = self.opener.open(urllib.request.Request(next_url), timeout=12)
+                current_url = resp2.geturl()
+                visited_urls.append(current_url)
+                body = resp2.read().decode("utf-8", errors="ignore")
+
+        # Check for HTML meta refresh or JavaScript redirection
+        for _ in range(2):
+            meta_refresh = re.search(r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*url=([^"\'>]+)', body, re.IGNORECASE)
+            if meta_refresh:
+                redirect_target = urllib.parse.urljoin(current_url, meta_refresh.group(1).strip())
+                visited_urls.append(redirect_target)
+                resp = self.opener.open(urllib.request.Request(redirect_target), timeout=12)
+                current_url = resp.geturl()
+                visited_urls.append(current_url)
+                body = resp.read().decode("utf-8", errors="ignore")
+                continue
+
+            js_redirect = re.search(r'(?:window\.)?location(?:\.href|\.replace)\s*\(\s*["\'](https?://[^"\']+)["\']\s*\)', body, re.IGNORECASE)
+            if js_redirect:
+                redirect_target = js_redirect.group(1).strip()
+                visited_urls.append(redirect_target)
+                resp = self.opener.open(urllib.request.Request(redirect_target), timeout=12)
+                current_url = resp.geturl()
+                visited_urls.append(current_url)
+                body = resp.read().decode("utf-8", errors="ignore")
+                continue
+            break
+
+        return current_url, body, visited_urls
+
+
+def add_cache_buster(url: str, cycle: int) -> str:
+    cb = f"{int(time.time() * 1000)}_{cycle}_{random.randint(100, 999)}"
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}cb={cb}"
 
 
 # =========================================================
-# Extraction Worker Thread
+# Worker Thread for Extractions
 # =========================================================
-def extraction_worker(chat_id: int, user_id: int, url: str, count: int, message_id: int):
+def extraction_worker(
+    chat_id: int,
+    user_id: int,
+    url: str,
+    count: int,
+    message_id: int,
+) -> None:
     active_jobs[user_id] = True
+    session = RotatingScraperSession()
 
-    # One session per job — connection pooling + shared TLS state
-    session = cffi_requests.Session()
-
-    all_found: set = set()
+    found_numbers: set[str] = set()
+    total_numbers_seen = 0
     total_ok = 0
-    total_errors = 0
-    total_raw = 0
+    errors = 0
+    last_ui_update = 0.0
 
     for i in range(1, count + 1):
         if not active_jobs.get(user_id, True):
-            # User pressed Cancel
             break
 
-        nums, raw, err = _visit_once(url, session)
-
-        if err:
-            total_errors += 1
-        else:
+        target = add_cache_buster(url, i)
+        try:
+            final_url, body, visited_urls = session.fetch(target)
             total_ok += 1
-            total_raw += raw
-            all_found.update(nums)
 
-        # Update progress every 5 requests or on the last one
-        if i % 5 == 0 or i == count:
+            cycle_numbers: set[str] = set()
+            for v_url in visited_urls:
+                cycle_numbers.update(extract_numbers_from_text(v_url))
+            cycle_numbers.update(extract_numbers_from_text(body))
+
+            total_numbers_seen += len(cycle_numbers)
+            found_numbers.update(cycle_numbers)
+        except Exception:
+            errors += 1
+
+        # Periodic UI update with throttle to avoid Telegram rate limits
+        now = time.time()
+        if (now - last_ui_update > 2.5) or i == count:
+            last_ui_update = now
             try:
                 done = int((i / count) * 10)
                 bar = "█" * done + "░" * (10 - done)
@@ -497,35 +545,29 @@ def extraction_worker(chat_id: int, user_id: int, url: str, count: int, message_
                     text=(
                         f"⏳ *Extraction In Progress*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🔗 *URL:* `{url[:45]}{'...' if len(url) > 45 else ''}`\n"
-                        f"📊 Progress: `[{bar}] {pct}%`\n"
-                        f"🔄 Requests: `{i}/{count}`\n"
-                        f"✅ Successful: `{total_ok}`\n"
-                        f"❌ Failed: `{total_errors}`\n"
-                        f"📱 Numbers Found So Far: `{len(all_found)}`\n"
+                        f"🔗 *URL:* `{url[:38]}{'...' if len(url) > 38 else ''}`\n"
+                        f"📊 *Progress:* `[{bar}] {pct}%`\n"
+                        f"🔄 *Requests:* `{i}/{count}`\n"
+                        f"✅ *Successful:* `{total_ok}`\n"
+                        f"❌ *Failed:* `{errors}`\n"
+                        f"📱 *Unique Numbers Found:* `{len(found_numbers)}`\n"
                         f"━━━━━━━━━━━━━━━━━━━━━\n"
                         f"_Please wait..._"
                     ),
                     parse_mode="Markdown",
                 )
+            except ApiTelegramException:
+                pass
             except Exception:
                 pass
 
-        # Human-like random delay: 1.5s – 3.5s
-        # This is critical — too fast = IP ban, too slow = waste of time
-        delay = random.uniform(1.5, 3.5)
-        # Slow down more if we keep getting errors (likely rate-limited)
-        if total_errors > 3 and total_errors > total_ok:
-            delay = random.uniform(4.0, 7.0)
-        time.sleep(delay)
+        time.sleep(0.3)
 
-    # ── Cleanup & Results ─────────────────────────────────────────────
+    # ── Extraction Complete ───────────────────────────────────────────
     active_jobs.pop(user_id, None)
 
-    unique_count = len(all_found)
-    # CORRECT math: raw_count includes re-appearances of the same number
-    # duplicate_count = how many times numbers appeared again after first sight
-    duplicate_count = max(0, total_raw - unique_count)
+    unique_count = len(found_numbers)
+    duplicate_count = max(total_numbers_seen - unique_count, 0)
 
     update_user_stats(user_id, unique_count)
     save_history(user_id, url, count, unique_count, duplicate_count)
@@ -537,9 +579,9 @@ def extraction_worker(chat_id: int, user_id: int, url: str, count: int, message_
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 *Total Cycles Run:* `{count}`\n"
             f"✅ *Successful Requests:* `{total_ok}`\n"
-            f"❌ *Failed Requests:* `{total_errors}`\n"
+            f"❌ *Failed Requests:* `{errors}`\n"
             f"🎯 *Unique WhatsApp Numbers:* `{unique_count}`\n"
-            f"🔁 *Duplicate Appearances:* `{duplicate_count}`\n"
+            f"🔁 *Duplicates Filtered:* `{duplicate_count}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━"
         ),
         parse_mode="Markdown",
@@ -547,16 +589,15 @@ def extraction_worker(chat_id: int, user_id: int, url: str, count: int, message_
     )
 
     if unique_count > 0:
-        # Generate and send .txt file
-        file_name = f"wa_numbers_{user_id}_{int(time.time())}.txt"
+        file_name = f"whatsapp_numbers_{user_id}_{int(time.time())}.txt"
         try:
             with open(file_name, "w", encoding="utf-8") as f:
                 f.write("DK Sharma Bot — WhatsApp Number Extractor\n")
-                f.write(f"Source URL : {url}\n")
-                f.write(f"Extracted  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Total Unique: {unique_count}\n")
+                f.write(f"Source URL: {url}\n")
+                f.write(f"Date & Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Total Unique Numbers: {unique_count}\n")
                 f.write("=" * 45 + "\n\n")
-                for num in sorted(all_found):
+                for num in sorted(found_numbers):
                     f.write(f"+{num}\n")
 
             with open(file_name, "rb") as doc:
@@ -564,14 +605,18 @@ def extraction_worker(chat_id: int, user_id: int, url: str, count: int, message_
                     chat_id,
                     doc,
                     caption=(
-                        f"📁 *WhatsApp Numbers File Ready!*\n"
-                        f"`Total: {unique_count} unique numbers`\n"
+                        f"📁 *Your WhatsApp Numbers File is Ready!*\n"
+                        f"📱 `Total Numbers: {unique_count}`\n"
                         f"_Made by DK Sharma Bot_ 🤖"
                     ),
                     parse_mode="Markdown",
                 )
         except Exception as e:
-            bot.send_message(chat_id, f"❌ File error: `{e}`", parse_mode="Markdown")
+            bot.send_message(
+                chat_id,
+                f"❌ File send error: `{str(e)}`",
+                parse_mode="Markdown",
+            )
         finally:
             if os.path.exists(file_name):
                 os.remove(file_name)
@@ -580,12 +625,11 @@ def extraction_worker(chat_id: int, user_id: int, url: str, count: int, message_
             chat_id,
             (
                 "⚠️ *No WhatsApp numbers found.*\n\n"
-                "*Possible reasons:*\n"
-                "• Website loads numbers via JavaScript AJAX after page load\n"
-                "• Link has expired or is invalid\n"
-                "• Website is heavily bot-protected (needs real browser)\n"
-                "• Numbers are inside an iframe or dynamic popup\n\n"
-                "_Try a different link or test with /debug command._"
+                "Possible reasons:\n"
+                "• Website is currently down\n"
+                "• Link has expired\n"
+                "• Rotation limit reached\n\n"
+                "_Try another link or test with 1x first._"
             ),
             parse_mode="Markdown",
             reply_markup=main_keyboard(),
@@ -593,10 +637,48 @@ def extraction_worker(chat_id: int, user_id: int, url: str, count: int, message_
 
 
 # =========================================================
+# Keyboard Builders
+# =========================================================
+def main_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🔗 Send New Link"),
+        types.KeyboardButton("📋 My History"),
+        types.KeyboardButton("📊 My Stats"),
+        types.KeyboardButton("❓ Help"),
+        types.KeyboardButton("📞 Support"),
+    )
+    return markup
+
+
+def extraction_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🧪 Test (1x)"),
+        types.KeyboardButton("🚀 20 Times"),
+        types.KeyboardButton("⚡ 50 Times"),
+        types.KeyboardButton("💎 100 Times (Max)"),
+        types.KeyboardButton("❌ Cancel"),
+    )
+    return markup
+
+
+def admin_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("📈 Bot Stats"),
+        types.KeyboardButton("📢 Broadcast"),
+        types.KeyboardButton("👥 Recent Users"),
+        types.KeyboardButton("🔙 Main Menu"),
+    )
+    return markup
+
+
+# =========================================================
 # Command Handlers
 # =========================================================
 @bot.message_handler(commands=["start"])
-def cmd_start(message: types.Message):
+def cmd_start(message: types.Message) -> None:
     user = message.from_user
     register_user(user.id, user.username, user.first_name)
     bot.send_message(
@@ -606,25 +688,29 @@ def cmd_start(message: types.Message):
             f"🤖 *WhatsApp Number Extractor*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"Made by *DK Sharma* 🎯\n\n"
-            f"🔥 *What this bot does:*\n"
-            f"Extracts hidden WhatsApp numbers from rotating/redirect links "
-            f"automatically, in bulk, with real Chrome browser impersonation.\n\n"
+            f"🔥 *What can this bot do?*\n"
+            f"Extract hidden WhatsApp numbers from any rotating or redirect link — "
+            f"even links with JavaScript & anti-bot protection (like ByetHost/site.je)!\n\n"
             f"📌 *How to use:*\n"
             f"1️⃣ Press *🔗 Send New Link*\n"
-            f"2️⃣ Paste your rotating/redirect URL\n"
-            f"3️⃣ Choose how many cycles (20, 50, 100)\n"
-            f"4️⃣ Get a `.txt` file with all unique numbers!\n\n"
+            f"2️⃣ Send your rotating/redirect URL\n"
+            f"3️⃣ Choose extraction count (1, 20, 50, 100)\n"
+            f"4️⃣ Get your `.txt` file with all unique numbers!\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👇 *Choose an option:*"
+            f"👇 *Choose an option below:*"
         ),
         reply_markup=main_keyboard(),
     )
 
 
 @bot.message_handler(commands=["admin"])
-def cmd_admin(message: types.Message):
+def cmd_admin(message: types.Message) -> None:
     if message.from_user.id not in ADMIN_IDS:
-        bot.send_message(message.chat.id, "❌ *Access Denied.*", parse_mode="Markdown")
+        bot.send_message(
+            message.chat.id,
+            "❌ *Access Denied.* You are not an admin.",
+            parse_mode="Markdown",
+        )
         return
     bot.send_message(
         message.chat.id,
@@ -632,75 +718,6 @@ def cmd_admin(message: types.Message):
         parse_mode="Markdown",
         reply_markup=admin_keyboard(),
     )
-
-
-@bot.message_handler(commands=["stats"])
-def cmd_stats(message: types.Message):
-    stats = get_user_stats(message.from_user.id)
-    if not stats:
-        bot.send_message(message.chat.id, "📊 No stats yet. Run your first extraction!")
-        return
-    bot.send_message(
-        message.chat.id,
-        (
-            f"📊 *Your Stats*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔄 *Total Extractions:* `{stats.get('total_extractions', 0)}`\n"
-            f"📱 *Total Numbers Found:* `{stats.get('total_numbers_found', 0)}`\n"
-            f"📅 *Member Since:* `{stats.get('joined_at', 'N/A')}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━"
-        ),
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(),
-    )
-
-
-@bot.message_handler(commands=["debug"])
-def cmd_debug(message: types.Message):
-    """Debug command: test a URL manually and show raw output."""
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].startswith("http"):
-        bot.send_message(
-            message.chat.id,
-            "🔧 *Debug Usage:*\n`/debug https://your-link-here`\n\n"
-            "Shows exactly what the bot sees when it visits your URL.",
-            parse_mode="Markdown",
-        )
-        return
-
-    url = parts[1].strip()
-    bot.send_message(message.chat.id, f"🔍 Testing URL:\n`{url}`\n\n_Please wait..._", parse_mode="Markdown")
-
-    session = cffi_requests.Session()
-    nums, raw, err = _visit_once(url, session)
-
-    if err:
-        bot.send_message(
-            message.chat.id,
-            f"❌ *Error visiting URL:*\n`{err}`\n\n"
-            f"This means the site is blocking all automated requests.",
-            parse_mode="Markdown",
-        )
-        return
-
-    if nums:
-        result = "\n".join(f"+{n}" for n in sorted(nums))
-        bot.send_message(
-            message.chat.id,
-            f"✅ *Debug Result — Numbers Found: {len(nums)}*\n\n```\n{result}\n```",
-            parse_mode="Markdown",
-        )
-    else:
-        bot.send_message(
-            message.chat.id,
-            (
-                f"⚠️ *Debug Result — No Numbers Found*\n\n"
-                f"Raw regex matches: `{raw}`\n\n"
-                f"The URL was visited but no WhatsApp number pattern was detected.\n"
-                f"The number may be loaded via AJAX after page load."
-            ),
-            parse_mode="Markdown",
-        )
 
 
 # =========================================================
@@ -715,7 +732,7 @@ _EXTRACTION_COUNT_MAP = {
 
 
 @bot.message_handler(func=lambda m: True)
-def handle_messages(message: types.Message):
+def handle_messages(message: types.Message) -> None:
     user = message.from_user
     chat_id = message.chat.id
     text = (message.text or "").strip()
@@ -723,48 +740,64 @@ def handle_messages(message: types.Message):
     register_user(user.id, user.username, user.first_name)
     state = user_states.get(user.id, {})
 
-    # ── Cancel / Main Menu ────────────────────────────────────────────
+    # Global Cancel / Back to Main Menu
     if text in ("❌ Cancel", "🔙 Main Menu"):
         if text == "❌ Cancel":
             active_jobs[user.id] = False
         user_states[user.id] = {}
-        bot.send_message(chat_id, "🏠 *Main Menu*", parse_mode="Markdown", reply_markup=main_keyboard())
+        bot.send_message(
+            chat_id,
+            "🏠 *Main Menu*",
+            parse_mode="Markdown",
+            reply_markup=main_keyboard(),
+        )
         return
 
-    # ── Admin Broadcast Input ─────────────────────────────────────────
+    # Admin Broadcast
     if user.id in ADMIN_IDS and state.get("awaiting_broadcast"):
         user_states[user.id] = {}
         all_users = get_all_user_ids()
         sent = failed = 0
-        status_msg = bot.send_message(chat_id, f"🚀 *Broadcasting to {len(all_users)} users...*", parse_mode="Markdown")
+        status_msg = bot.send_message(
+            chat_id,
+            f"🚀 *Broadcasting to {len(all_users)} users...*",
+            parse_mode="Markdown",
+        )
         for uid in all_users:
             try:
-                bot.send_message(uid, text, parse_mode="Markdown")
+                bot.send_message(uid, text)
                 sent += 1
                 time.sleep(0.05)
             except Exception:
                 failed += 1
-        bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg.message_id,
-            text=f"✅ *Broadcast Complete!*\n🎉 Sent: `{sent}`\n❌ Failed: `{failed}`",
-            parse_mode="Markdown",
-        )
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_msg.message_id,
+                text=(
+                    f"✅ *Broadcast Complete!*\n"
+                    f"🎉 Sent: `{sent}`\n"
+                    f"❌ Failed: `{failed}`"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
         bot.send_message(chat_id, "Admin Panel:", reply_markup=admin_keyboard())
         return
 
-    # ── Admin Panel Buttons ───────────────────────────────────────────
+    # Admin Buttons
     if user.id in ADMIN_IDS:
         if text == "📈 Bot Stats":
-            s = get_admin_stats()
+            stats = get_admin_stats()
             bot.send_message(
                 chat_id,
                 (
                     f"📈 *Bot System Stats*\n"
                     f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👥 *Total Users:* `{s.get('total_users') or 0}`\n"
-                    f"🔄 *Total Extractions:* `{s.get('total_ex') or 0}`\n"
-                    f"📱 *Total Numbers Found:* `{s.get('total_nums') or 0}`\n"
+                    f"👥 *Total Users:* `{stats.get('total_users') or 0}`\n"
+                    f"🔄 *Total Extractions:* `{stats.get('total_ex') or 0}`\n"
+                    f"📱 *Total Numbers Found:* `{stats.get('total_nums') or 0}`\n"
                     f"━━━━━━━━━━━━━━━━━━━━━"
                 ),
                 parse_mode="Markdown",
@@ -774,53 +807,71 @@ def handle_messages(message: types.Message):
 
         if text == "📢 Broadcast":
             user_states[user.id] = {"awaiting_broadcast": True}
-            bot.send_message(chat_id, "📢 *Broadcast:*\nType message to send to ALL users:", parse_mode="Markdown")
+            bot.send_message(
+                chat_id,
+                "📢 *Broadcast Message*\n\nType the message you want to send to ALL users:",
+                parse_mode="Markdown",
+            )
             return
 
         if text == "👥 Recent Users":
             conn = get_conn()
             try:
                 rows = conn.execute(
-                    "SELECT user_id, first_name, username, total_numbers_found, joined_at "
-                    "FROM users ORDER BY joined_at DESC LIMIT 10"
+                    """SELECT user_id, first_name, username, total_numbers_found, joined_at
+                       FROM users
+                       ORDER BY joined_at DESC
+                       LIMIT 10"""
                 ).fetchall()
             finally:
                 conn.close()
+
             if not rows:
                 bot.send_message(chat_id, "No users yet.", reply_markup=admin_keyboard())
                 return
+
             msg = "👥 *Recent 10 Users*\n━━━━━━━━━━━━━━━━━━━━━\n\n"
             for i, r in enumerate(rows, 1):
+                name = r["first_name"] or "N/A"
+                uname = r["username"] or "no_username"
                 msg += (
-                    f"*#{i}* {r['first_name'] or 'N/A'} (`{r['user_id']}`)\n"
-                    f"📱 {r['total_numbers_found']} numbers | @{r['username'] or 'no_username'}\n\n"
+                    f"*#{i}* {name} (`{r['user_id']}`)\n"
+                    f"📱 {r['total_numbers_found']} numbers | @{uname}\n\n"
                 )
             bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=admin_keyboard())
             return
 
-    # ── Send New Link ─────────────────────────────────────────────────
+    # Send New Link
     if text == "🔗 Send New Link":
         if active_jobs.get(user.id):
-            bot.send_message(chat_id, "⚠️ *Extraction already running!* Please wait.", parse_mode="Markdown")
+            bot.send_message(
+                chat_id,
+                "⚠️ *You already have an extraction running!* Please wait for it to finish.",
+                parse_mode="Markdown",
+            )
             return
         user_states[user.id] = {"awaiting_url": True}
         bot.send_message(
             chat_id,
             (
                 "🔗 *Send Your Link*\n\n"
-                "Paste your rotating or redirect link below:\n\n"
-                "_Example:_ `https://example.com/redirect/abc123`"
+                "Please paste your rotating or redirect link below:\n\n"
+                "_Example:_ `https://prismatic-daifuku.site.je/l/7u9vPK`"
             ),
             parse_mode="Markdown",
             reply_markup=types.ReplyKeyboardRemove(),
         )
         return
 
-    # ── My Stats ─────────────────────────────────────────────────────
+    # My Stats
     if text == "📊 My Stats":
         stats = get_user_stats(user.id)
         if not stats:
-            bot.send_message(chat_id, "📊 No stats yet. Run your first extraction!", reply_markup=main_keyboard())
+            bot.send_message(
+                chat_id,
+                "📊 No stats yet. Run your first extraction!",
+                reply_markup=main_keyboard(),
+            )
             return
         bot.send_message(
             chat_id,
@@ -829,7 +880,7 @@ def handle_messages(message: types.Message):
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 *User ID:* `{user.id}`\n"
                 f"👤 *Name:* {stats.get('first_name') or 'Unknown'}\n"
-                f"🔄 *Total Extractions:* `{stats.get('total_extractions', 0)}`\n"
+                f"🔄 *Total Extractions Run:* `{stats.get('total_extractions', 0)}`\n"
                 f"📱 *Total Numbers Found:* `{stats.get('total_numbers_found', 0)}`\n"
                 f"📅 *Member Since:* `{stats.get('joined_at', 'N/A')}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━"
@@ -839,13 +890,13 @@ def handle_messages(message: types.Message):
         )
         return
 
-    # ── My History ───────────────────────────────────────────────────
+    # My History
     if text == "📋 My History":
         history = get_user_history(user.id, limit=10)
         if not history:
             bot.send_message(
                 chat_id,
-                "📋 *No history yet.*\n\nRun your first extraction!",
+                "📋 *No extraction history yet.*\n\nRun your first extraction to see results here!",
                 parse_mode="Markdown",
                 reply_markup=main_keyboard(),
             )
@@ -857,12 +908,14 @@ def handle_messages(message: types.Message):
             msg += (
                 f"*#{i}* | `{completed}`\n"
                 f"🔗 `{url_display}`\n"
-                f"🔄 Cycles: `{h['cycles']}` | 📱 Found: `{h['unique_numbers']}` | 🔁 Dupes: `{h['duplicate_count']}`\n\n"
+                f"🔄 Cycles: `{h['cycles']}` | "
+                f"📱 Found: `{h['unique_numbers']}` | "
+                f"🔁 Dupes: `{h['duplicate_count']}`\n\n"
             )
         bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=main_keyboard())
         return
 
-    # ── Help ─────────────────────────────────────────────────────────
+    # Help
     if text == "❓ Help":
         bot.send_message(
             chat_id,
@@ -871,36 +924,31 @@ def handle_messages(message: types.Message):
                 "━━━━━━━━━━━━━━━━━━━━━\n\n"
                 "*Step 1:* Press *🔗 Send New Link*\n"
                 "*Step 2:* Paste your rotating/redirect link\n"
-                "*Step 3:* Choose cycles:\n"
-                "  • `🧪 Test (1x)` — Quick single test\n"
-                "  • `🚀 20 Times` — Medium run\n"
+                "*Step 3:* Choose extraction count:\n"
+                "  • `🧪 Test (1x)` — One quick test\n"
+                "  • `🚀 20 Times` — Medium extraction\n"
                 "  • `⚡ 50 Times` — Full extraction\n"
-                "  • `💎 100 Times` — Maximum\n"
-                "*Step 4:* Wait, then download your `.txt` file\n\n"
+                "  • `💎 100 Times` — Maximum extraction\n"
+                "*Step 4:* Wait for results\n"
+                "*Step 5:* Download your `.txt` file!\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
-                "🔧 *Debug a link:*\n"
-                "`/debug https://your-link`\n\n"
-                "⚙️ *How it works:*\n"
-                "• Real Chrome TLS fingerprint (curl\\_cffi)\n"
-                "• Follows HTTP + JS + meta-refresh redirects\n"
-                "• Scans HTML, scripts, meta tags, data attrs\n"
-                "• Rotates User-Agent every request\n"
-                "• Clears cookies before every visit\n"
-                "• Human-like 1.5–3.5s delays"
+                "🔄 *What is a rotating link?*\n"
+                "A link that redirects to WhatsApp with a different phone number each time. "
+                "This bot bypasses all anti-bot protections and saves all unique numbers!"
             ),
             parse_mode="Markdown",
             reply_markup=main_keyboard(),
         )
         return
 
-    # ── Support ──────────────────────────────────────────────────────
+    # Support
     if text == "📞 Support":
         bot.send_message(
             chat_id,
             (
                 "📞 *Support & Help*\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
-                "Having issues? Contact:\n\n"
+                "Having issues? Contact the admin:\n\n"
                 "👤 *Admin:* @YourAdminHandle\n\n"
                 "_Made with ❤️ by DK Sharma_"
             ),
@@ -909,15 +957,19 @@ def handle_messages(message: types.Message):
         )
         return
 
-    # ── URL Capture ───────────────────────────────────────────────────
+    # URL Submission
     if state.get("awaiting_url") or text.startswith(("http://", "https://")):
         if not text.startswith(("http://", "https://")):
             bot.send_message(
                 chat_id,
-                "⚠️ *Invalid URL.*\nSend a link starting with `http://` or `https://`",
+                (
+                    "⚠️ *Invalid URL.*\n\n"
+                    "Please send a valid URL starting with `http://` or `https://`"
+                ),
                 parse_mode="Markdown",
             )
             return
+
         user_states[user.id] = {"url": text}
         bot.send_message(
             chat_id,
@@ -925,32 +977,34 @@ def handle_messages(message: types.Message):
                 f"✅ *Link Received!*\n\n"
                 f"🔗 `{text}`\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 *How many times to visit this link?*\n\n"
-                f"More visits = more chances to find different numbers\n"
-                f"Duplicates are automatically filtered out."
+                f"🎯 *How many times should the bot visit this link?*\n\n"
+                f"• More visits = more rotating numbers collected\n"
+                f"• Duplicates are automatically removed"
             ),
             parse_mode="Markdown",
             reply_markup=extraction_keyboard(),
         )
         return
 
-    # ── Extraction Count Selection ────────────────────────────────────
+    # Extraction Count Selection
     if "url" in state:
         count = _EXTRACTION_COUNT_MAP.get(text)
         if count is not None:
             target_url = state["url"]
             user_states[user.id] = {}
+
             start_msg = bot.send_message(
                 chat_id,
                 (
                     f"⏳ *Starting extraction...*\n\n"
-                    f"🔗 `{target_url[:45]}{'...' if len(target_url) > 45 else ''}`\n"
+                    f"🔗 URL: `{target_url[:40]}{'...' if len(target_url) > 40 else ''}`\n"
                     f"🔄 Planned cycles: `{count}`\n\n"
-                    f"_Please wait. Do not close the chat._"
+                    f"_Bypassing protections and extracting numbers. Please wait..._"
                 ),
                 parse_mode="Markdown",
                 reply_markup=main_keyboard(),
             )
+
             threading.Thread(
                 target=extraction_worker,
                 args=(chat_id, user.id, target_url, count, start_msg.message_id),
@@ -958,8 +1012,12 @@ def handle_messages(message: types.Message):
             ).start()
             return
 
-    # ── Fallback ──────────────────────────────────────────────────────
-    bot.send_message(chat_id, "❓ Please choose an option from the menu below.", reply_markup=main_keyboard())
+    # Fallback
+    bot.send_message(
+        chat_id,
+        "❓ Please choose an option from the menu below.",
+        reply_markup=main_keyboard(),
+    )
 
 
 # =========================================================
@@ -967,18 +1025,18 @@ def handle_messages(message: types.Message):
 # =========================================================
 if __name__ == "__main__":
     init_db()
-    print("🤖 DK Sharma Bot starting...")
-    print(f"Admin IDs : {ADMIN_IDS}")
-    print(f"DB path   : {DB_FILE}")
+
+    print("🤖 DK Sharma Bot is starting...")
+    print(f"Admin IDs configured: {ADMIN_IDS}")
 
     try:
         bot.remove_webhook()
         time.sleep(1)
-        print("✅ Webhook removed.")
+        print("✅ Webhook removed successfully.")
     except Exception as e:
-        print(f"⚠️ Webhook warning: {e}")
+        print(f"⚠️  Webhook removal warning: {e}")
 
-    print("✅ Polling started...")
+    print("✅ Bot is now polling for messages...")
     while True:
         try:
             bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
