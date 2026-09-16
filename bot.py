@@ -16,7 +16,7 @@ from telebot.apihelper import ApiTelegramException
 # =========================================================
 # Configuration & Constants
 # =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8897758284:AAEOMrvaRfpjZmzcc91xkPnKr2nSOIQyUAA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8897758284:AAE5dZGfEYw6IGAhafnFa70dmiwPIs1ryDQ")
 
 ADMIN_IDS = [
     int(x.strip())
@@ -29,64 +29,18 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 # =========================================================
 # Maintenance Mode (Admin can toggle ON/OFF)
 # =========================================================
-MAINTENANCE_MODE = False  # False = Active for all | True = Only admins
+MAINTENANCE_MODE = False  # False = Bot active for all | True = Only admins can use
 
-# =========================================================
-# Proxy Pool — All 20 proxies (rotating per request)
-# =========================================================
-PROXY_LIST = [
-    # ── Batch 1/5 ──
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "ajU2MF6Ikj60_custom_zone_IN_st__city_sid_93300836_time_5",  "pass": "4977965"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "PaLh9cYLpA90_custom_zone_IN_st__city_sid_22770111_time_5",  "pass": "4977968"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "0G6DVvl50S40_custom_zone_IN_st__city_sid_12505227_time_5",  "pass": "4977972"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "UE2ig9iMXs10_custom_zone_IN_st__city_sid_59078548_time_5",  "pass": "4977974"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "sPpWHM9Tg540_custom_zone_IN_st__city_sid_30450690_time_5",  "pass": "4977983"},
-    # ── Batch 2/10 ──
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "pebooWgHxv90_custom_zone_IN_st__city_sid_88761836_time_5",  "pass": "4977991"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "GIcnSVrFhK70_custom_zone_IN_st__city_sid_00424286_time_5",  "pass": "4977994"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "dqlSXBDbHV00_custom_zone_IN_st__city_sid_20960218_time_5",  "pass": "4978006"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "FcPEjOrZOv60_custom_zone_IN_st__city_sid_80005378_time_5",  "pass": "4978011"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "BIqvZSSZDt00_custom_zone_IN_st__city_sid_34537474_time_5",  "pass": "4978022"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "FJ9LIt6CC420_custom_zone_IN_st__city_sid_34981499_time_5",  "pass": "4978024"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "RD6lrZVHNZ20_custom_zone_IN_st__city_sid_94818226_time_5",  "pass": "4978026"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "psSd9woUXfA0_custom_zone_IN_st__city_sid_25741592_time_5",  "pass": "4978040"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "WSNBiFPYUk30_custom_zone_IN_st__city_sid_70400970_time_5",  "pass": "4978041"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "TByoEbSZUr60_custom_zone_IN_st__city_sid_89177696_time_5",  "pass": "4978052"},
-    # ── Batch 3/5 ──
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "PgTVYMmNkfA0_custom_zone_IN_st__city_sid_97733468_time_5",  "pass": "4978056"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "FcYiPxQwMN40_custom_zone_IN_st__city_sid_95143370_time_5",  "pass": "4978069"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "drlsCv3yNK60_custom_zone_IN_st__city_sid_30589365_time_5",  "pass": "4978074"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "Nwlmr9e3XT00_custom_zone_IN_st__city_sid_27593950_time_5",  "pass": "4978083"},
-    {"host": "change4.owlproxy.com", "port": 7778, "user": "eenpbtufpN70_custom_zone_IN_st__city_sid_68883008_time_5",  "pass": "4978098"},
-]
-
-_proxy_index = 0
-_proxy_lock  = threading.Lock()
-
-
-def get_next_proxy() -> dict:
-    """Round-robin: returns next proxy from pool, wraps around."""
-    global _proxy_index
-    with _proxy_lock:
-        proxy = PROXY_LIST[_proxy_index % len(PROXY_LIST)]
-        _proxy_index += 1
-    return proxy
-
-
-# =========================================================
-# User State & Active Jobs
-# =========================================================
-# user_id -> {"url": str, "use_proxy": bool, "awaiting_url": bool, ...}
+# user_id -> {"url": str, "awaiting_url": bool, "awaiting_broadcast": bool}
 user_states: dict = {}
 
 # active extraction jobs: user_id -> True (running) / False (cancelled)
 active_jobs: dict = {}
 
-
 # =========================================================
 # Database Setup
 # =========================================================
-DB_FILE  = "bot_database.db"
+DB_FILE = "bot_database.db"
 _db_lock = threading.Lock()
 
 
@@ -373,6 +327,7 @@ def decrypt_byet_challenge(c_hex: str, a_hex: str, b_hex: str) -> str:
     Mode 2 = AES-128-CBC. Decrypts ciphertext 'c' using key 'a' and IV 'b'.
     Returns hex string for document.cookie = '__test=' + hex.
     """
+    # 1. Fast path: pycryptodome if installed
     try:
         from Crypto.Cipher import AES
         cipher = AES.new(bytes.fromhex(a_hex), AES.MODE_CBC, bytes.fromhex(b_hex))
@@ -380,6 +335,7 @@ def decrypt_byet_challenge(c_hex: str, a_hex: str, b_hex: str) -> str:
     except Exception:
         pass
 
+    # 2. Fast path: OpenSSL command if available
     import shutil
     import subprocess
     if shutil.which("openssl"):
@@ -396,10 +352,11 @@ def decrypt_byet_challenge(c_hex: str, a_hex: str, b_hex: str) -> str:
         except Exception:
             pass
 
+    # 3. Guaranteed Pure Python path (zero dependencies, works anywhere)
     c = bytes.fromhex(c_hex)
     a = bytes.fromhex(a_hex)
     b = bytes.fromhex(b_hex)
-    w   = _key_schedule(a)
+    w = _key_schedule(a)
     dec = _decrypt_single_block(c, w)
     res = bytes([dec[i] ^ b[i] for i in range(16)])
     return res.hex()
@@ -414,7 +371,7 @@ _WA_PATTERNS = [
     re.compile(r'whatsapp://send\?phone=(\+?\d+)', re.IGNORECASE),
     re.compile(r'api\.whatsapp\.com/send/?\??[^"\'\s]*phone=(\+?\d+)', re.IGNORECASE),
     re.compile(r'whatsapp\.com/send/?\??[^"\'\s]*phone=(\+?\d+)', re.IGNORECASE),
-    re.compile(r'wa\.me/(?:message/[A-Za-z0-9]+[^"\'\s]*?[?&]phone=)?(\d{10,15})', re.IGNORECASE),
+    re.compile(r'wa\.me/(?:message/[A-Z0-9]+.*?)?(\d{10,15})', re.IGNORECASE),
     re.compile(r'web\.whatsapp\.com/send/?\??[^"\'\s]*phone=(\+?\d+)', re.IGNORECASE),
 ]
 
@@ -438,57 +395,21 @@ def extract_numbers_from_text(text: str) -> set[str]:
 
 
 # =========================================================
-# Scraper Session — supports Direct & Proxy mode
+# Intelligent Session with Anti-Bot Challenge Solving
 # =========================================================
 class RotatingScraperSession:
-    def __init__(self, proxy: dict = None):
-        """
-        proxy = dict{host, port, user, pass}  or  None for direct connection.
-        In proxy mode, _make_opener is called fresh per-request (new IP each time).
-        """
-        self.proxy = proxy
+    def __init__(self):
+        self.cj = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cj))
         self.cached_test_cookie = None
         self.domain = None
-        self.cj, self.opener = self._make_opener(proxy)
 
-    def _make_opener(self, proxy: dict):
-        cj  = http.cookiejar.CookieJar()
-        handlers = [urllib.request.HTTPCookieProcessor(cj)]
-        if proxy:
-            proxy_url = (
-                f"http://{proxy['user']}:{proxy['pass']}"
-                f"@{proxy['host']}:{proxy['port']}"
-            )
-            handlers.insert(0, urllib.request.ProxyHandler({
-                "http":  proxy_url,
-                "https": proxy_url,
-            }))
-        opener = urllib.request.build_opener(*handlers)
-        return cj, opener
-
-    def fetch(self, url: str, rotate_proxy: bool = False) -> tuple[str, str, list[str]]:
+    def fetch(self, url: str) -> tuple[str, str, list[str]]:
         """
-        Fetches URL, solves ByetHost/InfinityFree AES anti-bot challenge,
-        follows JS/meta redirects.
-        rotate_proxy=True → pick a fresh proxy from the pool for this request.
-        Returns (final_url, final_body, all_visited_urls).
+        Visits the URL, solves any ByetHost / InfinityFree AES challenges,
+        follows all HTTP redirects and client-side JavaScript / meta redirects,
+        and returns: (final_url, final_body, all_visited_urls).
         """
-        if rotate_proxy:
-            new_proxy = get_next_proxy()
-            # Rebuild opener with fresh proxy; preserve cached anti-bot cookie value
-            # so we don't have to re-solve the AES challenge on every cycle.
-            self.cj, self.opener = self._make_opener(new_proxy)
-            # Re-inject __test cookie into the new CookieJar if we solved it before
-            if self.cached_test_cookie and self.domain:
-                _cookie = http.cookiejar.Cookie(
-                    version=0, name="__test", value=self.cached_test_cookie,
-                    port=None, port_specified=False,
-                    domain=self.domain, domain_specified=True, domain_initial_dot=False,
-                    path="/", path_specified=True, secure=False, expires=None, discard=True,
-                    comment=None, comment_url=None, rest={"HttpOnly": None}, rfc2109=False,
-                )
-                self.cj.set_cookie(_cookie)
-
         parsed = urllib.parse.urlparse(url)
         self.domain = parsed.hostname
 
@@ -502,6 +423,7 @@ class RotatingScraperSession:
             ("Upgrade-Insecure-Requests", "1"),
         ]
 
+        # Reuse valid __test cookie if available for this domain
         if self.cached_test_cookie and self.domain:
             c_obj = http.cookiejar.Cookie(
                 version=0, name="__test", value=self.cached_test_cookie, port=None, port_specified=False,
@@ -512,13 +434,13 @@ class RotatingScraperSession:
             self.cj.set_cookie(c_obj)
 
         visited_urls = [url]
-        req  = urllib.request.Request(url)
+        req = urllib.request.Request(url)
         resp = self.opener.open(req, timeout=12)
         current_url = resp.geturl()
         visited_urls.append(current_url)
         body = resp.read().decode("utf-8", errors="ignore")
 
-        # ── Solve InfinityFree / ByetHost slowAES challenge ──────────
+        # Detect and solve InfinityFree / ByetHost slowAES anti-bot challenge
         if "slowAES" in body or ("toNumbers(" in body and "__test=" in body):
             matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', body)
             if len(matches) >= 3:
@@ -533,9 +455,10 @@ class RotatingScraperSession:
                     )
                     self.cj.set_cookie(c_obj)
 
+                # Find redirect destination (e.g. ?i=1)
                 loc_match = re.search(r'location\.href\s*=\s*["\'](.*?)["\']', body)
-                next_dest  = loc_match.group(1) if loc_match else (url + ("&i=1" if "?" in url else "?i=1"))
-                next_url   = urllib.parse.urljoin(current_url, next_dest)
+                next_dest = loc_match.group(1) if loc_match else (url + ("&i=1" if "?" in url else "?i=1"))
+                next_url = urllib.parse.urljoin(current_url, next_dest)
 
                 visited_urls.append(next_url)
                 resp2 = self.opener.open(urllib.request.Request(next_url), timeout=12)
@@ -543,12 +466,9 @@ class RotatingScraperSession:
                 visited_urls.append(current_url)
                 body = resp2.read().decode("utf-8", errors="ignore")
 
-        # ── Follow meta-refresh / JS redirects (up to 2 hops) ────────
+        # Check for HTML meta refresh or JavaScript redirection
         for _ in range(2):
-            meta_refresh = re.search(
-                r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*url=([^"\'>]+)',
-                body, re.IGNORECASE
-            )
+            meta_refresh = re.search(r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*url=([^"\'>]+)', body, re.IGNORECASE)
             if meta_refresh:
                 redirect_target = urllib.parse.urljoin(current_url, meta_refresh.group(1).strip())
                 visited_urls.append(redirect_target)
@@ -558,10 +478,7 @@ class RotatingScraperSession:
                 body = resp.read().decode("utf-8", errors="ignore")
                 continue
 
-            js_redirect = re.search(
-                r'(?:window\.)?location(?:\.href|\.replace)\s*\(\s*["\'](https?://[^"\']+)["\']\s*\)',
-                body, re.IGNORECASE
-            )
+            js_redirect = re.search(r'(?:window\.)?location(?:\.href|\.replace)\s*\(\s*["\'](https?://[^"\']+)["\']\s*\)', body, re.IGNORECASE)
             if js_redirect:
                 redirect_target = js_redirect.group(1).strip()
                 visited_urls.append(redirect_target)
@@ -576,7 +493,7 @@ class RotatingScraperSession:
 
 
 def add_cache_buster(url: str, cycle: int) -> str:
-    cb  = f"{int(time.time() * 1000)}_{cycle}_{random.randint(100, 999)}"
+    cb = f"{int(time.time() * 1000)}_{cycle}_{random.randint(100, 999)}"
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}cb={cb}"
 
@@ -585,23 +502,20 @@ def add_cache_buster(url: str, cycle: int) -> str:
 # Worker Thread for Extractions
 # =========================================================
 def extraction_worker(
-    chat_id:   int,
-    user_id:   int,
-    url:       str,
-    count:     int,
+    chat_id: int,
+    user_id: int,
+    url: str,
+    count: int,
     message_id: int,
-    use_proxy: bool = False,
 ) -> None:
     active_jobs[user_id] = True
-    # When use_proxy=True, rotate_proxy=True in fetch() pulls a fresh proxy each cycle.
-    # Do NOT pre-consume one here — that would waste slot #1 without a request attached.
-    session = RotatingScraperSession(proxy=None)
+    session = RotatingScraperSession()
 
-    found_numbers:      set[str] = set()
-    total_numbers_seen  = 0
-    total_ok            = 0
-    errors              = 0
-    last_ui_update      = 0.0
+    found_numbers: set[str] = set()
+    total_numbers_seen = 0
+    total_ok = 0
+    errors = 0
+    last_ui_update = 0.0
 
     for i in range(1, count + 1):
         if not active_jobs.get(user_id, True):
@@ -609,8 +523,7 @@ def extraction_worker(
 
         target = add_cache_buster(url, i)
         try:
-            # rotate_proxy=True → fresh proxy from pool every single request
-            final_url, body, visited_urls = session.fetch(target, rotate_proxy=use_proxy)
+            final_url, body, visited_urls = session.fetch(target)
             total_ok += 1
 
             cycle_numbers: set[str] = set()
@@ -623,19 +536,14 @@ def extraction_worker(
         except Exception:
             errors += 1
 
-        # ── Periodic progress update (throttled) ─────────────────────
+        # Periodic UI update with throttle to avoid Telegram rate limits
         now = time.time()
         if (now - last_ui_update > 2.5) or i == count:
             last_ui_update = now
             try:
                 done = int((i / count) * 10)
-                bar  = "█" * done + "░" * (10 - done)
-                pct  = int((i / count) * 100)
-                mode_line = (
-                    "🌐 *Mode:* `With Proxy (Rotating IP)`"
-                    if use_proxy else
-                    "⚡ *Mode:* `Direct (No Proxy)`"
-                )
+                bar = "█" * done + "░" * (10 - done)
+                pct = int((i / count) * 100)
                 bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -643,7 +551,6 @@ def extraction_worker(
                         f"⏳ *Extraction In Progress*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔗 *URL:* `{url[:38]}{'...' if len(url) > 38 else ''}`\n"
-                        f"{mode_line}\n"
                         f"📊 *Progress:* `[{bar}] {pct}%`\n"
                         f"🔄 *Requests:* `{i}/{count}`\n"
                         f"✅ *Successful:* `{total_ok}`\n"
@@ -664,19 +571,17 @@ def extraction_worker(
     # ── Extraction Complete ───────────────────────────────────────────
     active_jobs.pop(user_id, None)
 
-    unique_count    = len(found_numbers)
+    unique_count = len(found_numbers)
     duplicate_count = max(total_numbers_seen - unique_count, 0)
 
     update_user_stats(user_id, unique_count)
     save_history(user_id, url, count, unique_count, duplicate_count)
 
-    mode_label = "🌐 With Proxy (Rotating IP)" if use_proxy else "⚡ Direct (No Proxy)"
     bot.send_message(
         chat_id,
         (
             f"✅ *Extraction Complete!*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📡 *Mode Used:* `{mode_label}`\n"
             f"📊 *Total Cycles Run:* `{count}`\n"
             f"✅ *Successful Requests:* `{total_ok}`\n"
             f"❌ *Failed Requests:* `{errors}`\n"
@@ -689,21 +594,22 @@ def extraction_worker(
     )
 
     if unique_count > 0:
-        # ── 1. Show numbers directly in chat + Copy button ────────────
+        # ── 1. Show numbers directly in chat (with copy button) ──────
         sorted_numbers = sorted(found_numbers)
-        numbers_text   = "\n".join(f"+{num}" for num in sorted_numbers)
+        numbers_text = "\n".join(f"+{num}" for num in sorted_numbers)
 
+        # Telegram message limit is 4096 chars; split if needed
         CHUNK_SIZE = 3800
         header = (
             f"📱 *Extracted WhatsApp Numbers*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 *Total Unique:* `{unique_count}`\n"
-            f"📡 *Mode:* `{mode_label}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         )
 
+        # Split numbers into chunks so each message fits Telegram limit
         lines = numbers_text.split("\n")
-        chunks: list[str] = []
+        chunks = []
         current_chunk = ""
         for line in lines:
             if len(current_chunk) + len(line) + 1 > CHUNK_SIZE:
@@ -714,15 +620,12 @@ def extraction_worker(
         if current_chunk.strip():
             chunks.append(current_chunk.strip())
 
-        # Inline keyboard: Copy button on first message
-        # Telegram's switch_inline_query has a hard 256-char limit.
-        # Pass only the first N numbers that fit; the .txt file holds the full set.
-        inline_query_payload = numbers_text[:256]
+        # Send first chunk with header and copy button (inline keyboard)
         copy_markup = types.InlineKeyboardMarkup()
         copy_markup.add(
             types.InlineKeyboardButton(
                 text="📋 Copy All Numbers",
-                switch_inline_query=inline_query_payload,
+                switch_inline_query=numbers_text,
             )
         )
 
@@ -732,13 +635,19 @@ def extraction_worker(
             try:
                 if idx == 0:
                     bot.send_message(
-                        chat_id, msg_text,
+                        chat_id,
+                        msg_text,
                         parse_mode="Markdown",
                         reply_markup=copy_markup,
                     )
                 else:
-                    bot.send_message(chat_id, msg_text, parse_mode="Markdown")
+                    bot.send_message(
+                        chat_id,
+                        msg_text,
+                        parse_mode="Markdown",
+                    )
             except Exception:
+                # If markdown fails, send plain
                 bot.send_message(chat_id, chunk)
 
         # ── 2. Also send as .txt file ─────────────────────────────────
@@ -746,8 +655,7 @@ def extraction_worker(
         try:
             with open(file_name, "w", encoding="utf-8") as f:
                 f.write("DK Sharma Bot — WhatsApp Number Extractor\n")
-                f.write(f"Source URL : {url}\n")
-                f.write(f"Mode       : {mode_label}\n")
+                f.write(f"Source URL: {url}\n")
                 f.write(f"Date & Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"Total Unique Numbers: {unique_count}\n")
                 f.write("=" * 45 + "\n\n")
@@ -756,11 +664,11 @@ def extraction_worker(
 
             with open(file_name, "rb") as doc:
                 bot.send_document(
-                    chat_id, doc,
+                    chat_id,
+                    doc,
                     caption=(
                         f"📁 *Your WhatsApp Numbers File is Ready!*\n"
                         f"📱 `Total Numbers: {unique_count}`\n"
-                        f"📡 `Mode: {mode_label}`\n"
                         f"_Made by DK Sharma Bot_ 🤖"
                     ),
                     parse_mode="Markdown",
@@ -831,52 +739,6 @@ def admin_keyboard() -> types.ReplyKeyboardMarkup:
 
 
 # =========================================================
-# Callback: Proxy / Direct Mode Choice (Inline Buttons)
-# =========================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("proxy:"))
-def callback_proxy_choice(call: types.CallbackQuery) -> None:
-    user    = call.from_user
-    chat_id = call.message.chat.id
-
-    if MAINTENANCE_MODE and user.id not in ADMIN_IDS:
-        bot.answer_callback_query(call.id, "🔧 Bot is under maintenance.")
-        return
-
-    state = user_states.get(user.id, {})
-    if "url" not in state:
-        bot.answer_callback_query(call.id, "⚠️ Session expired. Please send the link again.")
-        return
-
-    use_proxy = (call.data == "proxy:yes")
-    user_states[user.id] = {"url": state["url"], "use_proxy": use_proxy}
-
-    mode_text = (
-        "🌐 *With Proxy* — Rotating IP per request ✅"
-        if use_proxy else
-        "⚡ *Without Proxy* — Fast direct connection ✅"
-    )
-    bot.answer_callback_query(call.id, "✅ Mode selected!")
-
-    try:
-        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-    except Exception:
-        pass
-
-    bot.send_message(
-        chat_id,
-        (
-            f"{mode_text}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 *How many times should the bot visit this link?*\n\n"
-            f"• More visits = more rotating numbers collected\n"
-            f"• Duplicates are automatically removed"
-        ),
-        parse_mode="Markdown",
-        reply_markup=extraction_keyboard(),
-    )
-
-
-# =========================================================
 # Command Handlers
 # =========================================================
 @bot.message_handler(commands=["start"])
@@ -896,64 +758,12 @@ def cmd_start(message: types.Message) -> None:
             f"📌 *How to use:*\n"
             f"1️⃣ Press *🔗 Send New Link*\n"
             f"2️⃣ Send your rotating/redirect URL\n"
-            f"3️⃣ Choose *Without Proxy* or *With Proxy* mode\n"
-            f"4️⃣ Choose extraction count (1, 20, 50, 100)\n"
-            f"5️⃣ Get numbers in chat + `.txt` file!\n\n"
+            f"3️⃣ Choose extraction count (1, 20, 50, 100)\n"
+            f"4️⃣ Get your `.txt` file with all unique numbers!\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"👇 *Choose an option below:*"
         ),
         reply_markup=main_keyboard(),
-    )
-
-
-@bot.message_handler(commands=["help"])
-def cmd_help(message: types.Message) -> None:
-    """Alias: /help → same content as the ❓ Help button."""
-    bot.send_message(
-        message.chat.id,
-        (
-            "❓ *How to Use DK Sharma Bot*\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "*Step 1:* Press *🔗 Send New Link*\n"
-            "*Step 2:* Paste your rotating/redirect link\n"
-            "*Step 3:* Choose extraction mode:\n"
-            "  ⚡ *Without Proxy* — Fast, direct connection\n"
-            "  🌐 *With Proxy* — New IP every request\n"
-            "  _(Use With Proxy for airplane-mode style links)_\n"
-            "*Step 4:* Choose extraction count:\n"
-            "  • `🧪 Test (1x)` — One quick test\n"
-            "  • `🚀 20 Times` — Medium extraction\n"
-            "  • `⚡ 50 Times` — Full extraction\n"
-            "  • `💎 100 Times` — Maximum extraction\n"
-            "*Step 5:* Numbers show in chat + `.txt` file!\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔄 *What is a rotating link?*\n"
-            "A link that redirects to WhatsApp with a different phone number each time. "
-            "This bot bypasses all anti-bot protections and saves all unique numbers!"
-        ),
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(),
-    )
-
-
-@bot.message_handler(commands=["status"])
-def cmd_status(message: types.Message) -> None:
-    """Admin-only: quick runtime status check."""
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    active_count = sum(1 for v in active_jobs.values() if v)
-    bot.send_message(
-        message.chat.id,
-        (
-            f"🟢 *Bot Runtime Status*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔄 *Active Jobs:* `{active_count}`\n"
-            f"🌐 *Proxy Pool Size:* `{len(PROXY_LIST)}`\n"
-            f"🔧 *Maintenance Mode:* `{'ON' if MAINTENANCE_MODE else 'OFF'}`\n"
-            f"👤 *Proxy Index (current):* `{_proxy_index % len(PROXY_LIST)}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━"
-        ),
-        parse_mode="Markdown",
     )
 
 
@@ -978,9 +788,9 @@ def cmd_admin(message: types.Message) -> None:
 # Main Message Router
 # =========================================================
 _EXTRACTION_COUNT_MAP = {
-    "🧪 Test (1x)":      1,
-    "🚀 20 Times":       20,
-    "⚡ 50 Times":       50,
+    "🧪 Test (1x)": 1,
+    "🚀 20 Times": 20,
+    "⚡ 50 Times": 50,
     "💎 100 Times (Max)": 100,
 }
 
@@ -989,9 +799,9 @@ _EXTRACTION_COUNT_MAP = {
 def handle_messages(message: types.Message) -> None:
     global MAINTENANCE_MODE
 
-    user    = message.from_user
+    user = message.from_user
     chat_id = message.chat.id
-    text    = (message.text or "").strip()
+    text = (message.text or "").strip()
 
     register_user(user.id, user.username, user.first_name)
     state = user_states.get(user.id, {})
@@ -1010,7 +820,7 @@ def handle_messages(message: types.Message) -> None:
         )
         return
 
-    # ── Global Cancel / Back to Main Menu ────────────────────────────
+    # Global Cancel / Back to Main Menu
     if text in ("❌ Cancel", "🔙 Main Menu"):
         if text == "❌ Cancel":
             active_jobs[user.id] = False
@@ -1023,7 +833,7 @@ def handle_messages(message: types.Message) -> None:
         )
         return
 
-    # ── Admin: Broadcast reply ────────────────────────────────────────
+    # Admin Broadcast
     if user.id in ADMIN_IDS and state.get("awaiting_broadcast"):
         user_states[user.id] = {}
         all_users = get_all_user_ids()
@@ -1056,7 +866,7 @@ def handle_messages(message: types.Message) -> None:
         bot.send_message(chat_id, "Admin Panel:", reply_markup=admin_keyboard())
         return
 
-    # ── Admin Buttons ─────────────────────────────────────────────────
+    # Admin Buttons
     if user.id in ADMIN_IDS:
         if text == "📈 Bot Stats":
             stats = get_admin_stats()
@@ -1085,17 +895,16 @@ def handle_messages(message: types.Message) -> None:
             return
 
         if text == "👥 Recent Users":
-            with _db_lock:
-                conn = get_conn()
-                try:
-                    rows = conn.execute(
-                        """SELECT user_id, first_name, username, total_numbers_found, joined_at
-                           FROM users
-                           ORDER BY joined_at DESC
-                           LIMIT 10"""
-                    ).fetchall()
-                finally:
-                    conn.close()
+            conn = get_conn()
+            try:
+                rows = conn.execute(
+                    """SELECT user_id, first_name, username, total_numbers_found, joined_at
+                       FROM users
+                       ORDER BY joined_at DESC
+                       LIMIT 10"""
+                ).fetchall()
+            finally:
+                conn.close()
 
             if not rows:
                 bot.send_message(chat_id, "No users yet.", reply_markup=admin_keyboard())
@@ -1103,8 +912,8 @@ def handle_messages(message: types.Message) -> None:
 
             msg = "👥 *Recent 10 Users*\n━━━━━━━━━━━━━━━━━━━━━\n\n"
             for i, r in enumerate(rows, 1):
-                name  = r["first_name"] or "N/A"
-                uname = r["username"]   or "no_username"
+                name = r["first_name"] or "N/A"
+                uname = r["username"] or "no_username"
                 msg += (
                     f"*#{i}* {name} (`{r['user_id']}`)\n"
                     f"📱 {r['total_numbers_found']} numbers | @{uname}\n\n"
@@ -1114,11 +923,7 @@ def handle_messages(message: types.Message) -> None:
 
         if text in ("🟢 Maintenance: OFF", "🔴 Maintenance: ON"):
             MAINTENANCE_MODE = not MAINTENANCE_MODE
-            status = (
-                "🔴 *ON* — Users cannot use the bot now."
-                if MAINTENANCE_MODE else
-                "🟢 *OFF* — Bot is active for all users."
-            )
+            status = "🔴 *ON* — Users cannot use the bot now." if MAINTENANCE_MODE else "🟢 *OFF* — Bot is active for all users."
             bot.send_message(
                 chat_id,
                 (
@@ -1131,7 +936,7 @@ def handle_messages(message: types.Message) -> None:
             )
             return
 
-    # ── Send New Link ─────────────────────────────────────────────────
+    # Send New Link
     if text == "🔗 Send New Link":
         if active_jobs.get(user.id):
             bot.send_message(
@@ -1153,7 +958,7 @@ def handle_messages(message: types.Message) -> None:
         )
         return
 
-    # ── My Stats ──────────────────────────────────────────────────────
+    # My Stats
     if text == "📊 My Stats":
         stats = get_user_stats(user.id)
         if not stats:
@@ -1180,7 +985,7 @@ def handle_messages(message: types.Message) -> None:
         )
         return
 
-    # ── My History ────────────────────────────────────────────────────
+    # My History
     if text == "📋 My History":
         history = get_user_history(user.id, limit=10)
         if not history:
@@ -1194,7 +999,7 @@ def handle_messages(message: types.Message) -> None:
         msg = "📋 *Your Last 10 Extractions*\n━━━━━━━━━━━━━━━━━━━━━\n\n"
         for i, h in enumerate(history, 1):
             url_display = (h["url"][:30] + "...") if len(h["url"]) > 30 else h["url"]
-            completed   = (h.get("completed_at") or "N/A")[:16]
+            completed = (h.get("completed_at") or "N/A")[:16]
             msg += (
                 f"*#{i}* | `{completed}`\n"
                 f"🔗 `{url_display}`\n"
@@ -1205,7 +1010,7 @@ def handle_messages(message: types.Message) -> None:
         bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=main_keyboard())
         return
 
-    # ── Help ──────────────────────────────────────────────────────────
+    # Help
     if text == "❓ Help":
         bot.send_message(
             chat_id,
@@ -1214,16 +1019,13 @@ def handle_messages(message: types.Message) -> None:
                 "━━━━━━━━━━━━━━━━━━━━━\n\n"
                 "*Step 1:* Press *🔗 Send New Link*\n"
                 "*Step 2:* Paste your rotating/redirect link\n"
-                "*Step 3:* Choose extraction mode:\n"
-                "  ⚡ *Without Proxy* — Fast, direct connection\n"
-                "  🌐 *With Proxy* — New IP every request\n"
-                "  _(Use With Proxy for airplane-mode style links)_\n"
-                "*Step 4:* Choose extraction count:\n"
+                "*Step 3:* Choose extraction count:\n"
                 "  • `🧪 Test (1x)` — One quick test\n"
                 "  • `🚀 20 Times` — Medium extraction\n"
                 "  • `⚡ 50 Times` — Full extraction\n"
                 "  • `💎 100 Times` — Maximum extraction\n"
-                "*Step 5:* Numbers show in chat + `.txt` file!\n\n"
+                "*Step 4:* Wait for results\n"
+                "*Step 5:* Download your `.txt` file!\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
                 "🔄 *What is a rotating link?*\n"
                 "A link that redirects to WhatsApp with a different phone number each time. "
@@ -1234,7 +1036,7 @@ def handle_messages(message: types.Message) -> None:
         )
         return
 
-    # ── Support ───────────────────────────────────────────────────────
+    # Support
     if text == "📞 Support":
         bot.send_message(
             chat_id,
@@ -1250,7 +1052,7 @@ def handle_messages(message: types.Message) -> None:
         )
         return
 
-    # ── URL Submission → Show Proxy / Direct choice ───────────────────
+    # URL Submission
     if state.get("awaiting_url") or text.startswith(("http://", "https://")):
         if not text.startswith(("http://", "https://")):
             bot.send_message(
@@ -1264,44 +1066,34 @@ def handle_messages(message: types.Message) -> None:
             return
 
         user_states[user.id] = {"url": text}
-
-        proxy_markup = types.InlineKeyboardMarkup(row_width=2)
-        proxy_markup.add(
-            types.InlineKeyboardButton("⚡ Without Proxy", callback_data="proxy:no"),
-            types.InlineKeyboardButton("🌐 With Proxy",    callback_data="proxy:yes"),
-        )
         bot.send_message(
             chat_id,
             (
                 f"✅ *Link Received!*\n\n"
                 f"🔗 `{text}`\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌐 *Choose Extraction Mode:*\n\n"
-                f"⚡ *Without Proxy* — Fast, uses your server's direct IP\n"
-                f"🌐 *With Proxy* — Different IP for every request\n"
-                f"_(Best for links that need airplane-mode style IP change)_"
+                f"🎯 *How many times should the bot visit this link?*\n\n"
+                f"• More visits = more rotating numbers collected\n"
+                f"• Duplicates are automatically removed"
             ),
             parse_mode="Markdown",
-            reply_markup=proxy_markup,
+            reply_markup=extraction_keyboard(),
         )
         return
 
-    # ── Extraction Count Selection ────────────────────────────────────
-    if "url" in state and "use_proxy" in state:
+    # Extraction Count Selection
+    if "url" in state:
         count = _EXTRACTION_COUNT_MAP.get(text)
         if count is not None:
             target_url = state["url"]
-            use_proxy  = state["use_proxy"]
             user_states[user.id] = {}
 
-            mode_label = "🌐 With Proxy (Rotating IP)" if use_proxy else "⚡ Without Proxy (Direct)"
-            start_msg  = bot.send_message(
+            start_msg = bot.send_message(
                 chat_id,
                 (
                     f"⏳ *Starting extraction...*\n\n"
                     f"🔗 URL: `{target_url[:40]}{'...' if len(target_url) > 40 else ''}`\n"
-                    f"🔄 Planned cycles: `{count}`\n"
-                    f"📡 Mode: `{mode_label}`\n\n"
+                    f"🔄 Planned cycles: `{count}`\n\n"
                     f"_Bypassing protections and extracting numbers. Please wait..._"
                 ),
                 parse_mode="Markdown",
@@ -1310,12 +1102,12 @@ def handle_messages(message: types.Message) -> None:
 
             threading.Thread(
                 target=extraction_worker,
-                args=(chat_id, user.id, target_url, count, start_msg.message_id, use_proxy),
+                args=(chat_id, user.id, target_url, count, start_msg.message_id),
                 daemon=True,
             ).start()
             return
 
-    # ── Fallback ──────────────────────────────────────────────────────
+    # Fallback
     bot.send_message(
         chat_id,
         "❓ Please choose an option from the menu below.",
@@ -1329,17 +1121,8 @@ def handle_messages(message: types.Message) -> None:
 if __name__ == "__main__":
     init_db()
 
-    print("=" * 55)
-    print("   🤖  DK Sharma Bot — WhatsApp Number Extractor")
-    print("   Version : 1.1.0  (proxy-cookie-fix + regex-fix)")
-    print("=" * 55)
-    print(f"   Admin IDs      : {ADMIN_IDS}")
-    print(f"   Proxy pool     : {len(PROXY_LIST)} entries loaded")
-    if len(PROXY_LIST) != 20:
-        print(f"   ⚠️  WARNING: Expected 20 proxies, found {len(PROXY_LIST)}")
-    print(f"   Database file  : {DB_FILE}")
-    print(f"   Maintenance    : {'ON' if MAINTENANCE_MODE else 'OFF'}")
-    print("=" * 55)
+    print("🤖 DK Sharma Bot is starting...")
+    print(f"Admin IDs configured: {ADMIN_IDS}")
 
     try:
         bot.remove_webhook()
