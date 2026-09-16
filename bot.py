@@ -16,7 +16,7 @@ from telebot.apihelper import ApiTelegramException
 # =========================================================
 # Configuration & Constants
 # =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8897758284:AAE5dZGfEYw6IGAhafnFa70dmiwPIs1ryDQ")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8267372667:AAHHxGfrhUpFBrnZ4KmN2emg66Xbu4SBhlg")
 
 ADMIN_IDS = [
     int(x.strip())
@@ -27,11 +27,37 @@ ADMIN_IDS = [
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 # =========================================================
+# Proxy Pool (rotating authenticated HTTP proxies)
+# =========================================================
+PROXIES = [
+    "http://ajU2MF6Ikj60_custom_zone_IN_st__city_sid_93300836_time_5:4977965@change4.owlproxy.com:7778",
+    "http://PaLh9cYLpA90_custom_zone_IN_st__city_sid_22770111_time_5:4977968@change4.owlproxy.com:7778",
+    "http://0G6DVvl50S40_custom_zone_IN_st__city_sid_12505227_time_5:4977972@change4.owlproxy.com:7778",
+    "http://UE2ig9iMXs10_custom_zone_IN_st__city_sid_59078548_time_5:4977974@change4.owlproxy.com:7778",
+    "http://sPpWHM9Tg540_custom_zone_IN_st__city_sid_30450690_time_5:4977983@change4.owlproxy.com:7778",
+    "http://pebooWgHxv90_custom_zone_IN_st__city_sid_88761836_time_5:4977991@change4.owlproxy.com:7778",
+    "http://GIcnSVrFhK70_custom_zone_IN_st__city_sid_00424286_time_5:4977994@change4.owlproxy.com:7778",
+    "http://dqlSXBDbHV00_custom_zone_IN_st__city_sid_20960218_time_5:4978006@change4.owlproxy.com:7778",
+    "http://FcPEjOrZOv60_custom_zone_IN_st__city_sid_80005378_time_5:4978011@change4.owlproxy.com:7778",
+    "http://BIqvZSSZDt00_custom_zone_IN_st__city_sid_34537474_time_5:4978022@change4.owlproxy.com:7778",
+    "http://FJ9LIt6CC420_custom_zone_IN_st__city_sid_34981499_time_5:4978024@change4.owlproxy.com:7778",
+    "http://RD6lrZVHNZ20_custom_zone_IN_st__city_sid_94818226_time_5:4978026@change4.owlproxy.com:7778",
+    "http://psSd9woUXfA0_custom_zone_IN_st__city_sid_25741592_time_5:4978040@change4.owlproxy.com:7778",
+    "http://WSNBiFPYUk30_custom_zone_IN_st__city_sid_70400970_time_5:4978041@change4.owlproxy.com:7778",
+    "http://TByoEbSZUr60_custom_zone_IN_st__city_sid_89177696_time_5:4978052@change4.owlproxy.com:7778",
+    "http://PgTVYMmNkfA0_custom_zone_IN_st__city_sid_97733468_time_5:4978056@change4.owlproxy.com:7778",
+    "http://FcYiPxQwMN40_custom_zone_IN_st__city_sid_95143370_time_5:4978069@change4.owlproxy.com:7778",
+    "http://drlsCv3yNK60_custom_zone_IN_st__city_sid_30589365_time_5:4978074@change4.owlproxy.com:7778",
+    "http://Nwlmr9e3XT00_custom_zone_IN_st__city_sid_27593950_time_5:4978083@change4.owlproxy.com:7778",
+    "http://eenpbtufpN70_custom_zone_IN_st__city_sid_68883008_time_5:4978098@change4.owlproxy.com:7778",
+]
+
+# =========================================================
 # Maintenance Mode (Admin can toggle ON/OFF)
 # =========================================================
 MAINTENANCE_MODE = False  # False = Bot active for all | True = Only admins can use
 
-# user_id -> {"url": str, "awaiting_url": bool, "awaiting_broadcast": bool}
+# user_id -> {"url": str, "awaiting_url": bool, "awaiting_broadcast": bool, ...}
 user_states: dict = {}
 
 # active extraction jobs: user_id -> True (running) / False (cancelled)
@@ -396,20 +422,75 @@ def extract_numbers_from_text(text: str) -> set[str]:
 
 # =========================================================
 # Intelligent Session with Anti-Bot Challenge Solving
+# Now supports rotating authenticated HTTP proxies.
 # =========================================================
 class RotatingScraperSession:
-    def __init__(self):
+    def __init__(self, use_proxy: bool = False):
+        self.use_proxy = use_proxy
+        self.proxy_index = 0
         self.cj = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cj))
         self.cached_test_cookie = None
         self.domain = None
+        self.opener = None
+        self._build_opener(None)
 
+    # ---- opener construction (with or without proxy) -------------------
+    def _build_opener(self, proxy_url: str | None) -> None:
+        handlers = [urllib.request.HTTPCookieProcessor(self.cj)]
+        if proxy_url:
+            parsed = urllib.parse.urlparse(proxy_url)
+            user = urllib.parse.unquote(parsed.username or "")
+            pwd = urllib.parse.unquote(parsed.password or "")
+            host = parsed.hostname
+            port = parsed.port
+            host_port = f"{host}:{port}"
+
+            # Embed credentials directly in the proxy URL (most reliable)
+            proxy_full = f"http://{user}:{pwd}@{host_port}"
+            proxy_handler = urllib.request.ProxyHandler({
+                "http": proxy_full,
+                "https": proxy_full,
+            })
+
+            # Also add a basic-auth handler for safety
+            pwd_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+            pwd_mgr.add_password(None, f"http://{host_port}", user, pwd)
+            pwd_mgr.add_password(None, host_port, user, pwd)
+            auth_handler = urllib.request.ProxyBasicAuthHandler(pwd_mgr)
+
+            handlers.append(proxy_handler)
+            handlers.append(auth_handler)
+
+        self.opener = urllib.request.build_opener(*handlers)
+
+    # ---- round-robin proxy picker --------------------------------------
+    def _next_proxy(self) -> str | None:
+        if not self.use_proxy or not PROXIES:
+            return None
+        proxy = PROXIES[self.proxy_index % len(PROXIES)]
+        self.proxy_index += 1
+        return proxy
+
+    # ---- public fetch: retries across multiple proxies on failure ------
     def fetch(self, url: str) -> tuple[str, str, list[str]]:
-        """
-        Visits the URL, solves any ByetHost / InfinityFree AES challenges,
-        follows all HTTP redirects and client-side JavaScript / meta redirects,
-        and returns: (final_url, final_body, all_visited_urls).
-        """
+        if self.use_proxy and PROXIES:
+            last_err = None
+            for _attempt in range(3):  # max 3 proxy tries per cycle
+                proxy = self._next_proxy()
+                self._build_opener(proxy)
+                try:
+                    return self._do_fetch(url)
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.4)
+                    continue
+            raise last_err if last_err else Exception("All proxy attempts failed")
+        else:
+            self._build_opener(None)
+            return self._do_fetch(url)
+
+    # ---- core fetch logic (challenge + redirects) ----------------------
+    def _do_fetch(self, url: str) -> tuple[str, str, list[str]]:
         parsed = urllib.parse.urlparse(url)
         self.domain = parsed.hostname
 
@@ -435,7 +516,7 @@ class RotatingScraperSession:
 
         visited_urls = [url]
         req = urllib.request.Request(url)
-        resp = self.opener.open(req, timeout=12)
+        resp = self.opener.open(req, timeout=15)
         current_url = resp.geturl()
         visited_urls.append(current_url)
         body = resp.read().decode("utf-8", errors="ignore")
@@ -461,7 +542,7 @@ class RotatingScraperSession:
                 next_url = urllib.parse.urljoin(current_url, next_dest)
 
                 visited_urls.append(next_url)
-                resp2 = self.opener.open(urllib.request.Request(next_url), timeout=12)
+                resp2 = self.opener.open(urllib.request.Request(next_url), timeout=15)
                 current_url = resp2.geturl()
                 visited_urls.append(current_url)
                 body = resp2.read().decode("utf-8", errors="ignore")
@@ -472,7 +553,7 @@ class RotatingScraperSession:
             if meta_refresh:
                 redirect_target = urllib.parse.urljoin(current_url, meta_refresh.group(1).strip())
                 visited_urls.append(redirect_target)
-                resp = self.opener.open(urllib.request.Request(redirect_target), timeout=12)
+                resp = self.opener.open(urllib.request.Request(redirect_target), timeout=15)
                 current_url = resp.geturl()
                 visited_urls.append(current_url)
                 body = resp.read().decode("utf-8", errors="ignore")
@@ -482,7 +563,7 @@ class RotatingScraperSession:
             if js_redirect:
                 redirect_target = js_redirect.group(1).strip()
                 visited_urls.append(redirect_target)
-                resp = self.opener.open(urllib.request.Request(redirect_target), timeout=12)
+                resp = self.opener.open(urllib.request.Request(redirect_target), timeout=15)
                 current_url = resp.geturl()
                 visited_urls.append(current_url)
                 body = resp.read().decode("utf-8", errors="ignore")
@@ -507,15 +588,18 @@ def extraction_worker(
     url: str,
     count: int,
     message_id: int,
+    use_proxy: bool = False,
 ) -> None:
     active_jobs[user_id] = True
-    session = RotatingScraperSession()
+    session = RotatingScraperSession(use_proxy=use_proxy)
 
     found_numbers: set[str] = set()
     total_numbers_seen = 0
     total_ok = 0
     errors = 0
     last_ui_update = 0.0
+
+    proxy_label = "ON" if use_proxy else "OFF"
 
     for i in range(1, count + 1):
         if not active_jobs.get(user_id, True):
@@ -551,6 +635,7 @@ def extraction_worker(
                         f"⏳ *Extraction In Progress*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔗 *URL:* `{url[:38]}{'...' if len(url) > 38 else ''}`\n"
+                        f"🌐 *Proxy Mode:* `{proxy_label}`\n"
                         f"📊 *Progress:* `[{bar}] {pct}%`\n"
                         f"🔄 *Requests:* `{i}/{count}`\n"
                         f"✅ *Successful:* `{total_ok}`\n"
@@ -582,6 +667,7 @@ def extraction_worker(
         (
             f"✅ *Extraction Complete!*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌐 *Proxy Mode:* `{proxy_label}`\n"
             f"📊 *Total Cycles Run:* `{count}`\n"
             f"✅ *Successful Requests:* `{total_ok}`\n"
             f"❌ *Failed Requests:* `{errors}`\n"
@@ -604,6 +690,7 @@ def extraction_worker(
             f"📱 *Extracted WhatsApp Numbers*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 *Total Unique:* `{unique_count}`\n"
+            f"🌐 *Proxy Mode:* `{proxy_label}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         )
 
@@ -657,6 +744,7 @@ def extraction_worker(
                 f.write("DK Sharma Bot — WhatsApp Number Extractor\n")
                 f.write(f"Source URL: {url}\n")
                 f.write(f"Date & Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Proxy Mode: {proxy_label}\n")
                 f.write(f"Total Unique Numbers: {unique_count}\n")
                 f.write("=" * 45 + "\n\n")
                 for num in sorted_numbers:
@@ -669,6 +757,7 @@ def extraction_worker(
                     caption=(
                         f"📁 *Your WhatsApp Numbers File is Ready!*\n"
                         f"📱 `Total Numbers: {unique_count}`\n"
+                        f"🌐 `Proxy Mode: {proxy_label}`\n"
                         f"_Made by DK Sharma Bot_ 🤖"
                     ),
                     parse_mode="Markdown",
@@ -690,7 +779,8 @@ def extraction_worker(
                 "Possible reasons:\n"
                 "• Website is currently down\n"
                 "• Link has expired\n"
-                "• Rotation limit reached\n\n"
+                "• Rotation limit reached\n"
+                "• Proxy rejected the request (if Proxy Mode was ON)\n\n"
                 "_Try another link or test with 1x first._"
             ),
             parse_mode="Markdown",
@@ -709,6 +799,15 @@ def main_keyboard() -> types.ReplyKeyboardMarkup:
         types.KeyboardButton("📊 My Stats"),
         types.KeyboardButton("❓ Help"),
         types.KeyboardButton("📞 Support"),
+    )
+    return markup
+
+
+def proxy_choice_keyboard() -> types.ReplyKeyboardMarkup:
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🚫 Without Proxy"),
+        types.KeyboardButton("🌐 With Proxy"),
     )
     return markup
 
@@ -758,8 +857,9 @@ def cmd_start(message: types.Message) -> None:
             f"📌 *How to use:*\n"
             f"1️⃣ Press *🔗 Send New Link*\n"
             f"2️⃣ Send your rotating/redirect URL\n"
-            f"3️⃣ Choose extraction count (1, 20, 50, 100)\n"
-            f"4️⃣ Get your `.txt` file with all unique numbers!\n\n"
+            f"3️⃣ Choose *With Proxy* or *Without Proxy*\n"
+            f"4️⃣ Choose extraction count (1, 20, 50, 100)\n"
+            f"5️⃣ Get your `.txt` file with all unique numbers!\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"👇 *Choose an option below:*"
         ),
@@ -1019,13 +1119,16 @@ def handle_messages(message: types.Message) -> None:
                 "━━━━━━━━━━━━━━━━━━━━━\n\n"
                 "*Step 1:* Press *🔗 Send New Link*\n"
                 "*Step 2:* Paste your rotating/redirect link\n"
-                "*Step 3:* Choose extraction count:\n"
+                "*Step 3:* Choose *🚫 Without Proxy* or *🌐 With Proxy*\n"
+                "  • *Without Proxy* — Faster, uses your server IP\n"
+                "  • *With Proxy* — Rotates through a pool of HTTP proxies\n"
+                "*Step 4:* Choose extraction count:\n"
                 "  • `🧪 Test (1x)` — One quick test\n"
                 "  • `🚀 20 Times` — Medium extraction\n"
                 "  • `⚡ 50 Times` — Full extraction\n"
                 "  • `💎 100 Times` — Maximum extraction\n"
-                "*Step 4:* Wait for results\n"
-                "*Step 5:* Download your `.txt` file!\n\n"
+                "*Step 5:* Wait for results\n"
+                "*Step 6:* Download your `.txt` file!\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
                 "🔄 *What is a rotating link?*\n"
                 "A link that redirects to WhatsApp with a different phone number each time. "
@@ -1052,7 +1155,52 @@ def handle_messages(message: types.Message) -> None:
         )
         return
 
-    # URL Submission
+    # ── Proxy choice (after URL is provided) ─────────────────────────
+    if state.get("awaiting_proxy_choice"):
+        if text == "🚫 Without Proxy":
+            user_states[user.id] = {"url": state["url"], "use_proxy": False}
+            bot.send_message(
+                chat_id,
+                (
+                    f"🚫 *Mode Selected:* `Without Proxy`\n\n"
+                    f"🔗 `{state['url']}`\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎯 *How many times should the bot visit this link?*\n\n"
+                    f"• More visits = more rotating numbers collected\n"
+                    f"• Duplicates are automatically removed"
+                ),
+                parse_mode="Markdown",
+                reply_markup=extraction_keyboard(),
+            )
+            return
+
+        if text == "🌐 With Proxy":
+            user_states[user.id] = {"url": state["url"], "use_proxy": True}
+            bot.send_message(
+                chat_id,
+                (
+                    f"🌐 *Mode Selected:* `With Proxy`\n"
+                    f"_Rotating through {len(PROXIES)} authenticated HTTP proxies_\n\n"
+                    f"🔗 `{state['url']}`\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎯 *How many times should the bot visit this link?*\n\n"
+                    f"• More visits = more rotating numbers collected\n"
+                    f"• Duplicates are automatically removed"
+                ),
+                parse_mode="Markdown",
+                reply_markup=extraction_keyboard(),
+            )
+            return
+
+        bot.send_message(
+            chat_id,
+            "⚠️ Please choose *🚫 Without Proxy* or *🌐 With Proxy* using the buttons below.",
+            parse_mode="Markdown",
+            reply_markup=proxy_choice_keyboard(),
+        )
+        return
+
+    # ── URL Submission ───────────────────────────────────────────────
     if state.get("awaiting_url") or text.startswith(("http://", "https://")):
         if not text.startswith(("http://", "https://")):
             bot.send_message(
@@ -1065,34 +1213,42 @@ def handle_messages(message: types.Message) -> None:
             )
             return
 
-        user_states[user.id] = {"url": text}
+        user_states[user.id] = {
+            "url": text,
+            "awaiting_proxy_choice": True,
+        }
         bot.send_message(
             chat_id,
             (
                 f"✅ *Link Received!*\n\n"
                 f"🔗 `{text}`\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 *How many times should the bot visit this link?*\n\n"
-                f"• More visits = more rotating numbers collected\n"
-                f"• Duplicates are automatically removed"
+                f"🌐 *Choose your extraction mode:*\n\n"
+                f"• *🚫 Without Proxy* — Uses server's own IP (faster)\n"
+                f"• *🌐 With Proxy* — Rotates through {len(PROXIES)} authenticated proxies\n\n"
+                f"_Tip: If you get rate-limited or blocked, try With Proxy._"
             ),
             parse_mode="Markdown",
-            reply_markup=extraction_keyboard(),
+            reply_markup=proxy_choice_keyboard(),
         )
         return
 
-    # Extraction Count Selection
-    if "url" in state:
+    # ── Extraction Count Selection ───────────────────────────────────
+    if "url" in state and "use_proxy" in state:
         count = _EXTRACTION_COUNT_MAP.get(text)
         if count is not None:
             target_url = state["url"]
+            use_proxy = bool(state.get("use_proxy", False))
             user_states[user.id] = {}
+
+            proxy_label = "ON" if use_proxy else "OFF"
 
             start_msg = bot.send_message(
                 chat_id,
                 (
                     f"⏳ *Starting extraction...*\n\n"
                     f"🔗 URL: `{target_url[:40]}{'...' if len(target_url) > 40 else ''}`\n"
+                    f"🌐 Proxy Mode: `{proxy_label}`\n"
                     f"🔄 Planned cycles: `{count}`\n\n"
                     f"_Bypassing protections and extracting numbers. Please wait..._"
                 ),
@@ -1102,10 +1258,24 @@ def handle_messages(message: types.Message) -> None:
 
             threading.Thread(
                 target=extraction_worker,
-                args=(chat_id, user.id, target_url, count, start_msg.message_id),
+                args=(
+                    chat_id,
+                    user.id,
+                    target_url,
+                    count,
+                    start_msg.message_id,
+                    use_proxy,
+                ),
                 daemon=True,
             ).start()
             return
+
+        bot.send_message(
+            chat_id,
+            "⚠️ Please choose a valid extraction count using the buttons below.",
+            reply_markup=extraction_keyboard(),
+        )
+        return
 
     # Fallback
     bot.send_message(
@@ -1123,6 +1293,7 @@ if __name__ == "__main__":
 
     print("🤖 DK Sharma Bot is starting...")
     print(f"Admin IDs configured: {ADMIN_IDS}")
+    print(f"Proxy pool size: {len(PROXIES)}")
 
     try:
         bot.remove_webhook()
