@@ -13,12 +13,12 @@ from curl_cffi import requests  # 🔥 Advanced HTTP Client (Bypasses Cloudflare
 # =========================================================
 # Configuration & Constants
 # =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8897758284:AAFgPgIVSTkJrWlUcoYvJ7ohW9u7y2fZFk8")
 
 # Admin IDs (comma separated string in environment variables)
 ADMIN_IDS = [
     int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "123456789").split(",")
+    for x in os.environ.get("ADMIN_IDS", "8753914631").split(",")
     if x.strip().isdigit()
 ]
 
