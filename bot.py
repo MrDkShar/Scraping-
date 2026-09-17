@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
 """
-URL Fetcher & Rotating Link Engine
-Production-ready Telegram bot with robust proxy management.
+URL Fetcher & Rotating Link Engine — Professional Edition
+============================================================
+Production-ready Telegram bot for authorized extraction of publicly
+exposed phone numbers from HTTP/HTTPS pages and redirect chains.
+
+Key properties:
+  * IP-rotation mode routes EVERY request through a verified proxy
+    (requests + PySocks) and NEVER silently falls back to direct.
+  * Multi-stage proxy health testing with multiple IP-check endpoints,
+    exponential-backoff cooldown, and a failure threshold (no false-dead).
+  * Independent live-progress thread that updates while a request is
+    in flight, so the user never stares at "Visits: 0/20".
+  * Full extraction audit trail (jobs / numbers / proxy attempts).
+  * Multi-admin (numeric-ID auth), user approval, DB-backed settings,
+    optional channel auto-posting.
+  * Safe SQLite migrations — existing data is preserved.
+
 Compatible with Render and standard VPS deployments.
+Configuration is environment-driven; secrets are never hard-coded.
 """
 
 import concurrent.futures
@@ -32,14 +48,15 @@ from telebot import types
 from telebot.apihelper import ApiTelegramException
 
 try:
-    # PySocks must be installed for SOCKS5 to work
+    # PySocks is required for SOCKS5 proxy support (installed via requests[socks]).
     import socks  # noqa: F401
     _SOCKS5_AVAILABLE = True
 except ImportError:
     _SOCKS5_AVAILABLE = False
 
+
 # =========================================================
-# Logging Setup
+# Logging (credential-safe)
 # =========================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -50,30 +67,56 @@ logger = logging.getLogger("bot")
 
 
 def _safe_log(msg: str) -> str:
-    """Strip anything that looks like a credential from log strings."""
-    return re.sub(r"(://)[^@/\s]+@", r"\1****:****@", msg)
+    """Strip anything that looks like proxy credentials from a log string."""
+    return re.sub(r"(://)[^@/\s]+@", r"\1****:****@", str(msg))
+
+
+def log_event(event: str, **fields) -> None:
+    """Structured, credential-safe log line: EVENT key=value key=value ..."""
+    parts = [event]
+    for k, v in fields.items():
+        parts.append(f"{k}={_safe_log(v)}")
+    logger.info(" ".join(parts))
 
 
 # =========================================================
-# Configuration (Environment-Driven)
+# Configuration (environment-driven; DB overrides at runtime)
 # =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAHOv1uzboKpXBJsAfEgDqwe39gSBDyQl1U").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAFgLdPCaSL_TfZds10qQS1_Hr5iGnn0e5M").strip()
 if not BOT_TOKEN:
     logger.critical("BOT_TOKEN environment variable is not set. Exiting.")
     sys.exit(1)
 
-ADMIN_IDS: list[int] = [
-    int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "8753914631").split(",")
-    if x.strip().isdigit()
-]
+def _parse_admin_ids(raw: str) -> list[int]:
+    out: list[int] = []
+    for x in raw.split(","):
+        x = x.strip()
+        if x.lstrip("-").isdigit():
+            out.append(int(x))
+    return out
+
+ADMIN_IDS: list[int] = _parse_admin_ids(os.environ.get("ADMIN_IDS", "8753914631"))
+# The first configured admin (env) is the bootstrap OWNER.
+BOOTSTRAP_OWNER_ID: Optional[int] = ADMIN_IDS[0] if ADMIN_IDS else None
 
 DB_FILE = os.environ.get("DATABASE_PATH", "bot_database.db")
-REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "10"))
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "4"))
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "12"))
+CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "6"))
+READ_TIMEOUT = float(os.environ.get("READ_TIMEOUT", "10"))
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "6"))
 MAX_RESPONSE_SIZE = int(os.environ.get("MAX_RESPONSE_SIZE", str(5 * 1024 * 1024)))  # 5 MB
 MAX_URL_LENGTH = int(os.environ.get("MAX_URL_LENGTH", "2048"))
-PROXY_COOLDOWN = float(os.environ.get("PROXY_COOLDOWN", "120"))
+MAX_REDIRECTS = int(os.environ.get("MAX_REDIRECTS", "10"))
+MAX_VISITS_PER_JOB = int(os.environ.get("MAX_VISITS_PER_JOB", "100"))
+PROGRESS_INTERVAL = float(os.environ.get("PROGRESS_INTERVAL", "1.2"))
+
+# Proxy cooldown ladder (exponential backoff), capped.
+PROXY_COOLDOWN_LADDER = [30.0, 60.0, 120.0, 300.0]
+PROXY_COOLDOWN_MAX = float(os.environ.get("PROXY_COOLDOWN_MAX", "600"))
+PROXY_UNHEALTHY_THRESHOLD = 3  # consecutive failures before "unhealthy"
+
+DEFAULT_CHANNEL = os.environ.get("CHANNEL_USERNAME", "@HshDkSharmaBotsmall").strip()
+DEFAULT_AUTO_CHANNEL_POST = os.environ.get("AUTO_CHANNEL_POST", "0").strip() in ("1", "true", "TRUE", "yes")
 
 RAW_PROXY_ENV = (
     os.environ.get("PROXY_ENDPOINTS", "")
@@ -84,14 +127,21 @@ RAW_PROXY_ENV = (
 # Bot instance
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# Global state
-MAINTENANCE_MODE = False
+# =========================================================
+# Global in-process state (all access guarded by _state_lock)
+# =========================================================
 user_states: dict[int, dict] = {}
-active_jobs: dict[int, threading.Event] = {}   # user_id -> cancel event
-_state_lock = threading.Lock()
+active_jobs: dict[int, dict] = {}   # user_id -> {"cancel": Event, "job_id": int, "state": dict}
+_state_lock = threading.RLock()
+
+# Bounded executor for background proxy testing (never unbounded threads).
+_proxy_test_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=MAX_CONCURRENCY, thread_name_prefix="proxytest"
+)
+
 
 # =========================================================
-# Database
+# Database layer (SQLite, WAL, safe migrations)
 # =========================================================
 _db_lock = threading.Lock()
 
@@ -104,7 +154,25 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {r["name"] for r in rows}
+    except Exception:
+        return set()
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    if column not in _table_columns(conn, table):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            logger.info("Migration: added %s.%s", table, column)
+        except Exception as exc:
+            logger.warning("Migration skip %s.%s: %s", table, column, exc)
+
+
 def init_db() -> None:
+    """Create tables if absent and migrate existing ones without data loss."""
     with _db_lock:
         conn = get_conn()
         try:
@@ -115,10 +183,14 @@ def init_db() -> None:
                     first_name            TEXT,
                     total_extractions     INTEGER DEFAULT 0,
                     total_numbers_found   INTEGER DEFAULT 0,
+                    successful_jobs       INTEGER DEFAULT 0,
+                    failed_jobs           INTEGER DEFAULT 0,
+                    status                TEXT DEFAULT 'APPROVED',   -- PENDING/APPROVED/BLOCKED
                     joined_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_active           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
+                -- Legacy aggregate history (kept for backward compatibility).
                 CREATE TABLE IF NOT EXISTS extraction_history (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id         INTEGER,
@@ -132,16 +204,65 @@ def init_db() -> None:
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
                 );
 
+                -- Full per-job audit record.
+                CREATE TABLE IF NOT EXISTS extraction_jobs (
+                    job_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id           INTEGER,
+                    username          TEXT,
+                    source_url        TEXT,
+                    mode              TEXT,
+                    requested_visits  INTEGER,
+                    successful_visits INTEGER DEFAULT 0,
+                    failed_visits     INTEGER DEFAULT 0,
+                    unique_numbers    INTEGER DEFAULT 0,
+                    duplicate_numbers INTEGER DEFAULT 0,
+                    duration_ms       INTEGER DEFAULT 0,
+                    status            TEXT DEFAULT 'RUNNING',
+                    started_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at      TIMESTAMP,
+                    channel_post_status TEXT,
+                    channel_message_id  INTEGER,
+                    channel_post_error  TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS extracted_numbers (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id            INTEGER,
+                    user_id           INTEGER,
+                    number            TEXT,
+                    source_url        TEXT,
+                    extraction_method TEXT,
+                    visit_number      INTEGER,
+                    proxy_display     TEXT,
+                    observed_ip       TEXT,
+                    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS job_proxy_attempts (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id        INTEGER,
+                    visit_number  INTEGER,
+                    proxy_display TEXT,
+                    protocol      TEXT,
+                    status        TEXT,
+                    latency_ms    REAL,
+                    observed_ip   TEXT,
+                    error         TEXT,
+                    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE TABLE IF NOT EXISTS admin_proxies (
                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
                     endpoint         TEXT UNIQUE NOT NULL,
                     added_by         INTEGER,
                     is_active        INTEGER DEFAULT 1,
+                    health_status    TEXT DEFAULT 'UNTESTED',
                     last_tested      TIMESTAMP,
                     last_success     TIMESTAMP,
                     last_failure     TIMESTAMP,
                     success_count    INTEGER DEFAULT 0,
                     failure_count    INTEGER DEFAULT 0,
+                    consecutive_failures INTEGER DEFAULT 0,
                     average_latency  REAL DEFAULT 0,
                     last_error       TEXT,
                     last_observed_ip TEXT,
@@ -149,30 +270,214 @@ def init_db() -> None:
                     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id    INTEGER PRIMARY KEY,
+                    username   TEXT,
+                    role       TEXT DEFAULT 'ADMIN',   -- OWNER/ADMIN/MODERATOR
+                    added_by   INTEGER,
+                    is_active  INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS admin_audit_log (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    admin_id   INTEGER,
+                    action     TEXT,
+                    target     TEXT,
+                    details    TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_history_user ON extraction_history(user_id);
-                CREATE INDEX IF NOT EXISTS idx_history_date ON extraction_history(started_at);
+                CREATE INDEX IF NOT EXISTS idx_jobs_user   ON extraction_jobs(user_id);
+                CREATE INDEX IF NOT EXISTS idx_jobs_date   ON extraction_jobs(started_at);
+                CREATE INDEX IF NOT EXISTS idx_numbers_job ON extracted_numbers(job_id);
+                CREATE INDEX IF NOT EXISTS idx_numbers_user ON extracted_numbers(user_id);
+                CREATE INDEX IF NOT EXISTS idx_numbers_num ON extracted_numbers(number);
+                CREATE INDEX IF NOT EXISTS idx_attempts_job ON job_proxy_attempts(job_id);
                 CREATE INDEX IF NOT EXISTS idx_proxies_active ON admin_proxies(is_active);
             """)
+
+            # Migrations for databases created by older versions of this bot.
+            _add_column_if_missing(conn, "users", "successful_jobs", "INTEGER DEFAULT 0")
+            _add_column_if_missing(conn, "users", "failed_jobs", "INTEGER DEFAULT 0")
+            _add_column_if_missing(conn, "users", "status", "TEXT DEFAULT 'APPROVED'")
+            _add_column_if_missing(conn, "admin_proxies", "health_status", "TEXT DEFAULT 'UNTESTED'")
+            _add_column_if_missing(conn, "admin_proxies", "consecutive_failures", "INTEGER DEFAULT 0")
+
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Seed bootstrap owner + env admins.
+    _seed_admins()
+
+
+# ── Settings (DB-backed, env defaults) ─────────────────────
+_SETTING_DEFAULTS = {
+    "maintenance_mode": "0",
+    "approval_mode": "0",
+    "channel_username": DEFAULT_CHANNEL,
+    "channel_logging": "1" if DEFAULT_AUTO_CHANNEL_POST else "0",
+    "channel_post_numbers": "0",     # privacy default: OFF
+    "channel_attach_txt": "0",
+    "support_username": "",
+    "bot_name": "URL Extraction Center",
+    "max_visits": str(MAX_VISITS_PER_JOB),
+}
+
+
+def get_setting(key: str, default: Optional[str] = None) -> str:
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+        if row is not None:
+            return row["value"]
+    finally:
+        conn.close()
+    if default is not None:
+        return default
+    return _SETTING_DEFAULTS.get(key, "")
+
+
+def set_setting(key: str, value: str) -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute(
+                "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
             conn.commit()
         finally:
             conn.close()
 
 
-# ── User helpers ──────────────────────────────────────────
-def register_user(user_id: int, username: str = None, first_name: str = None) -> None:
+def get_bool_setting(key: str) -> bool:
+    return get_setting(key) in ("1", "true", "TRUE", "yes", "on")
+
+
+# ── Admin management (numeric-ID authorization) ────────────
+def _seed_admins() -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            first = True
+            for aid in ADMIN_IDS:
+                role = "OWNER" if first else "ADMIN"
+                conn.execute(
+                    "INSERT OR IGNORE INTO admins (user_id, role, added_by, is_active) "
+                    "VALUES (?, ?, ?, 1)",
+                    (aid, role, aid),
+                )
+                first = False
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_admin(user_id: int) -> Optional[dict]:
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM admins WHERE user_id = ? AND is_active = 1", (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def is_admin(user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    return get_admin(user_id) is not None
+
+
+def is_owner(user_id: int) -> bool:
+    if BOOTSTRAP_OWNER_ID is not None and user_id == BOOTSTRAP_OWNER_ID:
+        return True
+    row = get_admin(user_id)
+    return bool(row and row.get("role") == "OWNER")
+
+
+def list_admins() -> list[dict]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM admins WHERE is_active = 1 ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def add_admin(user_id: int, added_by: int, role: str = "ADMIN", username: str = None) -> None:
     with _db_lock:
         conn = get_conn()
         try:
             conn.execute(
-                "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
-                (user_id, username, first_name),
+                "INSERT INTO admins (user_id, username, role, added_by, is_active) "
+                "VALUES (?, ?, ?, ?, 1) "
+                "ON CONFLICT(user_id) DO UPDATE SET is_active = 1, role = excluded.role",
+                (user_id, username, role, added_by),
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def remove_admin(user_id: int) -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute("UPDATE admins SET is_active = 0 WHERE user_id = ?", (user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def audit(admin_id: int, action: str, target: str = "", details: str = "") -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
             conn.execute(
-                """UPDATE users
-                   SET last_active = CURRENT_TIMESTAMP,
-                       username    = COALESCE(?, username),
-                       first_name  = COALESCE(?, first_name)
-                   WHERE user_id = ?""",
+                "INSERT INTO admin_audit_log (admin_id, action, target, details) VALUES (?, ?, ?, ?)",
+                (admin_id, action, _safe_log(target)[:200], _safe_log(details)[:300]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    log_event("ADMIN_ACTION", admin=admin_id, action=action, target=target)
+
+
+# ── User helpers ──────────────────────────────────────────
+def register_user(user_id: int, username: str = None, first_name: str = None) -> None:
+    approval = get_bool_setting("approval_mode")
+    with _db_lock:
+        conn = get_conn()
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if not exists:
+                # New user: PENDING when approval mode is on (admins auto-approved).
+                status = "APPROVED"
+                if approval and not is_admin(user_id):
+                    status = "PENDING"
+                conn.execute(
+                    "INSERT INTO users (user_id, username, first_name, status) VALUES (?, ?, ?, ?)",
+                    (user_id, username, first_name, status),
+                )
+            conn.execute(
+                "UPDATE users SET last_active = CURRENT_TIMESTAMP, "
+                "username = COALESCE(?, username), first_name = COALESCE(?, first_name) "
+                "WHERE user_id = ?",
                 (username, first_name, user_id),
             )
             conn.commit()
@@ -180,41 +485,7 @@ def register_user(user_id: int, username: str = None, first_name: str = None) ->
             conn.close()
 
 
-def update_user_stats(user_id: int, unique_count: int) -> None:
-    with _db_lock:
-        conn = get_conn()
-        try:
-            conn.execute(
-                """UPDATE users
-                   SET total_extractions   = total_extractions + 1,
-                       total_numbers_found = total_numbers_found + ?,
-                       last_active         = CURRENT_TIMESTAMP
-                   WHERE user_id = ?""",
-                (unique_count, user_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def save_history(
-    user_id: int, url: str, mode: str, cycles: int, unique_numbers: int, duplicate_count: int
-) -> None:
-    with _db_lock:
-        conn = get_conn()
-        try:
-            conn.execute(
-                """INSERT INTO extraction_history
-                       (user_id, url, mode, cycles, unique_numbers, duplicate_count, completed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                (user_id, url, mode, cycles, unique_numbers, duplicate_count),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def get_user_stats(user_id: int) -> Optional[dict]:
+def get_user(user_id: int) -> Optional[dict]:
     conn = get_conn()
     try:
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
@@ -223,40 +494,214 @@ def get_user_stats(user_id: int) -> Optional[dict]:
         conn.close()
 
 
-def get_user_history(user_id: int, limit: int = 8) -> list[dict]:
+def set_user_status(user_id: int, status: str) -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute("UPDATE users SET status = ? WHERE user_id = ?", (status, user_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def user_is_blocked(user_id: int) -> bool:
+    u = get_user(user_id)
+    return bool(u and u.get("status") == "BLOCKED")
+
+
+def user_is_approved(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    if not get_bool_setting("approval_mode"):
+        return True
+    u = get_user(user_id)
+    return bool(u and u.get("status") == "APPROVED")
+
+
+def update_user_stats(user_id: int, unique_count: int, success: bool) -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute(
+                "UPDATE users SET total_extractions = total_extractions + 1, "
+                "total_numbers_found = total_numbers_found + ?, "
+                "successful_jobs = successful_jobs + ?, failed_jobs = failed_jobs + ?, "
+                "last_active = CURRENT_TIMESTAMP WHERE user_id = ?",
+                (unique_count, 1 if success else 0, 0 if success else 1, user_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_user_history(user_id: int, limit: int = 8, offset: int = 0) -> list[dict]:
     conn = get_conn()
     try:
         rows = conn.execute(
-            """SELECT * FROM extraction_history
-               WHERE user_id = ?
-               ORDER BY started_at DESC
-               LIMIT ?""",
-            (user_id, limit),
+            "SELECT * FROM extraction_jobs WHERE user_id = ? "
+            "ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_admin_stats() -> dict:
+def get_all_user_ids(status: Optional[str] = None) -> list[int]:
     conn = get_conn()
     try:
-        row = conn.execute(
-            """SELECT COUNT(*)                               AS total_users,
-                      COALESCE(SUM(total_extractions), 0)   AS total_ex,
-                      COALESCE(SUM(total_numbers_found), 0) AS total_nums
-               FROM users"""
-        ).fetchone()
-        return dict(row) if row else {}
+        if status:
+            rows = conn.execute("SELECT user_id FROM users WHERE status = ?", (status,)).fetchall()
+        else:
+            rows = conn.execute("SELECT user_id FROM users").fetchall()
+        return [r["user_id"] for r in rows]
     finally:
         conn.close()
 
 
-def get_all_user_ids() -> list[int]:
+def search_users(term: str, limit: int = 10) -> list[dict]:
     conn = get_conn()
     try:
-        rows = conn.execute("SELECT user_id FROM users").fetchall()
-        return [r["user_id"] for r in rows]
+        if term.lstrip("-").isdigit():
+            rows = conn.execute(
+                "SELECT * FROM users WHERE user_id = ? LIMIT ?", (int(term), limit)
+            ).fetchall()
+        else:
+            like = f"%{term.lstrip('@')}%"
+            rows = conn.execute(
+                "SELECT * FROM users WHERE username LIKE ? OR first_name LIKE ? LIMIT ?",
+                (like, like, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Job / audit helpers ────────────────────────────────────
+def create_job(user_id: int, username: str, url: str, mode: str, requested: int) -> int:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cur = conn.execute(
+                "INSERT INTO extraction_jobs (user_id, username, source_url, mode, requested_visits) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, url, mode, requested),
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def finalize_job(job_id: int, **fields) -> None:
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    vals = list(fields.values()) + [job_id]
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute(f"UPDATE extraction_jobs SET {cols} WHERE job_id = ?", vals)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def save_extracted_number(job_id, user_id, number, source_url, method, visit, proxy_display, ip) -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute(
+                "INSERT INTO extracted_numbers "
+                "(job_id, user_id, number, source_url, extraction_method, visit_number, proxy_display, observed_ip) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (job_id, user_id, number, source_url, method, visit, proxy_display, ip),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def save_proxy_attempt(job_id, visit, proxy_display, protocol, status, latency, ip, error) -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute(
+                "INSERT INTO job_proxy_attempts "
+                "(job_id, visit_number, proxy_display, protocol, status, latency_ms, observed_ip, error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (job_id, visit, proxy_display, protocol, status, latency, ip, _safe_log(error or "")[:200]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_job(job_id: int) -> Optional[dict]:
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM extraction_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_job_numbers(job_id: int) -> list[dict]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM extracted_numbers WHERE job_id = ? ORDER BY id ASC", (job_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def recent_jobs(limit: int = 10, offset: int = 0, since_days: Optional[int] = None) -> list[dict]:
+    conn = get_conn()
+    try:
+        if since_days is not None:
+            rows = conn.execute(
+                "SELECT * FROM extraction_jobs WHERE started_at >= datetime('now', ?) "
+                "ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                (f"-{since_days} days", limit, offset),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM extraction_jobs ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_admin_dashboard_stats() -> dict:
+    conn = get_conn()
+    try:
+        u = conn.execute(
+            "SELECT COUNT(*) AS total_users, "
+            "COALESCE(SUM(total_numbers_found),0) AS total_nums, "
+            "SUM(CASE WHEN last_active >= datetime('now','-1 day') THEN 1 ELSE 0 END) AS active_today "
+            "FROM users"
+        ).fetchone()
+        j = conn.execute(
+            "SELECT COUNT(*) AS total_jobs, "
+            "SUM(CASE WHEN status='COMPLETED' THEN 1 ELSE 0 END) AS ok_jobs, "
+            "SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_jobs, "
+            "SUM(CASE WHEN started_at >= date('now') THEN 1 ELSE 0 END) AS jobs_today, "
+            "AVG(CASE WHEN duration_ms>0 THEN duration_ms END) AS avg_ms "
+            "FROM extraction_jobs"
+        ).fetchone()
+        n = conn.execute(
+            "SELECT SUM(CASE WHEN created_at >= date('now') THEN 1 ELSE 0 END) AS nums_today "
+            "FROM extracted_numbers"
+        ).fetchone()
+        out = {}
+        out.update(dict(u) if u else {})
+        out.update(dict(j) if j else {})
+        out.update(dict(n) if n else {})
+        return out
     finally:
         conn.close()
 
@@ -266,15 +711,13 @@ def db_add_proxy(endpoint: str, added_by: int) -> bool:
     with _db_lock:
         conn = get_conn()
         try:
+            before = conn.total_changes
             conn.execute(
-                """INSERT OR IGNORE INTO admin_proxies (endpoint, added_by, is_active)
-                   VALUES (?, ?, 1)""",
+                "INSERT OR IGNORE INTO admin_proxies (endpoint, added_by, is_active) VALUES (?, ?, 1)",
                 (endpoint, added_by),
             )
             conn.commit()
-            return conn.execute(
-                "SELECT changes() AS c"
-            ).fetchone()["c"] > 0 or True
+            return (conn.total_changes - before) > 0
         except Exception as exc:
             logger.warning("db_add_proxy error: %s", exc)
             return False
@@ -285,15 +728,11 @@ def db_add_proxy(endpoint: str, added_by: int) -> bool:
 def db_get_all_proxies(active_only: bool = True) -> list[dict]:
     conn = get_conn()
     try:
+        q = "SELECT * FROM admin_proxies"
         if active_only:
-            rows = conn.execute(
-                "SELECT * FROM admin_proxies WHERE is_active = 1 ORDER BY id ASC"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM admin_proxies ORDER BY id ASC"
-            ).fetchall()
-        return [dict(r) for r in rows]
+            q += " WHERE is_active = 1"
+        q += " ORDER BY id ASC"
+        return [dict(r) for r in conn.execute(q).fetchall()]
     finally:
         conn.close()
 
@@ -302,11 +741,10 @@ def db_delete_proxy(proxy_id: int) -> bool:
     with _db_lock:
         conn = get_conn()
         try:
+            before = conn.total_changes
             conn.execute("DELETE FROM admin_proxies WHERE id = ?", (proxy_id,))
             conn.commit()
-            return True
-        except Exception:
-            return False
+            return (conn.total_changes - before) > 0
         finally:
             conn.close()
 
@@ -316,76 +754,24 @@ def db_clear_all_proxies() -> int:
         conn = get_conn()
         try:
             cur = conn.execute("DELETE FROM admin_proxies")
-            deleted = cur.rowcount
             conn.commit()
-            return deleted
+            return cur.rowcount
         finally:
             conn.close()
 
 
 def db_clear_dead_proxies() -> int:
+    """Only remove proxies that have never succeeded AND are past the failure threshold."""
     with _db_lock:
         conn = get_conn()
         try:
             cur = conn.execute(
-                """DELETE FROM admin_proxies
-                   WHERE failure_count > 0
-                     AND (success_count = 0
-                          OR (failure_count > success_count * 3))"""
-            )
-            deleted = cur.rowcount
-            conn.commit()
-            return deleted
-        finally:
-            conn.close()
-
-
-def db_update_proxy_success(proxy_id: int, latency_ms: float, observed_ip: str) -> None:
-    with _db_lock:
-        conn = get_conn()
-        try:
-            row = conn.execute(
-                "SELECT average_latency, success_count FROM admin_proxies WHERE id = ?",
-                (proxy_id,),
-            ).fetchone()
-            if not row:
-                return
-            old_avg = row["average_latency"] or 0.0
-            old_cnt = row["success_count"] or 0
-            new_cnt = old_cnt + 1
-            new_avg = ((old_avg * old_cnt) + latency_ms) / new_cnt
-            conn.execute(
-                """UPDATE admin_proxies
-                   SET success_count    = success_count + 1,
-                       last_success     = CURRENT_TIMESTAMP,
-                       last_tested      = CURRENT_TIMESTAMP,
-                       average_latency  = ?,
-                       last_observed_ip = ?,
-                       cooldown_until   = NULL,
-                       last_error       = NULL
-                   WHERE id = ?""",
-                (new_avg, observed_ip, proxy_id),
+                "DELETE FROM admin_proxies WHERE success_count = 0 "
+                "AND consecutive_failures >= ?",
+                (PROXY_UNHEALTHY_THRESHOLD,),
             )
             conn.commit()
-        finally:
-            conn.close()
-
-
-def db_update_proxy_failure(proxy_id: int, error: str) -> None:
-    with _db_lock:
-        conn = get_conn()
-        try:
-            conn.execute(
-                """UPDATE admin_proxies
-                   SET failure_count  = failure_count + 1,
-                       last_failure   = CURRENT_TIMESTAMP,
-                       last_tested    = CURRENT_TIMESTAMP,
-                       last_error     = ?,
-                       cooldown_until = datetime('now', '+2 minutes')
-                   WHERE id = ?""",
-                (error[:200], proxy_id),
-            )
-            conn.commit()
+            return cur.rowcount
         finally:
             conn.close()
 
@@ -393,29 +779,78 @@ def db_update_proxy_failure(proxy_id: int, error: str) -> None:
 def db_get_proxy_by_endpoint(endpoint: str) -> Optional[dict]:
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT * FROM admin_proxies WHERE endpoint = ?", (endpoint,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM admin_proxies WHERE endpoint = ?", (endpoint,)).fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
+
+
+def _cooldown_seconds(consecutive_failures: int) -> float:
+    idx = min(max(consecutive_failures - 1, 0), len(PROXY_COOLDOWN_LADDER) - 1)
+    return min(PROXY_COOLDOWN_LADDER[idx], PROXY_COOLDOWN_MAX)
+
+
+def db_update_proxy_success(proxy_id: int, latency_ms: float, observed_ip: str, status: str = "WORKING") -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT average_latency, success_count FROM admin_proxies WHERE id = ?", (proxy_id,)
+            ).fetchone()
+            if not row:
+                return
+            old_avg = row["average_latency"] or 0.0
+            old_cnt = row["success_count"] or 0
+            new_avg = ((old_avg * old_cnt) + latency_ms) / (old_cnt + 1)
+            conn.execute(
+                "UPDATE admin_proxies SET success_count = success_count + 1, "
+                "consecutive_failures = 0, last_success = CURRENT_TIMESTAMP, "
+                "last_tested = CURRENT_TIMESTAMP, average_latency = ?, "
+                "last_observed_ip = COALESCE(NULLIF(?, ''), last_observed_ip), "
+                "health_status = ?, cooldown_until = NULL, last_error = NULL WHERE id = ?",
+                (new_avg, observed_ip or "", status, proxy_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_update_proxy_failure(proxy_id: int, error: str, status: str = "TEMPORARY_FAILURE") -> None:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT consecutive_failures FROM admin_proxies WHERE id = ?", (proxy_id,)
+            ).fetchone()
+            if not row:
+                return
+            cf = (row["consecutive_failures"] or 0) + 1
+            cd = _cooldown_seconds(cf)
+            final_status = "UNHEALTHY" if cf >= PROXY_UNHEALTHY_THRESHOLD else status
+            conn.execute(
+                "UPDATE admin_proxies SET failure_count = failure_count + 1, "
+                "consecutive_failures = ?, last_failure = CURRENT_TIMESTAMP, "
+                "last_tested = CURRENT_TIMESTAMP, last_error = ?, health_status = ?, "
+                "cooldown_until = datetime('now', ?) WHERE id = ?",
+                (cf, _safe_log(error)[:200], final_status, f"+{int(cd)} seconds", proxy_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def db_proxy_stats() -> dict:
     conn = get_conn()
     try:
         row = conn.execute(
-            """SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN last_tested IS NULL THEN 1 ELSE 0 END) AS untested,
-                SUM(CASE WHEN success_count > 0 AND failure_count = 0 THEN 1
-                         WHEN success_count > 0 AND average_latency < 1500 THEN 1
-                         ELSE 0 END) AS working,
-                SUM(CASE WHEN success_count > 0 AND average_latency >= 1500 THEN 1 ELSE 0 END) AS slow,
-                SUM(CASE WHEN failure_count > 0 AND success_count = 0 THEN 1 ELSE 0 END) AS dead,
-                AVG(CASE WHEN success_count > 0 THEN average_latency END) AS avg_latency,
-                MAX(last_tested) AS last_test_time
-               FROM admin_proxies WHERE is_active = 1"""
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN health_status='UNTESTED' THEN 1 ELSE 0 END) AS untested, "
+            "SUM(CASE WHEN health_status='WORKING' THEN 1 ELSE 0 END) AS working, "
+            "SUM(CASE WHEN health_status='SLOW' THEN 1 ELSE 0 END) AS slow, "
+            "SUM(CASE WHEN health_status IN ('UNHEALTHY','TCP_FAILED','AUTH_FAILED','DEAD') THEN 1 ELSE 0 END) AS dead, "
+            "SUM(CASE WHEN health_status='TEMPORARY_FAILURE' THEN 1 ELSE 0 END) AS temp_fail, "
+            "AVG(CASE WHEN success_count>0 THEN average_latency END) AS avg_latency, "
+            "MAX(last_tested) AS last_test_time FROM admin_proxies WHERE is_active = 1"
         ).fetchone()
         return dict(row) if row else {}
     finally:
@@ -423,17 +858,15 @@ def db_proxy_stats() -> dict:
 
 
 # =========================================================
-# Proxy Parser & Validator
+# Proxy parser & validator
 # =========================================================
 SUPPORTED_SCHEMES = ("http", "https", "socks5", "socks5h")
 
 
 class ParsedProxy:
-    """Holds a validated, parsed proxy endpoint."""
     __slots__ = ("raw", "scheme", "host", "port", "username", "password")
 
-    def __init__(self, raw: str, scheme: str, host: str, port: int,
-                 username: Optional[str], password: Optional[str]):
+    def __init__(self, raw, scheme, host, port, username, password):
         self.raw = raw
         self.scheme = scheme
         self.host = host
@@ -443,48 +876,45 @@ class ParsedProxy:
 
     @property
     def display(self) -> str:
-        """Credential-free display string."""
         return f"{self.scheme}://{self.host}:{self.port}"
 
     @property
     def protocol_label(self) -> str:
-        if self.scheme.startswith("socks5"):
-            return "SOCKS5"
-        return self.scheme.upper()
+        return "SOCKS5" if self.scheme.startswith("socks5") else self.scheme.upper()
 
     def to_requests_proxies(self) -> Optional[dict]:
         """
-        Build a proxies dict for the requests library.
-        For SOCKS5, requires requests[socks] / PySocks installed.
-        Returns None if SOCKS5 is required but unavailable.
+        Build a proxies dict for requests. ALL proxy protocols (HTTP, HTTPS,
+        SOCKS5) go through requests, which handles CONNECT tunnelling and
+        proxy auth correctly — this is the fix for the old urllib path that
+        broke HTTPS-over-proxy and authenticated proxies.
         """
-        if self.scheme.startswith("socks5"):
-            if not _SOCKS5_AVAILABLE:
-                return None
-            if self.username and self.password:
-                u = urllib.parse.quote(self.username, safe="")
-                p = urllib.parse.quote(self.password, safe="")
-                url = f"{self.scheme}://{u}:{p}@{self.host}:{self.port}"
-            else:
-                url = f"{self.scheme}://{self.host}:{self.port}"
+        if self.scheme.startswith("socks5") and not _SOCKS5_AVAILABLE:
+            return None
+        if self.username is not None and self.password is not None:
+            u = urllib.parse.quote(self.username, safe="")
+            p = urllib.parse.quote(self.password, safe="")
+            url = f"{self.scheme}://{u}:{p}@{self.host}:{self.port}"
         else:
-            if self.username and self.password:
-                u = urllib.parse.quote(self.username, safe="")
-                p = urllib.parse.quote(self.password, safe="")
-                url = f"{self.scheme}://{u}:{p}@{self.host}:{self.port}"
-            else:
-                url = f"{self.scheme}://{self.host}:{self.port}"
+            url = f"{self.scheme}://{self.host}:{self.port}"
         return {"http": url, "https": url}
 
 
 def parse_proxy(raw: str) -> tuple[Optional[ParsedProxy], str]:
-    """
-    Parse and validate a proxy string.
-    Returns (ParsedProxy, "") on success or (None, "error reason") on failure.
-    """
-    raw = raw.strip()
+    raw = (raw or "").strip()
     if not raw:
         return None, "Empty proxy string"
+
+    # Accept shorthand host:port and host:port:user:pass by prefixing http://
+    if "://" not in raw:
+        parts = raw.split(":")
+        if len(parts) == 2:
+            raw = "http://" + raw
+        elif len(parts) == 4:
+            h, po, us, pw = parts
+            raw = f"http://{us}:{pw}@{h}:{po}"
+        else:
+            raw = "http://" + raw
 
     try:
         parsed = urllib.parse.urlsplit(raw)
@@ -493,109 +923,90 @@ def parse_proxy(raw: str) -> tuple[Optional[ParsedProxy], str]:
 
     scheme = (parsed.scheme or "").lower()
     if scheme not in SUPPORTED_SCHEMES:
-        supported = ", ".join(SUPPORTED_SCHEMES)
-        return None, f"Unsupported scheme '{scheme}'. Supported: {supported}"
+        return None, f"Unsupported scheme '{scheme}'. Supported: {', '.join(SUPPORTED_SCHEMES)}"
 
     host = parsed.hostname
     if not host:
         return None, "Missing hostname"
 
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError:
+        return None, "Invalid port"
     if port is None:
         return None, "Missing port number"
     if not (1 <= port <= 65535):
-        return None, f"Invalid port {port} (must be 1–65535)"
+        return None, f"Invalid port {port} (must be 1-65535)"
 
-    # Safely decode credentials
-    username: Optional[str] = None
-    password: Optional[str] = None
+    username = password = None
     if parsed.username:
-        try:
-            username = urllib.parse.unquote(parsed.username)
-        except Exception:
-            return None, "Could not decode username"
+        username = urllib.parse.unquote(parsed.username)
     if parsed.password:
-        try:
-            password = urllib.parse.unquote(parsed.password)
-        except Exception:
-            return None, "Could not decode password"
-
+        password = urllib.parse.unquote(parsed.password)
     if (username is None) != (password is None):
         return None, "Both username and password must be provided together"
 
-    return ParsedProxy(raw=raw, scheme=scheme, host=host, port=port,
-                       username=username, password=password), ""
+    return ParsedProxy(raw, scheme, host, port, username, password), ""
+
+
+def sanitize_display(endpoint: str) -> str:
+    parsed, _ = parse_proxy(endpoint)
+    if parsed:
+        return parsed.display
+    return "proxy-endpoint"
 
 
 # =========================================================
-# Proxy Test Result
+# Proxy health testing (multi-stage, multi-endpoint)
 # =========================================================
+_IP_CHECK_URLS = [
+    "https://api.ipify.org?format=json",
+    "https://ifconfig.me/all.json",
+    "http://ip-api.com/json?fields=query",
+    "https://httpbin.org/ip",
+]
+
+PROXY_STATUS_EMOJI = {
+    "WORKING": "🟢", "SLOW": "🟡", "CONNECTED": "🔵",
+    "TARGET_FAILED": "🟠", "AUTH_FAILED": "🟣", "TCP_FAILED": "🔴",
+    "TEMPORARY_FAILURE": "🟠", "UNHEALTHY": "🔴", "INVALID": "⚫",
+    "UNTESTED": "⚪", "DEAD": "🔴", "TIMEOUT": "🟠", "DNS_FAILED": "🔴",
+}
+
+
 class ProxyTestResult:
-    __slots__ = (
-        "proxy_display", "scheme_label", "working", "latency_ms",
-        "observed_ip", "error_reason", "tested_at",
-    )
+    __slots__ = ("proxy_display", "protocol", "status", "working",
+                 "latency_ms", "observed_ip", "error_reason", "tested_at")
 
-    def __init__(
-        self,
-        proxy_display: str,
-        scheme_label: str,
-        working: bool,
-        latency_ms: Optional[float],
-        observed_ip: Optional[str],
-        error_reason: Optional[str],
-    ):
+    def __init__(self, proxy_display, protocol, status, working,
+                 latency_ms, observed_ip, error_reason):
         self.proxy_display = proxy_display
-        self.scheme_label = scheme_label
+        self.protocol = protocol
+        self.status = status
         self.working = working
         self.latency_ms = latency_ms
         self.observed_ip = observed_ip
         self.error_reason = error_reason
         self.tested_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    def to_telegram_card(self, index: Optional[int] = None) -> str:
-        prefix = f"<b>#{index}</b>\n" if index is not None else ""
-        lines = [prefix]
-        lines.append(f"🌐 {html.escape(self.scheme_label)}")
-        lines.append(f"📡 <code>{html.escape(self.proxy_display)}</code>")
-
-        if self.working:
-            lines.append("✅ <b>WORKING</b>")
-            if self.latency_ms is not None:
-                speed = "⚡ Fast" if self.latency_ms < 1500 else "🐢 Slow"
-                lines.append(f"{speed}: <code>{self.latency_ms:.0f} ms</code>")
-            if self.observed_ip:
-                lines.append(f"🌍 Exit IP: <code>{html.escape(self.observed_ip)}</code>")
-            else:
-                lines.append("⚠️ IP Verification Failed")
-        else:
-            lines.append("❌ <b>DEAD</b>")
-            if self.error_reason:
-                lines.append(f"Reason: {html.escape(self.error_reason)}")
-
+    def card(self, index: Optional[int] = None) -> str:
+        emoji = PROXY_STATUS_EMOJI.get(self.status, "⚪")
+        head = f"<b>#{index}</b> " if index is not None else ""
+        lines = [f"{head}{emoji} <b>{html.escape(self.status)}</b> · {html.escape(self.protocol)}",
+                 f"📡 <code>{html.escape(self.proxy_display)}</code>"]
+        if self.latency_ms is not None:
+            lines.append(f"⚡ Latency: <code>{self.latency_ms:.0f} ms</code>")
+        if self.observed_ip:
+            lines.append(f"🌍 Exit IP: <code>{html.escape(self.observed_ip)}</code>")
+        if self.error_reason and not self.working:
+            lines.append(f"Reason: {html.escape(self.error_reason)}")
         lines.append(f"🕒 {html.escape(self.tested_at)}")
-        return "\n".join(line for line in lines if line)
+        return "\n".join(lines)
 
 
-# =========================================================
-# Core Proxy Tester
-# =========================================================
-_IP_CHECK_URLS = [
-    "https://api.ipify.org?format=json",
-    "https://httpbin.org/ip",
-    "http://ip-api.com/json?fields=query",
-]
-
-_TEST_TARGET = "https://httpbin.org/get"
-_TCP_TEST_HOST = "httpbin.org"
-_TCP_TEST_PORT = 443
-
-
-def _tcp_check(host: str, port: int, timeout: float = 4.0) -> tuple[bool, str]:
-    """Stage 1: raw TCP connectivity (no proxy, just checks DNS + connect)."""
+def _tcp_check(host: str, port: int, timeout: float) -> tuple[bool, str]:
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.close()
+        socket.create_connection((host, port), timeout=timeout).close()
         return True, ""
     except socket.timeout:
         return False, "TCP timeout"
@@ -608,132 +1019,107 @@ def _tcp_check(host: str, port: int, timeout: float = 4.0) -> tuple[bool, str]:
 
 
 def _classify_requests_error(exc: Exception) -> str:
-    """Convert a requests exception to a human-readable reason."""
     msg = str(exc)
+    low = msg.lower()
     if "SOCKS" in msg and not _SOCKS5_AVAILABLE:
-        return "SOCKS5 support not installed (pip install requests[socks])"
-    if "timed out" in msg.lower() or "timeout" in msg.lower():
-        return "Connection timeout"
-    if "refused" in msg.lower():
-        return "Connection refused"
+        return "SOCKS5 support not installed (add requests[socks])"
     if "407" in msg:
-        return "Authentication failed (HTTP 407)"
-    if "ssl" in msg.lower() or "certificate" in msg.lower():
+        return "Proxy authentication failed (HTTP 407)"
+    if "timed out" in low or "timeout" in low:
+        return "Connection timeout"
+    if "refused" in low:
+        return "Connection refused"
+    if "ssl" in low or "certificate" in low:
         return "TLS/SSL failure"
-    if "name or service not known" in msg.lower() or "nodename" in msg.lower():
+    if "name or service not known" in low or "nodename" in low or "getaddrinfo" in low:
         return "DNS failure"
     return msg[:120]
 
 
 def test_proxy(parsed: ParsedProxy, quick: bool = True) -> ProxyTestResult:
-    """
-    Multi-stage proxy test:
-      Stage 1 – TCP connectivity to proxy host
-      Stage 2 – HTTP request through proxy
-      Stage 3 – Public IP verification through proxy
-    """
-    timeout = 6.0 if quick else 12.0
+    """Stage 1 TCP → Stage 2/3 real request through proxy → multi-endpoint IP verify."""
+    connect_to = min(CONNECT_TIMEOUT, 5.0) if quick else CONNECT_TIMEOUT
+    read_to = READ_TIMEOUT if quick else READ_TIMEOUT * 1.5
 
-    # Stage 1: TCP to the proxy itself
-    tcp_ok, tcp_err = _tcp_check(parsed.host, parsed.port, timeout=min(timeout, 4.0))
+    # Stage 1 — TCP reachability of the proxy endpoint itself.
+    tcp_ok, tcp_err = _tcp_check(parsed.host, parsed.port, timeout=connect_to)
     if not tcp_ok:
-        return ProxyTestResult(
-            proxy_display=parsed.display,
-            scheme_label=parsed.protocol_label,
-            working=False,
-            latency_ms=None,
-            observed_ip=None,
-            error_reason=f"TCP connect to proxy failed: {tcp_err}",
-        )
+        return ProxyTestResult(parsed.display, parsed.protocol_label, "TCP_FAILED",
+                               False, None, None, f"TCP: {tcp_err}")
 
-    # Stage 2+3: HTTP request through proxy, public IP check
     proxies_dict = parsed.to_requests_proxies()
     if proxies_dict is None:
-        return ProxyTestResult(
-            proxy_display=parsed.display,
-            scheme_label=parsed.protocol_label,
-            working=False,
-            latency_ms=None,
-            observed_ip=None,
-            error_reason="SOCKS5 requires 'requests[socks]' — not installed",
-        )
+        return ProxyTestResult(parsed.display, parsed.protocol_label, "UNHEALTHY",
+                               False, None, None, "SOCKS5 requires requests[socks] (not installed)")
 
     session = requests.Session()
     session.proxies = proxies_dict
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; ProxyTester/1.0)"
-    })
+    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; ProxyTester/2.0)"})
 
-    observed_ip: Optional[str] = None
-    latency_ms: Optional[float] = None
-    error_reason: Optional[str] = None
+    observed_ip = None
+    best_latency = None
+    last_error = None
+    transport_ok = False
 
-    for ip_url in _IP_CHECK_URLS:
-        try:
-            t0 = time.perf_counter()
-            resp = session.get(ip_url, timeout=timeout, allow_redirects=True)
-            latency_ms = (time.perf_counter() - t0) * 1000
+    try:
+        # Stage 2/3 — try IP-check endpoints; ANY success = transport-working.
+        for ip_url in _IP_CHECK_URLS:
+            try:
+                t0 = time.perf_counter()
+                resp = session.get(ip_url, timeout=(connect_to, read_to), allow_redirects=True)
+                latency = (time.perf_counter() - t0) * 1000
+                if resp.status_code == 407:
+                    return ProxyTestResult(parsed.display, parsed.protocol_label, "AUTH_FAILED",
+                                           False, latency, None, "Proxy auth failed (HTTP 407)")
+                if resp.status_code == 200:
+                    transport_ok = True
+                    best_latency = latency if best_latency is None else min(best_latency, latency)
+                    try:
+                        data = resp.json()
+                        observed_ip = (data.get("ip") or data.get("query")
+                                       or (data.get("origin", "").split(",")[0].strip() or None))
+                    except Exception:
+                        m = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", resp.text)
+                        if m:
+                            observed_ip = m.group(1)
+                    if observed_ip:
+                        break  # verified exit IP — stop early
+                else:
+                    last_error = f"HTTP {resp.status_code} from IP check"
+            except requests.exceptions.RequestException as exc:
+                last_error = _classify_requests_error(exc)
+                # A connection-level failure to the FIRST endpoint may be transport
+                # failure; but keep trying other endpoints before concluding.
+    finally:
+        session.close()
 
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    observed_ip = (
-                        data.get("ip")
-                        or data.get("origin", "").split(",")[0].strip()
-                        or data.get("query")
-                    )
-                except Exception:
-                    text = resp.text.strip()
-                    ip_match = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", text)
-                    if ip_match:
-                        observed_ip = ip_match.group(1)
+    if transport_ok and observed_ip:
+        status = "SLOW" if (best_latency or 0) >= 2000 else "WORKING"
+        log_event("PROXY_SUCCESS", proxy=parsed.display, ip=observed_ip, latency=f"{best_latency:.0f}ms")
+        return ProxyTestResult(parsed.display, parsed.protocol_label, status,
+                               True, best_latency, observed_ip, None)
+    if transport_ok and not observed_ip:
+        # Proxy carried the request but no IP endpoint returned a parseable IP.
+        return ProxyTestResult(parsed.display, parsed.protocol_label, "CONNECTED",
+                               True, best_latency, None, "Transport OK, exit IP not verified")
 
-                logger.info(
-                    "Proxy test OK: %s → exit IP %s @ %.0f ms",
-                    _safe_log(parsed.display), observed_ip, latency_ms or 0,
-                )
-                session.close()
-                return ProxyTestResult(
-                    proxy_display=parsed.display,
-                    scheme_label=parsed.protocol_label,
-                    working=True,
-                    latency_ms=latency_ms,
-                    observed_ip=observed_ip,
-                    error_reason=None,
-                )
-            else:
-                error_reason = f"HTTP {resp.status_code} from {ip_url}"
-        except requests.exceptions.RequestException as exc:
-            error_reason = _classify_requests_error(exc)
-            logger.debug("Proxy test fail (%s): %s", _safe_log(parsed.display), error_reason)
-        except Exception as exc:
-            error_reason = f"Unexpected error: {str(exc)[:80]}"
-
-    session.close()
-    return ProxyTestResult(
-        proxy_display=parsed.display,
-        scheme_label=parsed.protocol_label,
-        working=False,
-        latency_ms=latency_ms,
-        observed_ip=None,
-        error_reason=error_reason or "All IP-check targets failed",
-    )
+    log_event("PROXY_FAILURE", proxy=parsed.display, reason=last_error or "all endpoints failed")
+    return ProxyTestResult(parsed.display, parsed.protocol_label, "UNHEALTHY",
+                           False, best_latency, None, last_error or "All IP-check endpoints failed")
 
 
 # =========================================================
-# Proxy Manager / Rotation Engine
+# Proxy Manager / Rotation Engine (job-aware, thread-safe)
 # =========================================================
 class ProxyManager:
     """
-    Manages proxy endpoints from environment variables and the SQLite database.
-    Implements round-robin rotation with per-proxy cooldown on failure.
-    Never silently falls back to a direct connection.
+    Fair round-robin rotation across env + DB proxies.
+    Skips proxies in DB cooldown; never falls back to a direct connection.
     """
 
     def __init__(self):
         self._env_proxies: list[str] = []
         self._rotation_index = 0
-        self._cooldowns: dict[str, float] = {}   # endpoint -> expires timestamp
         self._lock = threading.Lock()
         self._load_env()
 
@@ -745,19 +1131,15 @@ class ProxyManager:
                 continue
             parsed, err = parse_proxy(raw)
             if parsed:
-                items.append(raw)
+                items.append(parsed.raw)
             else:
                 logger.warning("Ignoring invalid env proxy '%s': %s", _safe_log(raw), err)
         self._env_proxies = list(dict.fromkeys(items))
         logger.info("Loaded %d proxy endpoints from environment.", len(self._env_proxies))
 
     def get_all_raw(self) -> list[str]:
-        """All raw endpoint strings (env + db), deduplicated."""
-        with self._lock:
-            db_rows = db_get_all_proxies(active_only=True)
-            db_eps = [r["endpoint"] for r in db_rows]
-            combined = list(dict.fromkeys(self._env_proxies + db_eps))
-            return combined
+        db_eps = [r["endpoint"] for r in db_get_all_proxies(active_only=True)]
+        return list(dict.fromkeys(self._env_proxies + db_eps))
 
     def has_endpoints(self) -> bool:
         return len(self.get_all_raw()) > 0
@@ -768,207 +1150,80 @@ class ProxyManager:
     def env_count(self) -> int:
         return len(self._env_proxies)
 
-    def get_next_endpoint(self) -> Optional[str]:
+    def _in_cooldown(self, endpoint: str) -> bool:
+        row = db_get_proxy_by_endpoint(endpoint)
+        if not row or not row.get("cooldown_until"):
+            return False
+        conn = get_conn()
+        try:
+            r = conn.execute(
+                "SELECT (cooldown_until > datetime('now')) AS cd FROM admin_proxies WHERE endpoint = ?",
+                (endpoint,),
+            ).fetchone()
+            return bool(r and r["cd"])
+        finally:
+            conn.close()
+
+    def eligible_endpoints(self) -> list[str]:
+        """Endpoints not currently in cooldown."""
+        return [ep for ep in self.get_all_raw() if not self._in_cooldown(ep)]
+
+    def has_eligible(self) -> bool:
+        return len(self.eligible_endpoints()) > 0
+
+    def get_next_endpoint(self, exclude: Optional[set] = None) -> Optional[str]:
         """
-        Returns the next available (non-cooled-down) proxy using round-robin.
-        Returns None only when all proxies are in cooldown; the caller must
-        NOT fall back to a direct connection silently.
+        Next eligible proxy via round-robin. Returns None when every proxy is
+        in cooldown — the caller MUST stop, never fall back to direct.
         """
+        exclude = exclude or set()
         with self._lock:
-            all_eps = self.get_all_raw()
-            if not all_eps:
-                return None
-
-            now = time.time()
-            # Expire cooldowns
-            self._cooldowns = {
-                ep: exp for ep, exp in self._cooldowns.items() if exp > now
-            }
-
-            available = [ep for ep in all_eps if ep not in self._cooldowns]
+            available = [ep for ep in self.eligible_endpoints() if ep not in exclude]
             if not available:
-                logger.warning("All proxies in cooldown; none available.")
-                return None
-
+                # Allow reuse if excludes emptied the pool but proxies remain.
+                available = self.eligible_endpoints()
+                if not available:
+                    return None
             idx = self._rotation_index % len(available)
             self._rotation_index += 1
-            chosen = available[idx]
-            return chosen
+            return available[idx]
 
-    def mark_failed(self, endpoint: str) -> None:
-        with self._lock:
-            self._cooldowns[endpoint] = time.time() + PROXY_COOLDOWN
-            logger.info("Proxy cooled down: %s", _safe_log(endpoint))
-            # Also update DB if this proxy exists there
+    def mark_failed(self, endpoint: str, reason: str = "Rotation failure") -> None:
         row = db_get_proxy_by_endpoint(endpoint)
         if row:
-            db_update_proxy_failure(row["id"], "Rotation failure")
+            db_update_proxy_failure(row["id"], reason)
+        else:
+            # Env-only proxy with no DB row: insert one so cooldown persists.
+            db_add_proxy(endpoint, added_by=0)
+            row = db_get_proxy_by_endpoint(endpoint)
+            if row:
+                db_update_proxy_failure(row["id"], reason)
+        log_event("PROXY_FAILURE", proxy=sanitize_display(endpoint), reason=reason)
 
     def mark_success(self, endpoint: str, latency_ms: float, observed_ip: str) -> None:
-        with self._lock:
-            self._cooldowns.pop(endpoint, None)
         row = db_get_proxy_by_endpoint(endpoint)
+        if not row:
+            db_add_proxy(endpoint, added_by=0)
+            row = db_get_proxy_by_endpoint(endpoint)
         if row:
-            db_update_proxy_success(row["id"], latency_ms, observed_ip)
-
-    @staticmethod
-    def sanitize_display(endpoint: str) -> str:
-        """Remove credentials for safe display."""
-        parsed, err = parse_proxy(endpoint)
-        if parsed:
-            return parsed.display
-        # Fallback strip
-        try:
-            p = urllib.parse.urlsplit(endpoint)
-            netloc = f"{p.hostname}:{p.port}" if p.port else (p.hostname or "?")
-            return f"{p.scheme}://{netloc}"
-        except Exception:
-            return "proxy-endpoint"
+            status = "SLOW" if latency_ms >= 2000 else "WORKING"
+            db_update_proxy_success(row["id"], latency_ms, observed_ip, status)
 
 
 proxy_manager = ProxyManager()
 
 
 # =========================================================
-# AES-128-CBC Challenge Solver (InfinityFree / ByetHost)
-# Pure Python, zero dependencies
+# Number extraction pipeline
 # =========================================================
-_AES_SBOX = (
-    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
-    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
-    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
-    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
-    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
-    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
-    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
-    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
-    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
-    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
-    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
-    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
-    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
-    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
-    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
-    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
-)
-_AES_INV_SBOX = [0] * 256
-for _i, _v in enumerate(_AES_SBOX):
-    _AES_INV_SBOX[_v] = _i
-_AES_RCON = (0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
-
-
-def _sub_word(w: int) -> int:
-    return (
-        (_AES_SBOX[(w >> 24) & 0xFF] << 24)
-        | (_AES_SBOX[(w >> 16) & 0xFF] << 16)
-        | (_AES_SBOX[(w >> 8) & 0xFF] << 8)
-        | _AES_SBOX[w & 0xFF]
-    )
-
-
-def _rot_word(w: int) -> int:
-    return ((w << 8) & 0xFFFFFFFF) | (w >> 24)
-
-
-def _key_schedule(key_bytes: bytes) -> list[int]:
-    w = []
-    for i in range(4):
-        w.append(
-            (key_bytes[4 * i] << 24)
-            | (key_bytes[4 * i + 1] << 16)
-            | (key_bytes[4 * i + 2] << 8)
-            | key_bytes[4 * i + 3]
-        )
-    for i in range(4, 44):
-        temp = w[i - 1]
-        if i % 4 == 0:
-            temp = _sub_word(_rot_word(temp)) ^ (_AES_RCON[i // 4] << 24)
-        w.append(w[i - 4] ^ temp)
-    return w
-
-
-def _gmul(a: int, b: int) -> int:
-    p = 0
-    for _ in range(8):
-        if b & 1:
-            p ^= a
-        hi = a & 0x80
-        a = (a << 1) & 0xFF
-        if hi:
-            a ^= 0x1B
-        b >>= 1
-    return p
-
-
-def _inv_mix_col(c: list[int]) -> list[int]:
-    return [
-        _gmul(c[0], 0x0E) ^ _gmul(c[1], 0x0B) ^ _gmul(c[2], 0x0D) ^ _gmul(c[3], 0x09),
-        _gmul(c[0], 0x09) ^ _gmul(c[1], 0x0E) ^ _gmul(c[2], 0x0B) ^ _gmul(c[3], 0x0D),
-        _gmul(c[0], 0x0D) ^ _gmul(c[1], 0x09) ^ _gmul(c[2], 0x0E) ^ _gmul(c[3], 0x0B),
-        _gmul(c[0], 0x0B) ^ _gmul(c[1], 0x0D) ^ _gmul(c[2], 0x09) ^ _gmul(c[3], 0x0E),
-    ]
-
-
-def _decrypt_single_block(block: bytes, w: list[int]) -> list[int]:
-    state = [[block[r + 4 * c] for c in range(4)] for r in range(4)]
-    for c in range(4):
-        rk = w[40 + c]
-        for r in range(4):
-            state[r][c] ^= (rk >> (24 - 8 * r)) & 0xFF
-    for round_num in range(9, 0, -1):
-        state[1] = state[1][3:] + state[1][:3]
-        state[2] = state[2][2:] + state[2][:2]
-        state[3] = state[3][1:] + state[3][:1]
-        for r in range(4):
-            for c in range(4):
-                state[r][c] = _AES_INV_SBOX[state[r][c]]
-        for c in range(4):
-            rk = w[round_num * 4 + c]
-            for r in range(4):
-                state[r][c] ^= (rk >> (24 - 8 * r)) & 0xFF
-        for c in range(4):
-            col = [state[r][c] for r in range(4)]
-            new_col = _inv_mix_col(col)
-            for r in range(4):
-                state[r][c] = new_col[r]
-    state[1] = state[1][3:] + state[1][:3]
-    state[2] = state[2][2:] + state[2][:2]
-    state[3] = state[3][1:] + state[3][:1]
-    for r in range(4):
-        for c in range(4):
-            state[r][c] = _AES_INV_SBOX[state[r][c]]
-    for c in range(4):
-        rk = w[c]
-        for r in range(4):
-            state[r][c] ^= (rk >> (24 - 8 * r)) & 0xFF
-    out = []
-    for c in range(4):
-        for r in range(4):
-            out.append(state[r][c])
-    return out
-
-
-def decrypt_byet_challenge(c_hex: str, a_key_hex: str, b_iv_hex: str) -> str:
-    c = bytes.fromhex(c_hex)
-    a = bytes.fromhex(a_key_hex)
-    b = bytes.fromhex(b_iv_hex)
-    w = _key_schedule(a)
-    dec = _decrypt_single_block(c, w)
-    res = bytes([dec[i] ^ b[i] for i in range(16)])
-    return res.hex()
-
-
-# =========================================================
-# Number Extraction
-# =========================================================
-_WA_PATTERNS = [
-    re.compile(r'wa\.me/(?:p/|qr/)?\+?(\d{10,15})', re.IGNORECASE),
-    re.compile(r'(?:[?&]|\b)(?:phone|mobile|wa_number|whatsapp|send_to|to)=\+?(\d{10,15})', re.IGNORECASE),
-    re.compile(r'(?:whatsapp|intent)://send\?.*?(?:phone|number)=\+?(\d{10,15})', re.IGNORECASE),
-    re.compile(r'(?:api|web)\.whatsapp\.com/send/?\??.*?(?:phone|number)=\+?(\d{10,15})', re.IGNORECASE),
-    re.compile(r'["\'](?:whatsapp|phone_number|mobile_number|wa)["\']\s*:\s*["\']\+?(\d{10,15})["\']', re.IGNORECASE),
-    re.compile(r'data-(?:phone|whatsapp|number)=["\']\+?(\d{10,15})["\']', re.IGNORECASE),
-    re.compile(r'href=["\'](?:tel:|whatsapp://send\?phone=)\+?(\d{10,15})["\']', re.IGNORECASE),
+_EXTRACTORS = [
+    ("wa.me", re.compile(r'wa\.me/(?:p/|qr/)?\+?(\d{10,15})', re.I)),
+    ("whatsapp_api", re.compile(r'(?:api|web)\.whatsapp\.com/send/?\??[^"\'\s]*?(?:phone|number)=\+?(\d{10,15})', re.I)),
+    ("whatsapp_scheme", re.compile(r'(?:whatsapp|intent)://send\?[^"\'\s]*?(?:phone|number)=\+?(\d{10,15})', re.I)),
+    ("query_parameter", re.compile(r'(?:[?&])(?:phone|mobile|wa_number|whatsapp|send_to|number|recipient|to)=\+?(\d{10,15})', re.I)),
+    ("tel_link", re.compile(r'(?:href=["\']|["\'])tel:\+?(\d{10,15})', re.I)),
+    ("html_attribute", re.compile(r'data-(?:phone|whatsapp|number|mobile)=["\']\+?(\d{10,15})["\']', re.I)),
+    ("json_field", re.compile(r'["\'](?:whatsapp|phone_number|mobile_number|wa_number|phone|mobile)["\']\s*:\s*["\']\+?(\d{10,15})["\']', re.I)),
 ]
 
 
@@ -983,32 +1238,28 @@ def clean_phone_number(raw: str) -> Optional[str]:
     return None
 
 
-def extract_numbers_from_text(text: str) -> set[str]:
-    found: set[str] = set()
+def extract_numbers_with_methods(text: str) -> dict[str, str]:
+    """Return {normalized_number: extraction_method}. First method wins per number."""
+    found: dict[str, str] = {}
     if not text:
         return found
-    samples = [
-        text,
-        urllib.parse.unquote(text),
-        urllib.parse.unquote_plus(text),
-        html.unescape(text),
-    ]
+    samples = [text, urllib.parse.unquote(text),
+               urllib.parse.unquote_plus(text), html.unescape(text)]
     for sample in samples:
-        for pattern in _WA_PATTERNS:
+        for method, pattern in _EXTRACTORS:
             for match in pattern.findall(sample):
                 if isinstance(match, tuple):
                     match = match[0]
                 cleaned = clean_phone_number(match)
-                if cleaned:
-                    found.add(cleaned)
+                if cleaned and cleaned not in found:
+                    found[cleaned] = method
     return found
 
 
 # =========================================================
-# URL Validator
+# URL validation
 # =========================================================
 def validate_url(url: str) -> tuple[bool, str]:
-    """Returns (valid, error_reason)."""
     if len(url) > MAX_URL_LENGTH:
         return False, f"URL too long (max {MAX_URL_LENGTH} chars)"
     try:
@@ -1023,1743 +1274,1523 @@ def validate_url(url: str) -> tuple[bool, str]:
 
 
 # =========================================================
-# Redirect Handler & Extraction Session
+# Extraction session (requests-based; proxy-safe)
 # =========================================================
-class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def __init__(self):
-        super().__init__()
-        self.collected_redirect_targets: list[str] = []
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        self.collected_redirect_targets.append(newurl)
-        parsed = urllib.parse.urlparse(newurl)
-        if parsed.scheme.lower() not in ("http", "https"):
-            # Non-HTTP scheme (whatsapp://, intent://, etc.) — record but don't follow
-            return None
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
 class ExtractionSession:
     """
-    Per-request session for fetching URLs.
-    HTTP/HTTPS proxies use urllib (no external dep).
-    SOCKS5 proxies use requests+PySocks.
-    Cookie jars are isolated per instance — no cross-proxy leakage.
+    One session per request in rotation mode; a shared session in direct mode.
+    All proxy traffic (HTTP/HTTPS/SOCKS5) goes through requests, which handles
+    HTTPS CONNECT tunnelling and proxy auth correctly.
     """
 
-    _UA = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-    _DEFAULT_HEADERS = [
-        ("User-Agent", _UA),
-        ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-        ("Accept-Language", "en-US,en;q=0.9"),
-        ("Cache-Control", "no-cache"),
-        ("Pragma", "no-cache"),
-        ("Upgrade-Insecure-Requests", "1"),
-    ]
+    _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-    def __init__(
-        self,
-        proxy_endpoint: Optional[str] = None,
-        timeout: float = REQUEST_TIMEOUT,
-    ):
+    def __init__(self, proxy_endpoint: Optional[str] = None):
         self.proxy_endpoint = proxy_endpoint
-        self.timeout = timeout
-        self.cached_test_cookie: Optional[str] = None
-
-        parsed_proxy, parse_err = None, ""
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": self._UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        self.session.max_redirects = MAX_REDIRECTS
         if proxy_endpoint:
-            parsed_proxy, parse_err = parse_proxy(proxy_endpoint)
-
-        self._use_requests = (
-            parsed_proxy is not None
-            and parsed_proxy.scheme.startswith("socks5")
-        )
-
-        if self._use_requests:
-            self._requests_session = requests.Session()
-            pd = parsed_proxy.to_requests_proxies()
-            if pd:
-                self._requests_session.proxies = pd
-            self._requests_session.headers.update({"User-Agent": self._UA})
-            self._urllib_opener = None
-            self._redirect_handler = None
-            self._cj = None
-        else:
-            self._requests_session = None
-            self._cj = http.cookiejar.CookieJar()
-            self._redirect_handler = SafeRedirectHandler()
-
-            handlers: list[urllib.request.BaseHandler] = [
-                urllib.request.HTTPCookieProcessor(self._cj),
-                self._redirect_handler,
-            ]
-            if parsed_proxy and not self._use_requests:
-                proxy_dict = {
-                    "http": proxy_endpoint,
-                    "https": proxy_endpoint,
-                }
-                handlers.append(urllib.request.ProxyHandler(proxy_dict))
-
-            self._urllib_opener = urllib.request.build_opener(*handlers)
-            self._urllib_opener.addheaders = list(self._DEFAULT_HEADERS)
+            parsed, _ = parse_proxy(proxy_endpoint)
+            if parsed:
+                pd = parsed.to_requests_proxies()
+                if pd:
+                    self.session.proxies = pd
 
     def close(self) -> None:
-        if self._requests_session:
-            try:
-                self._requests_session.close()
-            except Exception:
-                pass
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
     def fetch(self, url: str) -> tuple[str, str, list[str]]:
-        """
-        Returns (final_url, body, all_visited_urls).
-        Handles InfinityFree challenge, meta-refresh, JS redirects.
-        Non-HTTP redirect targets (whatsapp://) are recorded but not followed.
-        Limits response body to MAX_RESPONSE_SIZE.
-        """
-        if self._use_requests:
-            return self._fetch_requests(url)
-        return self._fetch_urllib(url)
-
-    def _fetch_requests(self, url: str) -> tuple[str, str, list[str]]:
+        """Return (final_url, body, visited_urls). Follows meta/JS redirects (2 hops)."""
         visited: list[str] = [url]
-        sess = self._requests_session
-        try:
-            resp = sess.get(url, timeout=self.timeout, allow_redirects=True, stream=True)
-            # Track redirect chain
-            for r in resp.history:
-                visited.append(r.url)
-            visited.append(resp.url)
+        resp = self.session.get(
+            url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            allow_redirects=True, stream=True,
+        )
+        for r in resp.history:
+            visited.append(r.url)
+        visited.append(resp.url)
 
-            body_bytes = b""
-            for chunk in resp.iter_content(chunk_size=65536):
-                body_bytes += chunk
-                if len(body_bytes) > MAX_RESPONSE_SIZE:
-                    break
-            body = body_bytes.decode("utf-8", errors="ignore")
-            return resp.url, body, visited
-        except requests.exceptions.RequestException as exc:
-            raise OSError(_classify_requests_error(exc)) from exc
+        body_bytes = b""
+        for chunk in resp.iter_content(chunk_size=65536):
+            body_bytes += chunk
+            if len(body_bytes) > MAX_RESPONSE_SIZE:
+                break
+        body = body_bytes.decode("utf-8", errors="ignore")
+        current_url = resp.url
+        resp.close()
 
-    def _fetch_urllib(self, url: str) -> tuple[str, str, list[str]]:
-        if self._redirect_handler:
-            self._redirect_handler.collected_redirect_targets.clear()
-
-        domain = urllib.parse.urlparse(url).hostname
-        if self.cached_test_cookie and domain and self._cj is not None:
-            c_obj = http.cookiejar.Cookie(
-                version=0, name="__test", value=self.cached_test_cookie,
-                port=None, port_specified=False,
-                domain=domain, domain_specified=True, domain_initial_dot=False,
-                path="/", path_specified=True, secure=False, expires=None,
-                discard=True, comment=None, comment_url=None,
-                rest={"HttpOnly": None}, rfc2109=False,
-            )
-            self._cj.set_cookie(c_obj)
-
-        visited: list[str] = [url]
-        current_url = url
-        body = ""
-
-        try:
-            req = urllib.request.Request(url)
-            resp = self._urllib_opener.open(req, timeout=self.timeout)
-            current_url = resp.geturl()
-            visited.append(current_url)
-            raw = resp.read(MAX_RESPONSE_SIZE)
-            body = raw.decode("utf-8", errors="ignore")
-        except urllib.error.HTTPError as e:
-            current_url = e.geturl() or url
-            visited.append(current_url)
-            try:
-                raw = e.read(MAX_RESPONSE_SIZE) if hasattr(e, "read") else b""
-                body = raw.decode("utf-8", errors="ignore")
-            except Exception:
-                body = ""
-        except Exception:
-            if self._redirect_handler:
-                visited.extend(self._redirect_handler.collected_redirect_targets)
-            raise
-
-        if self._redirect_handler:
-            visited.extend(self._redirect_handler.collected_redirect_targets)
-
-        # InfinityFree / ByetHost slowAES challenge
-        if "slowAES" in body or ("toNumbers(" in body and "__test=" in body):
-            matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', body)
-            if len(matches) >= 3:
-                a_key, b_iv, c_cipher = matches[0], matches[1], matches[2]
-                self.cached_test_cookie = decrypt_byet_challenge(c_cipher, a_key, b_iv)
-                if domain and self._cj is not None:
-                    c_obj = http.cookiejar.Cookie(
-                        version=0, name="__test", value=self.cached_test_cookie,
-                        port=None, port_specified=False,
-                        domain=domain, domain_specified=True, domain_initial_dot=False,
-                        path="/", path_specified=True, secure=False, expires=None,
-                        discard=True, comment=None, comment_url=None,
-                        rest={"HttpOnly": None}, rfc2109=False,
-                    )
-                    self._cj.set_cookie(c_obj)
-
-                loc_match = re.search(r'location\.href\s*=\s*["\'](.*?)["\']', body)
-                next_dest = loc_match.group(1) if loc_match else (
-                    url + ("&i=1" if "?" in url else "?i=1")
-                )
-                next_url = urllib.parse.urljoin(current_url, next_dest)
-                visited.append(next_url)
-                try:
-                    resp2 = self._urllib_opener.open(
-                        urllib.request.Request(next_url), timeout=self.timeout
-                    )
-                    current_url = resp2.geturl()
-                    visited.append(current_url)
-                    body = resp2.read(MAX_RESPONSE_SIZE).decode("utf-8", errors="ignore")
-                except Exception:
-                    pass
-
-        # Meta-refresh and JS redirect follow-through (up to 2 hops)
         for _ in range(2):
-            meta_refresh = re.search(
-                r'<meta[^>]*?http-equiv\s*=\s*["\']?refresh["\']?[^>]*?'
-                r'content\s*=\s*["\']?[^"\'>]*?url\s*=\s*([^\s"\'\';>]+)',
-                body, re.IGNORECASE,
-            )
-            if meta_refresh:
-                dest = meta_refresh.group(1).strip()
-                dest_url = urllib.parse.urljoin(current_url, dest)
-                visited.append(dest_url)
-                if dest_url.lower().startswith(("http://", "https://")):
-                    try:
-                        r = self._urllib_opener.open(
-                            urllib.request.Request(dest_url), timeout=self.timeout
-                        )
-                        current_url = r.geturl()
-                        visited.append(current_url)
-                        body = r.read(MAX_RESPONSE_SIZE).decode("utf-8", errors="ignore")
-                        continue
-                    except Exception:
-                        pass
+            meta = re.search(
+                r'<meta[^>]*?http-equiv\s*=\s*["\']?refresh["\']?[^>]*?content\s*=\s*["\']?[^"\'>]*?url\s*=\s*([^\s"\';>]+)',
+                body, re.I)
+            js = re.search(
+                r'(?:window\.|document\.|top\.)?location(?:\.href|\.replace|\.assign)?\s*(?:=|\()\s*["\'](https?://[^"\']+)["\']',
+                body, re.I)
+            dest = None
+            if meta:
+                dest = urllib.parse.urljoin(current_url, meta.group(1).strip())
+            elif js:
+                dest = js.group(1).strip()
+            if not dest or not dest.lower().startswith(("http://", "https://")):
                 break
-
-            js_match = re.search(
-                r'(?:window\.|document\.|top\.)?location(?:\.href|\.replace|\.assign)?\s*'
-                r'(?:=|\()\s*["\'](https?://[^"\']+|whatsapp://[^"\']+|wa\.me/[^"\']+)["\']',
-                body, re.IGNORECASE,
-            )
-            if js_match:
-                dest_url = js_match.group(1).strip()
-                visited.append(dest_url)
-                if dest_url.lower().startswith(("http://", "https://")):
-                    try:
-                        r = self._urllib_opener.open(
-                            urllib.request.Request(dest_url), timeout=self.timeout
-                        )
-                        current_url = r.geturl()
-                        visited.append(current_url)
-                        body = r.read(MAX_RESPONSE_SIZE).decode("utf-8", errors="ignore")
-                        continue
-                    except Exception:
-                        pass
+            visited.append(dest)
+            try:
+                r2 = self.session.get(dest, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                                      allow_redirects=True, stream=True)
+                for r in r2.history:
+                    visited.append(r.url)
+                current_url = r2.url
+                visited.append(current_url)
+                bb = b""
+                for chunk in r2.iter_content(chunk_size=65536):
+                    bb += chunk
+                    if len(bb) > MAX_RESPONSE_SIZE:
+                        break
+                body = bb.decode("utf-8", errors="ignore")
+                r2.close()
+            except Exception:
                 break
-            break
 
         return current_url, body, visited
 
 
 def add_cache_buster(url: str, cycle: int) -> str:
+    """Append a cache-busting param unless the URL looks signed (has a token/sig)."""
+    low = url.lower()
+    if any(tok in low for tok in ("signature=", "sig=", "token=", "&x-amz-", "?x-amz-")):
+        return url  # preserve signed URLs
     import random as _r
     ts = int(time.time() * 1000)
-    salt = _r.randint(100, 999)
     sep = "&" if "?" in url else "?"
-    return f"{url}{sep}_cb={ts}_{cycle}_{salt}"
+    return f"{url}{sep}_cb={ts}_{cycle}_{_r.randint(100, 999)}"
 
 
 # =========================================================
-# Keyboards
+# Live progress updater (independent thread)
 # =========================================================
-def main_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        types.KeyboardButton("🔗 Send New Link"),
-        types.KeyboardButton("📋 My History"),
-        types.KeyboardButton("📊 My Stats"),
-        types.KeyboardButton("❓ Help"),
-        types.KeyboardButton("📞 Support"),
-    )
-    return markup
+def _progress_bar(pct: int) -> str:
+    ticks = max(0, min(10, int(pct / 10)))
+    return "█" * ticks + "░" * (10 - ticks)
 
 
-def mode_selection_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        types.KeyboardButton("🟢 WITHOUT IP"),
-        types.KeyboardButton("🌐 WITH IP ROTATION"),
-        types.KeyboardButton("🔙 Back"),
-        types.KeyboardButton("❌ Cancel"),
-    )
-    return markup
+def render_progress(state: dict) -> str:
+    total = state.get("total", 0)
+    visits = state.get("visits", 0)
+    pct = int((visits / total) * 100) if total else 0
+    elapsed = int(time.time() - state.get("start", time.time()))
+    speed = (visits / elapsed) if elapsed > 0 else 0
+    lines = [
+        "⏳ <b>EXTRACTION IN PROGRESS</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🆔 Job: <code>#{state.get('job_id', 0):06d}</code>",
+        f"⚙️ Mode: {state.get('mode_display', '')}",
+        "",
+        f"Progress: <code>[{_progress_bar(pct)}]</code> {pct}%",
+        f"🔄 Visits: <code>{visits}/{total}</code>",
+        f"✅ Successful: <code>{state.get('ok', 0)}</code>",
+        f"❌ Failed: <code>{state.get('failed', 0)}</code>",
+        f"📱 Unique Numbers: <code>{state.get('unique', 0)}</code>",
+        f"♻️ Duplicates: <code>{state.get('dupes', 0)}</code>",
+    ]
+    if state.get("mode") == "ROTATING":
+        lines.append("")
+        lines.append(f"🌐 Proxy: <code>{html.escape(state.get('proxy_display', 'selecting…'))}</code>")
+        if state.get("exit_ip"):
+            lines.append(f"📡 Exit IP: <code>{html.escape(state['exit_ip'])}</code>")
+        if state.get("latency"):
+            lines.append(f"⚡ Latency: <code>{state['latency']:.0f} ms</code>")
+    lines += [
+        "",
+        f"🔧 Stage: <i>{html.escape(state.get('stage', 'Working'))}</i>",
+        f"⏱ Elapsed: {elapsed}s · Speed: {speed:.2f}/s",
+        "━━━━━━━━━━━━━━━━━━",
+        "<i>Tap ❌ Cancel to stop</i>",
+    ]
+    return "\n".join(lines)
 
 
-def extraction_cycles_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        types.KeyboardButton("🧪 Test — 1 Visit"),
-        types.KeyboardButton("🚀 20 Visits"),
-        types.KeyboardButton("⚡ 50 Visits"),
-        types.KeyboardButton("💎 100 Visits"),
-        types.KeyboardButton("🔙 Back"),
-        types.KeyboardButton("❌ Cancel"),
-    )
-    return markup
+def progress_updater(chat_id: int, message_id: int, state: dict,
+                     stop_event: threading.Event) -> None:
+    """Runs independently so the UI keeps moving even during a slow request."""
+    last_text = ""
+    while not stop_event.is_set():
+        try:
+            text = render_progress(state)
+            if text != last_text:
+                bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+                last_text = text
+        except ApiTelegramException as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.debug("progress edit: %s", exc)
+        except Exception as exc:
+            logger.debug("progress edit error: %s", exc)
+        stop_event.wait(PROGRESS_INTERVAL)
 
 
-def admin_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    maintenance_label = "🔴 Maintenance: ON" if MAINTENANCE_MODE else "🟢 Maintenance: OFF"
-    markup.add(
-        types.KeyboardButton("🌐 Proxy Manager"),
-        types.KeyboardButton("📈 Bot Stats"),
-        types.KeyboardButton("📢 Broadcast"),
-        types.KeyboardButton("👥 Recent Users"),
-        types.KeyboardButton(maintenance_label),
-        types.KeyboardButton("🔙 Main Menu"),
-    )
-    return markup
+# =========================================================
+# Channel posting
+# =========================================================
+def channel_target() -> str:
+    return get_setting("channel_username", DEFAULT_CHANNEL).strip()
 
 
-def proxy_manager_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        types.KeyboardButton("➕ Add Single Proxy"),
-        types.KeyboardButton("📦 Bulk Add Proxies"),
-        types.KeyboardButton("🧪 Test Single Proxy"),
-        types.KeyboardButton("📦 Test Multiple Proxies"),
-        types.KeyboardButton("🧪 Test All Proxies"),
-        types.KeyboardButton("📋 List All Proxies"),
-        types.KeyboardButton("📊 Proxy Statistics"),
-        types.KeyboardButton("🔄 Retest Failed"),
-        types.KeyboardButton("🗑️ Delete Proxy"),
-        types.KeyboardButton("🗑️ Clear Dead Proxies"),
-        types.KeyboardButton("🗑️ Clear All Proxies"),
-        types.KeyboardButton("🔙 Admin Panel"),
-        types.KeyboardButton("❌ Cancel"),
-    )
-    return markup
-
-
-def cancel_only_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(types.KeyboardButton("❌ Cancel"))
-    return markup
-
-
-def back_cancel_keyboard() -> types.ReplyKeyboardMarkup:
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        types.KeyboardButton("🔙 Back"),
-        types.KeyboardButton("❌ Cancel"),
-    )
-    return markup
-
-
-def build_copy_markup(numbers_text: str) -> types.InlineKeyboardMarkup:
-    markup = types.InlineKeyboardMarkup()
+def verify_channel() -> tuple[bool, str]:
+    target = channel_target()
+    if not target:
+        return False, "No channel configured"
     try:
-        copy_btn = types.InlineKeyboardButton(
-            text="📋 Copy All Numbers",
-            copy_text=types.CopyTextButton(text=numbers_text),
-        )
-        markup.add(copy_btn)
-    except Exception:
-        markup.add(
-            types.InlineKeyboardButton(
-                text="📋 Copy All Numbers",
-                switch_inline_query=numbers_text[:250],
-            )
-        )
-    return markup
+        chat = bot.get_chat(target)
+        member = bot.get_chat_member(chat.id, bot.get_me().id)
+        if member.status in ("administrator", "creator"):
+            return True, f"Verified: {getattr(chat, 'title', target)}"
+        return False, "Bot is not an administrator of the channel"
+    except ApiTelegramException as exc:
+        return False, str(exc)[:120]
+    except Exception as exc:
+        return False, str(exc)[:120]
 
 
-def proxy_status_emoji(row: dict) -> str:
-    if row.get("last_tested") is None:
-        return "⚪"
-    if row.get("success_count", 0) == 0:
-        return "🔴"
-    avg_lat = row.get("average_latency") or 0
-    if avg_lat >= 1500:
-        return "🟡"
-    return "🟢"
+def post_to_channel(job: dict, numbers: list[str], txt_bytes: Optional[bytes]) -> None:
+    if not get_bool_setting("channel_logging"):
+        return
+    target = channel_target()
+    if not target:
+        return
+
+    dur = (job.get("duration_ms") or 0) / 1000.0
+    uname = job.get("username")
+    uname_disp = f"@{uname}" if uname else "N/A"
+    summary = (
+        "🚀 <b>EXTRACTION COMPLETED</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 User: {html.escape(uname_disp)}\n"
+        f"🆔 User ID: <code>{job.get('user_id')}</code>\n\n"
+        f"🔗 Source:\n<code>{html.escape((job.get('source_url') or '')[:120])}</code>\n\n"
+        f"⚙️ Method: {'🌐 IP Rotation' if job.get('mode') == 'ROTATING' else '🟢 Direct'}\n"
+        f"🔄 Visits: {job.get('requested_visits')}\n"
+        f"✅ Successful: {job.get('successful_visits')}\n"
+        f"❌ Failed: {job.get('failed_visits')}\n"
+        f"📱 Unique Numbers: {job.get('unique_numbers')}\n"
+        f"♻️ Duplicates: {job.get('duplicate_numbers')}\n"
+        f"⏱ Duration: {dur:.1f}s\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 Job ID: <code>#{job.get('job_id'):06d}</code>"
+    )
+    if get_bool_setting("channel_post_numbers") and numbers:
+        preview = "\n".join(f"+{n}" for n in numbers[:30])
+        summary += f"\n\n📞 <b>Numbers:</b>\n<code>{html.escape(preview)}</code>"
+        if len(numbers) > 30:
+            summary += f"\n<i>… and {len(numbers) - 30} more</i>"
+
+    status, msg_id, err = "FAILED", None, None
+    for attempt in range(3):
+        try:
+            sent = bot.send_message(target, summary)
+            msg_id = sent.message_id
+            status = "POSTED"
+            if get_bool_setting("channel_attach_txt") and txt_bytes:
+                stream = io.BytesIO(txt_bytes)
+                stream.name = f"job_{job.get('job_id'):06d}_numbers.txt"
+                try:
+                    bot.send_document(target, stream)
+                except Exception as e:
+                    logger.warning("Channel TXT upload failed: %s", e)
+            log_event("CHANNEL_POST_SUCCESS", job=job.get("job_id"))
+            break
+        except ApiTelegramException as exc:
+            err = str(exc)[:150]
+            time.sleep(1.5 * (attempt + 1))
+        except Exception as exc:
+            err = str(exc)[:150]
+            break
+    if status != "POSTED":
+        log_event("CHANNEL_POST_FAILURE", job=job.get("job_id"), reason=err or "unknown")
+    finalize_job(job.get("job_id"),
+                 channel_post_status=status, channel_message_id=msg_id, channel_post_error=err)
 
 
 # =========================================================
-# Extraction Worker
+# Result TXT builder
 # =========================================================
-_CYCLE_COUNT_MAP = {
-    "🧪 Test — 1 Visit": 1,
-    "🚀 20 Visits": 20,
-    "⚡ 50 Visits": 50,
-    "💎 100 Visits": 100,
-}
+def build_result_txt(job: dict, numbers_records: list[dict]) -> bytes:
+    bot_name = get_setting("bot_name")
+    lines = [
+        f"{bot_name} — Extraction Results",
+        "=" * 45,
+        f"Job ID:      #{job.get('job_id'):06d}",
+        f"User ID:     {job.get('user_id')}",
+        f"Username:    @{job.get('username') or 'N/A'}",
+        f"Source URL:  {job.get('source_url')}",
+        f"Mode:        {'IP Rotation' if job.get('mode') == 'ROTATING' else 'Direct'}",
+        f"Date:        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Visits:      {job.get('requested_visits')}",
+        f"Successful:  {job.get('successful_visits')}",
+        f"Failed:      {job.get('failed_visits')}",
+        f"Unique:      {job.get('unique_numbers')}",
+        f"Duplicates:  {job.get('duplicate_numbers')}",
+        "",
+        "Numbers (number | method | visit)",
+        "-" * 45,
+    ]
+    for rec in numbers_records:
+        lines.append(f"+{rec['number']}  |  {rec.get('extraction_method', '')}  |  visit {rec.get('visit_number', '')}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def extraction_worker(
-    chat_id: int,
-    user_id: int,
-    url: str,
-    mode: str,
-    total_cycles: int,
-    progress_message_id: int,
-    cancel_event: threading.Event,
-) -> None:
-    logger.info("Job started: user=%d url=%s mode=%s cycles=%d", user_id, url, mode, total_cycles)
+# =========================================================
+# Extraction worker
+# =========================================================
+def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
+                      mode: str, total: int, progress_msg_id: int,
+                      job_id: int, cancel_event: threading.Event) -> None:
+    log_event("JOB_START", job=job_id, user=user_id, mode=mode, visits=total)
 
-    found_numbers: list[str] = []
+    mode_display = "🌐 IP Rotation" if mode == "ROTATING" else "🟢 Direct Connection"
+    state = {
+        "job_id": job_id, "mode": mode, "mode_display": mode_display,
+        "total": total, "visits": 0, "ok": 0, "failed": 0,
+        "unique": 0, "dupes": 0, "start": time.time(),
+        "stage": "Initialising", "proxy_display": "selecting…",
+        "exit_ip": "", "latency": 0.0,
+    }
+
+    stop_progress = threading.Event()
+    prog_thread = threading.Thread(
+        target=progress_updater, args=(chat_id, progress_msg_id, state, stop_progress),
+        daemon=True)
+    prog_thread.start()
+
+    found_order: list[str] = []
     found_set: set[str] = set()
-    total_numbers_seen = 0
-    total_ok = 0
-    errors = 0
-    last_ui_update = 0.0
-    start_time = time.time()
+    number_methods: dict[str, str] = {}
+    total_seen = 0
+    stopped_no_proxy = False
+    start = time.time()
 
-    mode_display = "🌐 IP Rotation" if mode == "ROTATING" else "🟢 Normal Connection"
-
-    # Shared session for NORMAL mode (reuse for performance)
-    shared_session: Optional[ExtractionSession] = None
-    if mode == "NORMAL":
-        shared_session = ExtractionSession(proxy_endpoint=None)
+    shared_session = ExtractionSession(None) if mode == "NORMAL" else None
+    recent_proxies: set = set()
 
     try:
-        for cycle in range(1, total_cycles + 1):
+        for cycle in range(1, total + 1):
             if cancel_event.is_set():
-                logger.info("Job cancelled: user=%d at cycle %d", user_id, cycle)
                 break
 
             target_url = add_cache_buster(url, cycle)
-            session: Optional[ExtractionSession] = shared_session
-            endpoint_raw: Optional[str] = None
+            endpoint = None
+            session = shared_session
 
             if mode == "ROTATING":
-                endpoint_raw = proxy_manager.get_next_endpoint()
-                if endpoint_raw is None:
-                    # No proxy available — abort honestly; do not fall back to direct.
-                    logger.warning("No proxy available at cycle %d for user %d", cycle, user_id)
-                    try:
-                        bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=progress_message_id,
-                            text=(
-                                "❌ <b>Extraction Stopped</b>\n\n"
-                                "No working proxy is available right now.\n"
-                                "All proxies may be in cooldown.\n\n"
-                                f"Completed: {cycle - 1}/{total_cycles} visits.\n"
-                                f"Unique Numbers found so far: {len(found_numbers)}"
-                            ),
-                        )
-                    except Exception:
-                        pass
+                state["stage"] = "Selecting proxy"
+                endpoint = proxy_manager.get_next_endpoint(exclude=recent_proxies)
+                if endpoint is None:
+                    stopped_no_proxy = True
+                    log_event("JOB_STOP_NO_PROXY", job=job_id, at=cycle)
                     break
-                session = ExtractionSession(proxy_endpoint=endpoint_raw)
+                recent_proxies.add(endpoint)
+                if len(recent_proxies) > max(1, min(3, proxy_manager.get_endpoint_count() - 1)):
+                    recent_proxies.pop() if isinstance(recent_proxies, set) else None
+                    recent_proxies = set(list(recent_proxies)[-3:])
+                state["proxy_display"] = sanitize_display(endpoint)
+                parsed, _ = parse_proxy(endpoint)
+                session = ExtractionSession(endpoint)
 
-            cycle_start = time.perf_counter()
+            state["stage"] = "Connecting"
+            t0 = time.perf_counter()
+            attempt_status = "FAILED"
+            attempt_ip = ""
+            attempt_error = ""
             try:
-                final_url, body, visited_urls = session.fetch(target_url)
-                latency_ms = (time.perf_counter() - cycle_start) * 1000
-                total_ok += 1
+                state["stage"] = "Fetching URL"
+                final_url, body, visited = session.fetch(target_url)
+                latency = (time.perf_counter() - t0) * 1000
+                state["latency"] = latency
+                state["stage"] = "Scanning response"
 
-                cycle_numbers: set[str] = set()
-                for v_url in visited_urls:
-                    cycle_numbers.update(extract_numbers_from_text(v_url))
-                cycle_numbers.update(extract_numbers_from_text(body))
+                cycle_numbers: dict[str, str] = {}
+                for v in visited:
+                    for num, meth in extract_numbers_with_methods(v).items():
+                        cycle_numbers.setdefault(num, meth)
+                for num, meth in extract_numbers_with_methods(body).items():
+                    cycle_numbers.setdefault(num, meth)
 
-                total_numbers_seen += len(cycle_numbers)
-                for num in sorted(cycle_numbers):
+                total_seen += len(cycle_numbers)
+                for num, meth in sorted(cycle_numbers.items()):
                     if num not in found_set:
                         found_set.add(num)
-                        found_numbers.append(num)
+                        found_order.append(num)
+                        number_methods[num] = meth
 
-                if mode == "ROTATING" and endpoint_raw:
-                    proxy_manager.mark_success(endpoint_raw, latency_ms, "")
+                state["ok"] += 1
+                state["unique"] = len(found_order)
+                state["dupes"] = max(total_seen - len(found_order), 0)
+                attempt_status = "SUCCESS"
+
+                if mode == "ROTATING" and endpoint:
+                    # Observe exit IP once per new proxy to confirm rotation.
+                    observed = ""
+                    try:
+                        r = session.session.get(_IP_CHECK_URLS[0],
+                                                 timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+                        if r.status_code == 200:
+                            observed = (r.json().get("ip") or "")
+                    except Exception:
+                        observed = ""
+                    attempt_ip = observed
+                    state["exit_ip"] = observed or state.get("exit_ip", "")
+                    proxy_manager.mark_success(endpoint, latency, observed)
 
             except Exception as exc:
-                errors += 1
-                err_str = str(exc)[:120]
-                logger.warning(
-                    "Cycle %d error (user=%d proxy=%s): %s",
-                    cycle, user_id, _safe_log(endpoint_raw or "direct"), err_str,
-                )
-                if mode == "ROTATING" and endpoint_raw:
-                    proxy_manager.mark_failed(endpoint_raw)
+                state["failed"] += 1
+                attempt_error = _classify_requests_error(exc)
+                log_event("VISIT_FAIL", job=job_id, cycle=cycle,
+                          proxy=sanitize_display(endpoint or "direct"), reason=attempt_error)
+                if mode == "ROTATING" and endpoint:
+                    proxy_manager.mark_failed(endpoint, attempt_error)
             finally:
                 if mode == "ROTATING" and session:
                     session.close()
 
-            # Throttled progress update (~1.8 s)
-            now = time.time()
-            if (now - last_ui_update > 1.8) or (cycle == total_cycles):
-                last_ui_update = now
-                elapsed = max(int(now - start_time), 1)
-                pct = int((cycle / total_cycles) * 100)
-                done_ticks = int((cycle / total_cycles) * 10)
-                bar = "█" * done_ticks + "░" * (10 - done_ticks)
-
-                cancel_hint = ""
-                if mode == "ROTATING":
-                    ep_disp = ProxyManager.sanitize_display(endpoint_raw) if endpoint_raw else "None"
-                    cancel_hint = f"\n📡 Last proxy: <code>{html.escape(ep_disp)}</code>"
-
-                progress_text = (
-                    f"⏳ <b>EXTRACTION IN PROGRESS</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>Mode:</b> {mode_display}\n"
-                    f"<b>Visits:</b> {cycle}/{total_cycles} ({pct}%)\n"
-                    f"<b>Progress:</b> <code>[{bar}]</code>\n"
-                    f"<b>Successful:</b> <code>{total_ok}</code>\n"
-                    f"<b>Failed:</b> <code>{errors}</code>\n"
-                    f"<b>Unique Numbers:</b> <code>{len(found_numbers)}</code>\n"
-                    f"<b>Elapsed:</b> {elapsed}s"
-                    f"{cancel_hint}\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"<i>Tap ❌ Cancel to stop</i>"
-                )
-                try:
-                    bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=progress_message_id,
-                        text=progress_text,
-                    )
-                except ApiTelegramException:
-                    pass
-                except Exception:
-                    pass
-
+            # Record every attempt & every number for the audit trail.
+            if mode == "ROTATING":
+                save_proxy_attempt(job_id, cycle, state["proxy_display"],
+                                   parsed.protocol_label if endpoint and parsed else "",
+                                   attempt_status, state.get("latency", 0),
+                                   attempt_ip, attempt_error)
+            state["visits"] = cycle
             time.sleep(0.05)
 
+        # Persist all unique numbers with their first-seen method.
+        for num in found_order:
+            save_extracted_number(job_id, user_id, num, url, number_methods.get(num, ""),
+                                  0, state.get("proxy_display", "") if mode == "ROTATING" else "",
+                                  state.get("exit_ip", ""))
+
     finally:
+        stop_progress.set()
         if shared_session:
             shared_session.close()
         with _state_lock:
             active_jobs.pop(user_id, None)
 
-    logger.info(
-        "Job completed: user=%d unique=%d ok=%d err=%d",
-        user_id, len(found_numbers), total_ok, errors,
-    )
+    # ── Finalize ──
+    unique = len(found_order)
+    dupes = max(total_seen - unique, 0)
+    duration_ms = int((time.time() - start) * 1000)
+    cancelled = cancel_event.is_set()
+    status = "CANCELLED" if cancelled else ("FAILED" if (stopped_no_proxy and state["ok"] == 0) else "COMPLETED")
 
-    unique_count = len(found_numbers)
-    duplicate_count = max(total_numbers_seen - unique_count, 0)
-    sorted_numbers = sorted(found_numbers)
-
-    update_user_stats(user_id, unique_count)
-    save_history(user_id, url, mode, total_cycles, unique_count, duplicate_count)
-
-    cancelled_note = " (Cancelled early)" if cancel_event.is_set() else ""
-
-    if unique_count > 0:
-        numbers_plain_text = "\n".join(f"+{num}" for num in sorted_numbers)
-
-        CHUNK_LIMIT = 3200
-        lines = [f"+{num}" for num in sorted_numbers]
-        chunks: list[str] = []
-        curr_chunk = ""
-        for line in lines:
-            if len(curr_chunk) + len(line) + 1 > CHUNK_LIMIT:
-                chunks.append(curr_chunk.strip())
-                curr_chunk = line + "\n"
-            else:
-                curr_chunk += line + "\n"
-        if curr_chunk.strip():
-            chunks.append(curr_chunk.strip())
-
-        copy_markup = build_copy_markup(numbers_plain_text)
-
-        header_text = (
-            f"📱 <b>EXTRACTED NUMBERS</b>{html.escape(cancelled_note)}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"<code>{html.escape(chunks[0])}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>Unique Numbers:</b> <code>{unique_count}</code>\n"
-            f"🔄 <b>Visits:</b> <code>{total_cycles}</code>\n"
-            f"✅ <b>Successful:</b> <code>{total_ok}</code>\n"
-            f"❌ <b>Failed:</b> <code>{errors}</code>\n"
-            f"🌐 <b>Mode:</b> {mode_display}"
-        )
+    finalize_job(job_id, successful_visits=state["ok"], failed_visits=state["failed"],
+                 unique_numbers=unique, duplicate_numbers=dupes, duration_ms=duration_ms,
+                 status=status, completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    update_user_stats(user_id, unique, success=(status == "COMPLETED"))
+    # Legacy history table (backward compatibility).
+    with _db_lock:
+        c = get_conn()
         try:
-            bot.send_message(chat_id, header_text, reply_markup=copy_markup)
-        except Exception:
-            bot.send_message(chat_id, f"Extracted Numbers:\n{chunks[0]}")
+            c.execute("INSERT INTO extraction_history (user_id, url, mode, cycles, unique_numbers, "
+                      "duplicate_count, completed_at) VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                      (user_id, url, mode, total, unique, dupes))
+            c.commit()
+        finally:
+            c.close()
 
-        for extra_idx, extra_chunk in enumerate(chunks[1:], start=2):
-            extra_text = (
-                f"📱 <b>Numbers (Part {extra_idx})</b>\n\n"
-                f"<code>{html.escape(extra_chunk)}</code>"
-            )
-            try:
-                bot.send_message(chat_id, extra_text)
-            except Exception:
-                bot.send_message(chat_id, extra_chunk)
+    log_event("JOB_COMPLETE", job=job_id, status=status, unique=unique)
 
+    job = get_job(job_id)
+    records = get_job_numbers(job_id)
+    txt_bytes = build_result_txt(job, records) if unique else None
+
+    # No-proxy stop message (never fell back to direct).
+    if stopped_no_proxy and unique == 0:
         try:
-            file_data = (
-                "URL Extractor — Final Results\n"
-                f"Source URL: {url}\n"
-                f"Mode: {mode_display}\n"
-                f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Total Visits Requested: {total_cycles}\n"
-                f"Successful Visits: {total_ok}\n"
-                f"Failed Visits: {errors}\n"
-                f"Unique Numbers: {unique_count}\n"
-                f"Duplicates Filtered: {duplicate_count}\n"
-                + ("=" * 45) + "\n\n"
-                + numbers_plain_text + "\n"
-            )
-            file_stream = io.BytesIO(file_data.encode("utf-8"))
-            file_stream.name = f"numbers_{int(time.time())}.txt"
-            bot.send_document(
-                chat_id,
-                file_stream,
-                caption=(
-                    f"📁 <b>Extraction File Ready</b>\n"
-                    f"📱 <code>Unique Numbers: {unique_count}</code>\n"
-                    f"<i>Tap above to save or download</i>"
-                ),
-                reply_markup=main_keyboard(),
-            )
-        except Exception as e:
-            logger.error("File upload failed: %s", e)
-            bot.send_message(
-                chat_id,
-                f"⚠️ File upload error: {html.escape(str(e)[:80])}",
-                reply_markup=main_keyboard(),
-            )
-    else:
-        bot.send_message(
-            chat_id,
-            (
-                f"⚠️ <b>No numbers found</b>{html.escape(cancelled_note)}\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🔄 <b>Visits Completed:</b> <code>{total_ok}/{total_cycles}</code>\n"
-                f"❌ <b>Errors:</b> <code>{errors}</code>\n"
-                f"🌐 <b>Mode:</b> {mode_display}\n\n"
-                "<i>The target may not have returned any trackable phone patterns.</i>"
-            ),
-            reply_markup=main_keyboard(),
-        )
-
-
-# =========================================================
-# Background Proxy Test Worker (for bulk/all tests)
-# =========================================================
-def _run_proxy_tests_in_bg(
-    chat_id: int,
-    status_msg_id: int,
-    endpoints_raw: list[str],
-    cancel_event: threading.Event,
-    detailed: bool = False,
-) -> None:
-    """
-    Tests a list of raw proxy strings in a bounded thread pool.
-    Sends progress updates, then a full summary.
-    """
-    total = len(endpoints_raw)
-    results: list[tuple[str, ProxyTestResult]] = []
-    tested = 0
-    working = 0
-    dead = 0
-    last_update = 0.0
-
-    def _test_one(raw: str) -> tuple[str, ProxyTestResult]:
-        parsed, err = parse_proxy(raw)
-        if not parsed:
-            return raw, ProxyTestResult(
-                proxy_display=ProxyManager.sanitize_display(raw),
-                scheme_label="UNKNOWN",
-                working=False,
-                latency_ms=None,
-                observed_ip=None,
-                error_reason=f"Parse error: {err}",
-            )
-        return raw, test_proxy(parsed, quick=not detailed)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as pool:
-        futures = {pool.submit(_test_one, raw): raw for raw in endpoints_raw}
-        for future in concurrent.futures.as_completed(futures):
-            if cancel_event.is_set():
-                # Cancel remaining futures
-                for f in futures:
-                    f.cancel()
-                break
-
-            raw, result = future.result()
-            results.append((raw, result))
-            tested += 1
-            if result.working:
-                working += 1
-                # Update DB stats
-                db_row = db_get_proxy_by_endpoint(raw)
-                if db_row:
-                    db_update_proxy_success(
-                        db_row["id"],
-                        result.latency_ms or 0,
-                        result.observed_ip or "",
-                    )
-            else:
-                dead += 1
-                db_row = db_get_proxy_by_endpoint(raw)
-                if db_row:
-                    db_update_proxy_failure(db_row["id"], result.error_reason or "Test failed")
-
-            now = time.time()
-            if (now - last_update > 2.0) or tested == total:
-                last_update = now
-                pct = int((tested / total) * 100)
-                done_ticks = int((tested / total) * 10)
-                bar = "█" * done_ticks + "░" * (10 - done_ticks)
-                progress_text = (
-                    f"🧪 <b>Testing proxies...</b>\n\n"
-                    f"Progress:\n<code>[{bar}]</code> {pct}%\n\n"
-                    f"Tested: {tested}/{total}\n"
-                    f"✅ Working: {working}\n"
-                    f"❌ Dead: {dead}"
-                )
-                try:
-                    bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=status_msg_id,
-                        text=progress_text,
-                    )
-                except Exception:
-                    pass
-
-    if cancel_event.is_set():
-        try:
-            bot.send_message(
-                chat_id,
-                f"🛑 <b>Test cancelled.</b>\nTested {tested}/{total} proxies.",
-                reply_markup=proxy_manager_keyboard(),
-            )
+            bot.edit_message_text(
+                chat_id=chat_id, message_id=progress_msg_id,
+                text=("❌ <b>IP Rotation stopped</b>\n━━━━━━━━━━━━━━━━━━\n"
+                      "No verified proxy is currently available.\n"
+                      f"Completed: {state['ok']}/{total} visits.\n\n"
+                      "<i>Try again after proxies recover. The bot did not fall back "
+                      "to a direct connection.</i>"))
         except Exception:
             pass
+        bot.send_message(chat_id, "🏠 Main Menu", reply_markup=main_keyboard(user_id))
         return
 
-    # Build summary
-    fast = sum(1 for _, r in results if r.working and (r.latency_ms or 9999) < 1500)
-    slow = working - fast
+    # Deliver results to the user.
+    _send_results(chat_id, user_id, job, found_order, txt_bytes, cancelled, stopped_no_proxy, total, state)
 
-    summary = (
-        f"🧪 <b>PROXY TEST RESULTS</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"Total: {total}\n"
-        f"✅ Working: {working}\n"
-        f"⚡ Fast: {fast}\n"
-        f"🐢 Slow: {slow}\n"
-        f"❌ Dead: {dead}\n\n"
-        f"━━━━━━━━━━━━━━━━━━"
+    # Auto channel post (never crash the job if it fails).
+    try:
+        post_to_channel(get_job(job_id), found_order, txt_bytes)
+    except Exception as exc:
+        logger.warning("Channel post error: %s", exc)
+
+
+def _send_results(chat_id, user_id, job, numbers, txt_bytes, cancelled,
+                  stopped_no_proxy, total, state) -> None:
+    mode_display = "🌐 IP Rotation" if job.get("mode") == "ROTATING" else "🟢 Direct Connection"
+    note = " (Cancelled)" if cancelled else ""
+    dur = (job.get("duration_ms") or 0) / 1000.0
+
+    if not numbers:
+        bot.send_message(
+            chat_id,
+            (f"⚠️ <b>No numbers found</b>{note}\n━━━━━━━━━━━━━━━━━━\n"
+             f"🔄 Visits: <code>{job.get('successful_visits')}/{total}</code>\n"
+             f"❌ Failed: <code>{job.get('failed_visits')}</code>\n"
+             f"🌐 Mode: {mode_display}\n\n"
+             "<i>The target returned no trackable phone patterns.</i>"),
+            reply_markup=main_keyboard(user_id))
+        return
+
+    numbers_plain = "\n".join(f"+{n}" for n in numbers)
+    result = (
+        f"✅ <b>EXTRACTION COMPLETED</b>{note}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 Job: <code>#{job.get('job_id'):06d}</code>\n"
+        f"🔗 Source: <code>{html.escape((job.get('source_url') or '')[:60])}</code>\n\n"
+        f"⚙️ Mode: {mode_display}\n"
+        f"🔄 Visits: <code>{job.get('successful_visits')}/{total}</code>\n"
+        f"✅ Successful: <code>{job.get('successful_visits')}</code>\n"
+        f"❌ Failed: <code>{job.get('failed_visits')}</code>\n"
+        f"📱 Unique Numbers: <code>{job.get('unique_numbers')}</code>\n"
+        f"♻️ Duplicates: <code>{job.get('duplicate_numbers')}</code>\n"
+        f"⏱ Duration: <code>{dur:.1f}s</code>\n"
+        "━━━━━━━━━━━━━━━━━━"
     )
+    # First chunk of numbers inline (rest via TXT).
+    preview = "\n".join(f"+{n}" for n in numbers[:60])
+    result += f"\n\n📱 <b>NUMBERS</b>\n<code>{html.escape(preview)}</code>"
+    if len(numbers) > 60:
+        result += f"\n<i>… and {len(numbers) - 60} more (see TXT)</i>"
 
-    # Send summary first
+    try:
+        bot.send_message(chat_id, result, reply_markup=build_copy_markup(numbers_plain))
+    except Exception:
+        bot.send_message(chat_id, result)
+
+    if txt_bytes:
+        try:
+            stream = io.BytesIO(txt_bytes)
+            stream.name = f"job_{job.get('job_id'):06d}_numbers.txt"
+            bot.send_document(chat_id, stream,
+                              caption=f"📁 <b>Results</b> · {job.get('unique_numbers')} unique numbers",
+                              reply_markup=main_keyboard(user_id))
+        except Exception as exc:
+            logger.error("File upload failed: %s", exc)
+            bot.send_message(chat_id, "🏠 Main Menu", reply_markup=main_keyboard(user_id))
+    else:
+        bot.send_message(chat_id, "🏠 Main Menu", reply_markup=main_keyboard(user_id))
+
+
+# =========================================================
+# Keyboards
+# =========================================================
+def main_keyboard(user_id: int = 0) -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(types.KeyboardButton("🔗 New Extraction"),
+          types.KeyboardButton("📊 My Statistics"),
+          types.KeyboardButton("📋 My History"),
+          types.KeyboardButton("❓ Help"),
+          types.KeyboardButton("📞 Support"))
+    if is_admin(user_id):
+        m.add(types.KeyboardButton("🔐 Admin Panel"))
+    return m
+
+
+def mode_keyboard() -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(types.KeyboardButton("🟢 WITHOUT IP"),
+          types.KeyboardButton("🌐 WITH IP ROTATION"),
+          types.KeyboardButton("🔙 Back"), types.KeyboardButton("❌ Cancel"))
+    return m
+
+
+def cycles_keyboard() -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(types.KeyboardButton("🧪 1 Visit"), types.KeyboardButton("🚀 20 Visits"),
+          types.KeyboardButton("⚡ 50 Visits"), types.KeyboardButton("💎 100 Visits"),
+          types.KeyboardButton("🔙 Back"), types.KeyboardButton("❌ Cancel"))
+    return m
+
+
+def cancel_keyboard() -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    m.add(types.KeyboardButton("❌ Cancel"))
+    return m
+
+
+def back_cancel_keyboard() -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(types.KeyboardButton("🔙 Back"), types.KeyboardButton("❌ Cancel"))
+    return m
+
+
+def admin_keyboard() -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(types.KeyboardButton("📊 Dashboard"), types.KeyboardButton("👥 Users"),
+          types.KeyboardButton("🔎 Extraction Logs"), types.KeyboardButton("🌐 Proxy Manager"),
+          types.KeyboardButton("📢 Broadcast"), types.KeyboardButton("📡 Channel Settings"),
+          types.KeyboardButton("⚙️ Bot Settings"), types.KeyboardButton("👮 Admin Management"),
+          types.KeyboardButton("🩺 Diagnostics"), types.KeyboardButton("🔙 Main Menu"))
+    return m
+
+
+def proxy_manager_keyboard() -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(types.KeyboardButton("➕ Add Proxy"), types.KeyboardButton("📦 Bulk Add"),
+          types.KeyboardButton("🧪 Health Check"), types.KeyboardButton("🔄 Retest Unhealthy"),
+          types.KeyboardButton("📋 Proxy List"), types.KeyboardButton("📊 Proxy Stats"),
+          types.KeyboardButton("🗑 Cleanup"), types.KeyboardButton("🔙 Admin Panel"))
+    return m
+
+
+def build_copy_markup(numbers_text: str) -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup()
+    try:
+        markup.add(types.InlineKeyboardButton(
+            text="📋 Copy All Numbers",
+            copy_text=types.CopyTextButton(text=numbers_text[:4000])))
+    except Exception:
+        markup.add(types.InlineKeyboardButton(
+            text="📋 Copy All Numbers", switch_inline_query=numbers_text[:250]))
+    return markup
+
+
+_CYCLE_MAP = {"🧪 1 Visit": 1, "🚀 20 Visits": 20, "⚡ 50 Visits": 50, "💎 100 Visits": 100}
+
+
+# =========================================================
+# Background proxy test runner (bounded pool, live progress)
+# =========================================================
+def run_proxy_tests_bg(chat_id: int, status_msg_id: int, endpoints: list[str],
+                       cancel_event: threading.Event, detailed: bool = False) -> None:
+    total = len(endpoints)
+    results: list[ProxyTestResult] = []
+    tested = working = slow = failed = 0
+    last_update = 0.0
+
+    def _one(raw: str) -> ProxyTestResult:
+        parsed, err = parse_proxy(raw)
+        if not parsed:
+            return ProxyTestResult(sanitize_display(raw), "UNKNOWN", "INVALID",
+                                   False, None, None, f"Parse: {err}")
+        res = test_proxy(parsed, quick=not detailed)
+        row = db_get_proxy_by_endpoint(raw)
+        if row:
+            if res.working:
+                db_update_proxy_success(row["id"], res.latency_ms or 0, res.observed_ip or "", res.status)
+            else:
+                db_update_proxy_failure(row["id"], res.error_reason or "Test failed", res.status)
+        return res
+
+    futures = {_proxy_test_pool.submit(_one, raw): raw for raw in endpoints}
+    for fut in concurrent.futures.as_completed(futures):
+        if cancel_event.is_set():
+            for f in futures:
+                f.cancel()
+            break
+        res = fut.result()
+        results.append(res)
+        tested += 1
+        if res.working and res.status == "WORKING":
+            working += 1
+        elif res.working and res.status in ("SLOW", "CONNECTED"):
+            slow += 1
+        else:
+            failed += 1
+        now = time.time()
+        if now - last_update > 1.5 or tested == total:
+            last_update = now
+            pct = int(tested / total * 100)
+            try:
+                bot.edit_message_text(
+                    chat_id=chat_id, message_id=status_msg_id,
+                    text=(f"🧪 <b>PROXY HEALTH CHECK</b>\n━━━━━━━━━━━━━━━━━━\n"
+                          f"<code>[{_progress_bar(pct)}]</code> {pct}%\n\n"
+                          f"Checked: {tested}/{total}\n🟢 Working: {working}\n"
+                          f"🟡 Slow: {slow}\n🔴 Failed: {failed}\n"
+                          f"Remaining: {total - tested}"))
+            except Exception:
+                pass
+
+    if cancel_event.is_set():
+        bot.send_message(chat_id, f"🛑 Health check cancelled ({tested}/{total}).",
+                         reply_markup=proxy_manager_keyboard())
+        return
+
+    summary = (f"🧪 <b>HEALTH CHECK COMPLETE</b>\n━━━━━━━━━━━━━━━━━━\n"
+               f"Total: {total}\n🟢 Working: {working}\n🟡 Slow/Connected: {slow}\n"
+               f"🔴 Failed: {failed}")
     try:
         bot.edit_message_text(chat_id=chat_id, message_id=status_msg_id, text=summary)
     except Exception:
+        pass
+
+    for i in range(0, len(results), 5):
+        block = "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(
+            r.card(index=idx + 1) for idx, r in enumerate(results[i:i + 5], start=i))
         try:
-            bot.send_message(chat_id, summary)
+            bot.send_message(chat_id, block)
         except Exception:
             pass
+        time.sleep(0.4)
+    bot.send_message(chat_id, "✅ Done.", reply_markup=proxy_manager_keyboard())
 
-    # Send individual cards in batches
-    CARDS_PER_MSG = 5
-    card_lines: list[str] = []
-    for idx, (_, r) in enumerate(results, 1):
-        card_lines.append(r.to_telegram_card(index=idx))
-        if len(card_lines) == CARDS_PER_MSG or idx == len(results):
-            block = "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(card_lines)
-            try:
-                bot.send_message(chat_id, block)
-            except Exception:
-                pass
-            card_lines = []
-            time.sleep(0.5)
 
-    # Inline buttons for follow-up actions
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("🔄 Retest Failed", callback_data="retest_failed"),
-        types.InlineKeyboardButton("🔙 Proxy Manager", callback_data="proxy_manager"),
-    )
+def trigger_retest_unhealthy(chat_id: int) -> None:
+    conn = get_conn()
     try:
-        bot.send_message(
-            chat_id,
-            "✅ <b>Test complete.</b>",
-            reply_markup=proxy_manager_keyboard(),
-        )
-    except Exception:
-        pass
+        rows = conn.execute(
+            "SELECT endpoint FROM admin_proxies WHERE is_active = 1 "
+            "AND (health_status != 'WORKING' OR last_tested IS NULL) "
+            "ORDER BY last_tested ASC").fetchall()
+    finally:
+        conn.close()
+    endpoints = [r["endpoint"] for r in rows]
+    if not endpoints:
+        bot.send_message(chat_id, "✅ No unhealthy/untested proxies.", reply_markup=proxy_manager_keyboard())
+        return
+    status = bot.send_message(chat_id, f"🔄 Retesting {len(endpoints)} proxies…")
+    ev = threading.Event()
+    threading.Thread(target=run_proxy_tests_bg,
+                     args=(chat_id, status.message_id, endpoints, ev, False), daemon=True).start()
 
 
 # =========================================================
-# Command Handlers
+# Command handlers
 # =========================================================
 @bot.message_handler(commands=["start"])
 def cmd_start(message: types.Message) -> None:
-    user = message.from_user
-    register_user(user.id, user.username, user.first_name)
+    u = message.from_user
+    register_user(u.id, u.username, u.first_name)
+
+    if user_is_blocked(u.id):
+        bot.send_message(message.chat.id, "🚫 <b>Access blocked.</b>")
+        return
+
+    if not user_is_approved(u.id):
+        bot.send_message(message.chat.id,
+                         "🔒 <b>ACCESS PENDING</b>\n\nYour access request has been submitted.\n"
+                         "Please wait for administrator approval.")
+        _notify_admins_new_request(u)
+        return
+
     bot.send_message(
         message.chat.id,
-        (
-            f"👋 <b>Welcome!</b>\n\n"
-            f"🤖 <b>URL Fetcher & Link Engine</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"<b>How it works:</b>\n"
-            f"1️⃣ Tap <b>🔗 Send New Link</b>\n"
-            f"2️⃣ Paste any valid HTTP/HTTPS link\n"
-            f"3️⃣ Choose extraction mode:\n"
-            f"    • 🟢 <b>WITHOUT IP:</b> Direct server connection\n"
-            f"    • 🌐 <b>WITH IP ROTATION:</b> Via configured proxy endpoints\n"
-            f"4️⃣ Select visit count (1x / 20x / 50x / 100x)\n"
-            f"5️⃣ Receive all unique numbers with Copy + .txt download!\n\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"👇 <b>Select an option below:</b>"
-        ),
-        reply_markup=main_keyboard(),
-    )
+        (f"🤖 <b>{html.escape(get_setting('bot_name'))}</b>\n"
+         "━━━━━━━━━━━━━━━━━━\n"
+         "Extract publicly exposed phone numbers from HTTP/HTTPS links and redirect chains.\n\n"
+         "1️⃣ Tap <b>🔗 New Extraction</b>\n"
+         "2️⃣ Send a valid link\n"
+         "3️⃣ Choose mode (Direct / IP Rotation)\n"
+         "4️⃣ Choose visit count\n"
+         "5️⃣ Get unique numbers + TXT download\n"
+         "━━━━━━━━━━━━━━━━━━"),
+        reply_markup=main_keyboard(u.id))
 
 
 @bot.message_handler(commands=["admin"])
 def cmd_admin(message: types.Message) -> None:
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         bot.send_message(message.chat.id, "❌ <b>Access Denied.</b>")
         return
-    bot.send_message(
-        message.chat.id,
-        "🔐 <b>Admin Control Console</b>\n━━━━━━━━━━━━━━━━━━\nSelect an administrative function:",
-        reply_markup=admin_keyboard(),
-    )
+    bot.send_message(message.chat.id,
+                     "🔐 <b>ADMIN CONTROL CENTER</b>\n━━━━━━━━━━━━━━━━━━",
+                     reply_markup=admin_keyboard())
 
 
-# =========================================================
-# Inline Callback Handlers
-# =========================================================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("del_proxy_"))
-def handle_proxy_delete_callback(call: types.CallbackQuery):
-    if call.from_user.id not in ADMIN_IDS:
-        bot.answer_callback_query(call.id, "Access denied.")
-        return
-    proxy_id_str = call.data.replace("del_proxy_", "")
-    if proxy_id_str.isdigit():
-        db_delete_proxy(int(proxy_id_str))
-        bot.answer_callback_query(call.id, "✅ Proxy deleted.")
+def _notify_admins_new_request(u) -> None:
+    text = (f"👤 <b>NEW USER REQUEST</b>\n\nName: {html.escape(u.first_name or '')}\n"
+            f"Username: @{html.escape(u.username or 'none')}\nUser ID: <code>{u.id}</code>")
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✅ Approve", callback_data=f"approve_{u.id}"),
+               types.InlineKeyboardButton("❌ Reject", callback_data=f"reject_{u.id}"))
+    for aid in [a["user_id"] for a in list_admins()]:
         try:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=f"🗑️ <i>Proxy #{proxy_id_str} deleted.</i>",
-            )
+            bot.send_message(aid, text, reply_markup=markup)
         except Exception:
             pass
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "proxy_manager")
-def handle_proxy_manager_callback(call: types.CallbackQuery):
-    if call.from_user.id not in ADMIN_IDS:
+# =========================================================
+# Callback handlers
+# =========================================================
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("approve_", "reject_")))
+def cb_approval(call: types.CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
         bot.answer_callback_query(call.id, "Access denied.")
+        return
+    action, _, uid_s = call.data.partition("_")
+    if not uid_s.isdigit():
+        return
+    uid = int(uid_s)
+    if action == "approve":
+        set_user_status(uid, "APPROVED")
+        audit(call.from_user.id, "USER_APPROVED", target=str(uid))
+        bot.answer_callback_query(call.id, "Approved.")
+        try:
+            bot.send_message(uid, "✅ <b>Access approved!</b> Tap /start to begin.")
+        except Exception:
+            pass
+    else:
+        set_user_status(uid, "BLOCKED")
+        audit(call.from_user.id, "USER_REJECTED", target=str(uid))
+        bot.answer_callback_query(call.id, "Rejected.")
+    try:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              text=f"{call.message.text}\n\n➡️ <b>{action.upper()}D</b>")
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("del_proxy_"))
+def cb_del_proxy(call: types.CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Access denied.")
+        return
+    pid = call.data.replace("del_proxy_", "")
+    if pid.isdigit():
+        db_delete_proxy(int(pid))
+        audit(call.from_user.id, "PROXY_DELETED", target=pid)
+        bot.answer_callback_query(call.id, "Deleted.")
+        try:
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=f"🗑 <i>Proxy #{html.escape(pid)} deleted.</i>")
+        except Exception:
+            pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("job_"))
+def cb_job_detail(call: types.CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Access denied.")
+        return
+    jid = call.data.replace("job_", "")
+    if not jid.isdigit():
         return
     bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        "🌐 <b>Proxy Manager</b>",
-        reply_markup=proxy_manager_keyboard(),
-    )
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "retest_failed")
-def handle_retest_failed_callback(call: types.CallbackQuery):
-    if call.from_user.id not in ADMIN_IDS:
-        bot.answer_callback_query(call.id, "Access denied.")
+    job = get_job(int(jid))
+    if not job:
+        bot.send_message(call.message.chat.id, "Job not found.")
         return
-    bot.answer_callback_query(call.id, "Starting retest of failed proxies...")
-    _trigger_retest_failed(call.message.chat.id)
+    nums = get_job_numbers(int(jid))
+    dur = (job.get("duration_ms") or 0) / 1000.0
+    lines = [
+        f"📱 <b>JOB #{job['job_id']:06d}</b>", "━━━━━━━━━━━━━━━━━━",
+        f"👤 @{html.escape(job.get('username') or 'N/A')} · 🆔 <code>{job.get('user_id')}</code>",
+        f"🔗 <code>{html.escape((job.get('source_url') or '')[:80])}</code>",
+        f"⚙️ Mode: {'IP Rotation' if job.get('mode') == 'ROTATING' else 'Direct'}",
+        f"🔄 {job.get('successful_visits')}/{job.get('requested_visits')} ok · "
+        f"❌ {job.get('failed_visits')}",
+        f"📱 Unique: {job.get('unique_numbers')} · ♻️ Dupes: {job.get('duplicate_numbers')}",
+        f"⏱ {dur:.1f}s · Status: {job.get('status')}", "",
+        "<b>Numbers:</b>",
+    ]
+    for r in nums[:40]:
+        lines.append(f"+{r['number']} · <i>{html.escape(r.get('extraction_method') or '')}</i>")
+    if len(nums) > 40:
+        lines.append(f"<i>… and {len(nums) - 40} more</i>")
+    bot.send_message(call.message.chat.id, "\n".join(lines))
 
 
 # =========================================================
-# Main Message Router
+# Main message router
 # =========================================================
 @bot.message_handler(func=lambda m: True)
-def handle_all_messages(message: types.Message) -> None:
-    global MAINTENANCE_MODE
-
-    user = message.from_user
+def handle_all(message: types.Message) -> None:
+    u = message.from_user
     chat_id = message.chat.id
     text = (message.text or "").strip()
-
-    register_user(user.id, user.username, user.first_name)
+    register_user(u.id, u.username, u.first_name)
 
     with _state_lock:
-        state = dict(user_states.get(user.id, {}))
+        state = dict(user_states.get(u.id, {}))
 
-    # ── Maintenance mode check ────────────────────────────
-    if MAINTENANCE_MODE and user.id not in ADMIN_IDS:
-        bot.send_message(
-            chat_id,
-            "🔧 <b>Maintenance Mode Active</b>\n\nPlease check back shortly!",
-        )
+    admin = is_admin(u.id)
+
+    # ── Access gates ──
+    if user_is_blocked(u.id):
+        bot.send_message(chat_id, "🚫 <b>Access blocked.</b>")
+        return
+    if get_bool_setting("maintenance_mode") and not admin:
+        bot.send_message(chat_id, "🛠 <b>BOT UNDER MAINTENANCE</b>\n\nPlease try again later.")
+        return
+    if not user_is_approved(u.id):
+        bot.send_message(chat_id, "🔒 <b>ACCESS PENDING</b>\n\nPlease wait for administrator approval.")
         return
 
-    # ── Global Cancel / Main Menu ─────────────────────────
+    # ── Global navigation ──
     if text == "❌ Cancel":
         with _state_lock:
-            cancel_ev = active_jobs.get(user.id)
-        if cancel_ev:
-            cancel_ev.set()
-            bot.send_message(chat_id, "🛑 <b>Cancellation requested.</b> Stopping after current step…", reply_markup=main_keyboard())
+            job = active_jobs.get(u.id)
+        if job:
+            job["cancel"].set()
+            bot.send_message(chat_id, "🛑 <b>Cancelling…</b>", reply_markup=main_keyboard(u.id))
         else:
             with _state_lock:
-                user_states[user.id] = {}
-            bot.send_message(chat_id, "🏠 <b>Main Menu</b>", reply_markup=main_keyboard())
+                user_states[u.id] = {}
+            bot.send_message(chat_id, "🏠 <b>Main Menu</b>", reply_markup=main_keyboard(u.id))
         return
 
     if text == "🔙 Main Menu":
         with _state_lock:
-            user_states[user.id] = {}
-        bot.send_message(chat_id, "🏠 <b>Main Menu</b>", reply_markup=main_keyboard())
+            user_states[u.id] = {}
+        bot.send_message(chat_id, "🏠 <b>Main Menu</b>", reply_markup=main_keyboard(u.id))
         return
 
-    # ── Back navigation ───────────────────────────────────
+    if text == "🔐 Admin Panel" and admin:
+        with _state_lock:
+            user_states[u.id] = {}
+        bot.send_message(chat_id, "🔐 <b>ADMIN CONTROL CENTER</b>", reply_markup=admin_keyboard())
+        return
+
+    if text == "🔙 Admin Panel" and admin:
+        with _state_lock:
+            user_states[u.id] = {}
+        bot.send_message(chat_id, "🔐 <b>ADMIN CONTROL CENTER</b>", reply_markup=admin_keyboard())
+        return
+
     if text == "🔙 Back":
         step = state.get("step")
         if step == "AWAITING_MODE":
             with _state_lock:
-                user_states[user.id] = {"step": "AWAITING_URL"}
-            bot.send_message(
-                chat_id,
-                "🔗 <b>Submit Target URL</b>\n\nPlease send a valid HTTP/HTTPS link:",
-                reply_markup=cancel_only_keyboard(),
-            )
+                user_states[u.id] = {"step": "AWAITING_URL"}
+            bot.send_message(chat_id, "🔗 Send a valid HTTP/HTTPS link:", reply_markup=cancel_keyboard())
         elif step == "AWAITING_CYCLES":
             with _state_lock:
-                user_states[user.id] = {"step": "AWAITING_MODE", "url": state.get("url")}
-            bot.send_message(
-                chat_id,
-                "Choose Extraction Mode:",
-                reply_markup=mode_selection_keyboard(),
-            )
-        elif user.id in ADMIN_IDS and step in (
-            "ADMIN_ADD_PROXY", "ADMIN_BULK_ADD_PROXIES",
-            "ADMIN_TEST_SINGLE", "ADMIN_TEST_BULK",
-            "ADMIN_DELETE_PROXY",
-        ):
+                user_states[u.id] = {"step": "AWAITING_MODE", "url": state.get("url")}
+            bot.send_message(chat_id, "Choose mode:", reply_markup=mode_keyboard())
+        elif admin:
             with _state_lock:
-                user_states[user.id] = {}
-            bot.send_message(chat_id, "🌐 <b>Proxy Manager</b>", reply_markup=proxy_manager_keyboard())
-        elif user.id in ADMIN_IDS:
-            with _state_lock:
-                user_states[user.id] = {}
-            bot.send_message(chat_id, "🔐 <b>Admin Console</b>", reply_markup=admin_keyboard())
+                user_states[u.id] = {}
+            bot.send_message(chat_id, "🔐 Admin Panel", reply_markup=admin_keyboard())
         else:
             with _state_lock:
-                user_states[user.id] = {}
-            bot.send_message(chat_id, "🏠 <b>Main Menu</b>", reply_markup=main_keyboard())
+                user_states[u.id] = {}
+            bot.send_message(chat_id, "🏠 Main Menu", reply_markup=main_keyboard(u.id))
         return
 
-    # ── Admin-only: Back to Admin Panel ──────────────────
-    if user.id in ADMIN_IDS and text == "🔙 Admin Panel":
-        with _state_lock:
-            user_states[user.id] = {}
-        bot.send_message(chat_id, "🔐 <b>Admin Control Console</b>", reply_markup=admin_keyboard())
+    # ── Admin awaiting-input states ──
+    if admin and state.get("await"):
+        _handle_admin_input(message, u, chat_id, text, state)
         return
 
-    # ── Admin: Broadcast input ────────────────────────────
-    if user.id in ADMIN_IDS and state.get("awaiting_broadcast"):
+    # ── Admin menu buttons ──
+    if admin and _handle_admin_menu(message, u, chat_id, text):
+        return
+
+    # ── User menu ──
+    if text == "🔗 New Extraction":
         with _state_lock:
-            user_states[user.id] = {}
-        all_users = get_all_user_ids()
-        sent = failed = 0
-        status_msg = bot.send_message(chat_id, f"🚀 <b>Broadcasting to {len(all_users)} users...</b>")
-        for uid in all_users:
+            if u.id in active_jobs:
+                bot.send_message(chat_id, "⚠️ A job is already running. Tap ❌ Cancel first.",
+                                 reply_markup=cancel_keyboard())
+                return
+            user_states[u.id] = {"step": "AWAITING_URL"}
+        bot.send_message(chat_id,
+                         "🔗 <b>Submit Target URL</b>\n\nSend a valid HTTP/HTTPS link:\n\n"
+                         "<i>Example:</i> <code>https://example.com/redirect</code>",
+                         reply_markup=cancel_keyboard())
+        return
+
+    if text == "📊 My Statistics":
+        s = get_user(u.id) or {}
+        bot.send_message(chat_id,
+                         (f"📊 <b>MY STATISTICS</b>\n━━━━━━━━━━━━━━━━━━\n"
+                          f"👤 {html.escape(s.get('first_name') or 'User')}\n"
+                          f"🆔 <code>{u.id}</code>\n"
+                          f"🔄 Total Extractions: <code>{s.get('total_extractions', 0)}</code>\n"
+                          f"✅ Successful Jobs: <code>{s.get('successful_jobs', 0)}</code>\n"
+                          f"❌ Failed Jobs: <code>{s.get('failed_jobs', 0)}</code>\n"
+                          f"📱 Unique Numbers: <code>{s.get('total_numbers_found', 0)}</code>\n"
+                          f"📅 Since: <code>{html.escape(str(s.get('joined_at', 'N/A'))[:10])}</code>"),
+                         reply_markup=main_keyboard(u.id))
+        return
+
+    if text == "📋 My History":
+        hist = get_user_history(u.id, limit=8)
+        if not hist:
+            bot.send_message(chat_id, "📋 <b>No history yet.</b>", reply_markup=main_keyboard(u.id))
+            return
+        msg = "📋 <b>MY HISTORY</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+        for h in hist:
+            mode_lbl = "🌐 IP" if h.get("mode") == "ROTATING" else "🟢 Direct"
+            url_disp = html.escape((h["source_url"][:34] + "…") if len(h.get("source_url") or "") > 34 else (h.get("source_url") or ""))
+            msg += (f"<b>#{h['job_id']:06d}</b> [{mode_lbl}] · <code>{html.escape(str(h.get('completed_at') or '')[:16])}</code>\n"
+                    f"🔗 <code>{url_disp}</code>\n"
+                    f"🔄 {h.get('requested_visits')} · 📱 {h.get('unique_numbers')}\n\n")
+        bot.send_message(chat_id, msg, reply_markup=main_keyboard(u.id))
+        return
+
+    if text == "❓ Help":
+        socks = "✅ Available" if _SOCKS5_AVAILABLE else "❌ Not installed"
+        bot.send_message(chat_id,
+                         ("❓ <b>HELP</b>\n━━━━━━━━━━━━━━━━━━\n"
+                          "Fetches HTTP/HTTPS URLs and extracts publicly exposed phone numbers "
+                          "from pages and redirect chains.\n\n"
+                          "<b>Modes:</b>\n🟢 WITHOUT IP — direct connection\n"
+                          "🌐 WITH IP ROTATION — via verified proxies\n\n"
+                          f"<b>SOCKS5:</b> {socks}\n\n"
+                          "Cancel anytime with ❌ Cancel."),
+                         reply_markup=main_keyboard(u.id))
+        return
+
+    if text == "📞 Support":
+        sup = get_setting("support_username")
+        contact = f"Contact: @{html.escape(sup)}" if sup else "Contact the administrator."
+        bot.send_message(chat_id, f"📞 <b>SUPPORT</b>\n━━━━━━━━━━━━━━━━━━\n{contact}",
+                         reply_markup=main_keyboard(u.id))
+        return
+
+    # ── Extraction flow ──
+    if state.get("step") == "AWAITING_URL" or text.startswith(("http://", "https://")):
+        valid, err = validate_url(text)
+        if not valid:
+            bot.send_message(chat_id, f"⚠️ <b>Invalid URL</b>\n{html.escape(err)}",
+                             reply_markup=cancel_keyboard())
+            return
+        with _state_lock:
+            user_states[u.id] = {"step": "AWAITING_MODE", "url": text}
+        bot.send_message(chat_id,
+                         (f"🔗 <b>Link received</b>\n<code>{html.escape(text[:80])}</code>\n\n"
+                          "⚙️ <b>SELECT CONNECTION MODE</b>\n"
+                          "🟢 WITHOUT IP — direct\n🌐 WITH IP ROTATION — via proxies"),
+                         reply_markup=mode_keyboard())
+        return
+
+    if state.get("step") == "AWAITING_MODE":
+        target_url = state.get("url", "")
+        if text == "🟢 WITHOUT IP":
+            with _state_lock:
+                user_states[u.id] = {"step": "AWAITING_CYCLES", "url": target_url, "mode": "NORMAL"}
+            bot.send_message(chat_id, "🟢 <b>Direct mode.</b> Select visit count:",
+                             reply_markup=cycles_keyboard())
+            return
+        if text == "🌐 WITH IP ROTATION":
+            if not proxy_manager.has_endpoints():
+                bot.send_message(chat_id,
+                                 "⚠️ <b>IP Rotation Unavailable</b>\n\nNo proxy endpoints configured.",
+                                 reply_markup=mode_keyboard())
+                return
+            if not proxy_manager.has_eligible():
+                bot.send_message(chat_id,
+                                 "⚠️ <b>IP Rotation Currently Unavailable</b>\n\n"
+                                 "No verified working proxy is available (all in cooldown).\n"
+                                 "Please try again later.",
+                                 reply_markup=mode_keyboard())
+                return
+            with _state_lock:
+                user_states[u.id] = {"step": "AWAITING_CYCLES", "url": target_url, "mode": "ROTATING"}
+            bot.send_message(chat_id,
+                             f"🌐 <b>IP Rotation mode.</b>\n📡 Available proxies: "
+                             f"<code>{len(proxy_manager.eligible_endpoints())}</code>\n\nSelect visit count:",
+                             reply_markup=cycles_keyboard())
+            return
+
+    if state.get("step") == "AWAITING_CYCLES":
+        count = _CYCLE_MAP.get(text)
+        if count is not None:
+            max_v = int(get_setting("max_visits", str(MAX_VISITS_PER_JOB)))
+            count = min(count, max_v)
+            target_url = state.get("url", "")
+            mode = state.get("mode", "NORMAL")
+            cancel_ev = threading.Event()
+            job_id = create_job(u.id, u.username, target_url, mode, count)
+            with _state_lock:
+                user_states[u.id] = {}
+                active_jobs[u.id] = {"cancel": cancel_ev, "job_id": job_id}
+            mode_name = "🌐 IP Rotation" if mode == "ROTATING" else "🟢 Direct Connection"
+            start_msg = bot.send_message(chat_id,
+                                         (f"⏳ <b>EXTRACTION IN PROGRESS</b>\n━━━━━━━━━━━━━━━━━━\n"
+                                          f"🆔 Job: <code>#{job_id:06d}</code>\n"
+                                          f"⚙️ Mode: {mode_name}\n"
+                                          f"🔄 Visits: 0/{count}\n<i>Initialising…</i>"),
+                                         reply_markup=cancel_keyboard())
+            threading.Thread(target=extraction_worker,
+                             args=(chat_id, u.id, u.username or "", target_url, mode, count,
+                                   start_msg.message_id, job_id, cancel_ev), daemon=True).start()
+            return
+
+    bot.send_message(chat_id, "❓ Please pick an option or tap <b>🔗 New Extraction</b>.",
+                     reply_markup=main_keyboard(u.id))
+
+
+# =========================================================
+# Admin menu dispatch
+# =========================================================
+def _handle_admin_menu(message, u, chat_id, text) -> bool:
+    if text == "📊 Dashboard":
+        s = get_admin_dashboard_stats()
+        ps = db_proxy_stats()
+        avg_ms = s.get("avg_ms")
+        bot.send_message(chat_id,
+                         (f"📊 <b>BOT DASHBOARD</b>\n━━━━━━━━━━━━━━━━━━\n"
+                          f"👥 Users: <code>{s.get('total_users', 0)}</code>\n"
+                          f"🟢 Active Today: <code>{s.get('active_today', 0)}</code>\n\n"
+                          f"🔄 Total Jobs: <code>{s.get('total_jobs', 0)}</code>\n"
+                          f"✅ Successful: <code>{s.get('ok_jobs', 0)}</code>\n"
+                          f"❌ Failed: <code>{s.get('failed_jobs', 0)}</code>\n"
+                          f"📅 Jobs Today: <code>{s.get('jobs_today', 0)}</code>\n\n"
+                          f"📱 Numbers Today: <code>{s.get('nums_today', 0)}</code>\n\n"
+                          f"🌐 Proxies — 🟢 {ps.get('working', 0)} · 🟡 {ps.get('slow', 0)} · 🔴 {ps.get('dead', 0)}\n"
+                          f"⏱ Avg Job: <code>{(avg_ms/1000.0):.1f}s</code>" if avg_ms else
+                          f"📊 <b>BOT DASHBOARD</b>\n━━━━━━━━━━━━━━━━━━\n"
+                          f"👥 Users: <code>{s.get('total_users', 0)}</code>"),
+                         reply_markup=admin_keyboard())
+        return True
+
+    if text == "👥 Users":
+        with _state_lock:
+            user_states[u.id] = {"await": "USER_SEARCH"}
+        bot.send_message(chat_id, "🔎 <b>Search user</b>\nSend a Telegram ID, @username, or name:",
+                         reply_markup=back_cancel_keyboard())
+        return True
+
+    if text == "🔎 Extraction Logs":
+        jobs = recent_jobs(limit=10)
+        if not jobs:
+            bot.send_message(chat_id, "No extraction jobs yet.", reply_markup=admin_keyboard())
+            return True
+        for j in jobs:
+            mode_lbl = "🌐 IP" if j.get("mode") == "ROTATING" else "🟢 Direct"
+            card = (f"<b>#{j['job_id']:06d}</b> · @{html.escape(j.get('username') or 'N/A')} [{mode_lbl}]\n"
+                    f"✅ {j.get('successful_visits')}/{j.get('requested_visits')} · "
+                    f"📱 {j.get('unique_numbers')} · 🕒 {str(j.get('completed_at') or '')[:16]}")
+            mk = types.InlineKeyboardMarkup()
+            mk.add(types.InlineKeyboardButton("🔍 Details", callback_data=f"job_{j['job_id']}"))
+            try:
+                bot.send_message(chat_id, card, reply_markup=mk)
+            except Exception:
+                pass
+        bot.send_message(chat_id, "🔎 Tap a job for full details.", reply_markup=admin_keyboard())
+        return True
+
+    if text == "🌐 Proxy Manager":
+        ps = db_proxy_stats()
+        bot.send_message(chat_id,
+                         (f"🌐 <b>PROXY MANAGER</b>\n━━━━━━━━━━━━━━━━━━\n"
+                          f"📊 Total: <code>{proxy_manager.get_endpoint_count()}</code> "
+                          f"(⚙️ env {proxy_manager.env_count()})\n"
+                          f"🟢 Working: <code>{ps.get('working', 0)}</code>\n"
+                          f"🟡 Slow: <code>{ps.get('slow', 0)}</code>\n"
+                          f"🔴 Failed: <code>{ps.get('dead', 0)}</code>\n"
+                          f"⚪ Untested: <code>{ps.get('untested', 0)}</code>"),
+                         reply_markup=proxy_manager_keyboard())
+        return True
+
+    if text == "➕ Add Proxy":
+        with _state_lock:
+            user_states[u.id] = {"await": "ADD_PROXY"}
+        bot.send_message(chat_id,
+                         "➕ <b>Add Proxy</b>\nSend one proxy:\n"
+                         "<code>http://ip:port</code>\n<code>http://user:pass@ip:port</code>\n"
+                         "<code>socks5://ip:port</code>\n\n<i>Credentials never shown in chat.</i>",
+                         reply_markup=back_cancel_keyboard())
+        return True
+
+    if text == "📦 Bulk Add":
+        with _state_lock:
+            user_states[u.id] = {"await": "BULK_ADD"}
+        bot.send_message(chat_id, "📦 <b>Bulk Add</b>\nPaste proxies, one per line:",
+                         reply_markup=back_cancel_keyboard())
+        return True
+
+    if text == "🧪 Health Check":
+        eps = proxy_manager.get_all_raw()
+        if not eps:
+            bot.send_message(chat_id, "⚠️ No proxies configured.", reply_markup=proxy_manager_keyboard())
+            return True
+        status = bot.send_message(chat_id, f"🧪 Checking {len(eps)} proxies…")
+        ev = threading.Event()
+        threading.Thread(target=run_proxy_tests_bg,
+                         args=(chat_id, status.message_id, eps, ev, False), daemon=True).start()
+        return True
+
+    if text == "🔄 Retest Unhealthy":
+        trigger_retest_unhealthy(chat_id)
+        return True
+
+    if text == "📋 Proxy List":
+        rows = db_get_all_proxies(active_only=False)
+        env = proxy_manager._env_proxies
+        if not rows and not env:
+            bot.send_message(chat_id, "📋 No proxies configured.", reply_markup=proxy_manager_keyboard())
+            return True
+        if env:
+            lines = ["⚙️ <b>Environment proxies:</b>"] + [
+                f"• <code>{html.escape(sanitize_display(e))}</code>" for e in env]
+            bot.send_message(chat_id, "\n".join(lines))
+        for i in range(0, len(rows), 8):
+            for item in rows[i:i + 8]:
+                emoji = PROXY_STATUS_EMOJI.get(item.get("health_status", "UNTESTED"), "⚪")
+                lat = f"{item['average_latency']:.0f} ms" if item.get("average_latency") else "N/A"
+                card = (f"{emoji} <b>#{item['id']}</b> <code>{html.escape(sanitize_display(item['endpoint']))}</code>\n"
+                        f"   ✅ {item.get('success_count', 0)} · ❌ {item.get('failure_count', 0)} · "
+                        f"⚡ {lat} · 🌍 <code>{html.escape(item.get('last_observed_ip') or '?')}</code>")
+                mk = types.InlineKeyboardMarkup()
+                mk.add(types.InlineKeyboardButton(f"🗑 Delete #{item['id']}", callback_data=f"del_proxy_{item['id']}"))
+                try:
+                    bot.send_message(chat_id, card, reply_markup=mk)
+                except Exception:
+                    pass
+            time.sleep(0.3)
+        bot.send_message(chat_id, "📋 End of list.", reply_markup=proxy_manager_keyboard())
+        return True
+
+    if text == "📊 Proxy Stats":
+        ps = db_proxy_stats()
+        avg = ps.get("avg_latency")
+        bot.send_message(chat_id,
+                         (f"📊 <b>PROXY STATISTICS</b>\n━━━━━━━━━━━━━━━━━━\n"
+                          f"📡 Total (DB): <code>{ps.get('total', 0)}</code>\n"
+                          f"🟢 Working: <code>{ps.get('working', 0)}</code>\n"
+                          f"🟡 Slow: <code>{ps.get('slow', 0)}</code>\n"
+                          f"🟠 Temp Failure: <code>{ps.get('temp_fail', 0)}</code>\n"
+                          f"🔴 Unhealthy: <code>{ps.get('dead', 0)}</code>\n"
+                          f"⚪ Untested: <code>{ps.get('untested', 0)}</code>\n"
+                          f"⚡ Avg Latency: <code>{(avg or 0):.0f} ms</code>"),
+                         reply_markup=proxy_manager_keyboard())
+        return True
+
+    if text == "🗑 Cleanup":
+        deleted = db_clear_dead_proxies()
+        audit(u.id, "PROXY_CLEANUP", details=f"{deleted} removed")
+        bot.send_message(chat_id, f"🗑 Removed <code>{deleted}</code> permanently-dead proxies.\n"
+                                  "<i>(Only proxies that never succeeded and passed the failure threshold.)</i>",
+                         reply_markup=proxy_manager_keyboard())
+        return True
+
+    if text == "📢 Broadcast":
+        with _state_lock:
+            user_states[u.id] = {"await": "BROADCAST"}
+        bot.send_message(chat_id, "📢 <b>Broadcast</b>\nType the message for all users:",
+                         reply_markup=cancel_keyboard())
+        return True
+
+    if text == "📡 Channel Settings":
+        _show_channel_settings(chat_id)
+        return True
+
+    if text == "🧪 Test Channel":
+        ok, reason = verify_channel()
+        bot.send_message(chat_id,
+                         (f"✅ <b>Channel verified.</b>\n{html.escape(reason)}" if ok else
+                          f"❌ <b>Channel posting failed.</b>\nReason: {html.escape(reason)}\n\n"
+                          "Add the bot as an administrator with permission to post."),
+                         reply_markup=admin_keyboard())
+        return True
+
+    if text == "🔀 Toggle Channel Posting":
+        new = "0" if get_bool_setting("channel_logging") else "1"
+        set_setting("channel_logging", new)
+        audit(u.id, "CHANNEL_TOGGLE", details=new)
+        _show_channel_settings(chat_id)
+        return True
+
+    if text == "🔀 Toggle Publish Numbers":
+        new = "0" if get_bool_setting("channel_post_numbers") else "1"
+        set_setting("channel_post_numbers", new)
+        _show_channel_settings(chat_id)
+        return True
+
+    if text == "✏️ Set Channel":
+        with _state_lock:
+            user_states[u.id] = {"await": "SET_CHANNEL"}
+        bot.send_message(chat_id, "✏️ Send the channel username (e.g. <code>@mychannel</code>):",
+                         reply_markup=back_cancel_keyboard())
+        return True
+
+    if text == "⚙️ Bot Settings":
+        _show_bot_settings(chat_id)
+        return True
+
+    if text == "🔀 Toggle Maintenance":
+        new = "0" if get_bool_setting("maintenance_mode") else "1"
+        set_setting("maintenance_mode", new)
+        audit(u.id, "MAINTENANCE", details=new)
+        _show_bot_settings(chat_id)
+        return True
+
+    if text == "🔀 Toggle Approval":
+        new = "0" if get_bool_setting("approval_mode") else "1"
+        set_setting("approval_mode", new)
+        audit(u.id, "APPROVAL_MODE", details=new)
+        _show_bot_settings(chat_id)
+        return True
+
+    if text == "✏️ Set Support Username":
+        with _state_lock:
+            user_states[u.id] = {"await": "SET_SUPPORT"}
+        bot.send_message(chat_id, "✏️ Send the support username:", reply_markup=back_cancel_keyboard())
+        return True
+
+    if text == "👮 Admin Management":
+        _show_admin_management(chat_id, u.id)
+        return True
+
+    if text == "➕ Add Admin" and is_owner(u.id):
+        with _state_lock:
+            user_states[u.id] = {"await": "ADD_ADMIN"}
+        bot.send_message(chat_id, "➕ Send the numeric Telegram ID to promote to admin:",
+                         reply_markup=back_cancel_keyboard())
+        return True
+
+    if text == "➖ Remove Admin" and is_owner(u.id):
+        with _state_lock:
+            user_states[u.id] = {"await": "REMOVE_ADMIN"}
+        bot.send_message(chat_id, "➖ Send the numeric Telegram ID to remove:",
+                         reply_markup=back_cancel_keyboard())
+        return True
+
+    if text == "🩺 Diagnostics":
+        _run_diagnostics(chat_id)
+        return True
+
+    return False
+
+
+def _show_channel_settings(chat_id) -> None:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(types.KeyboardButton("🧪 Test Channel"), types.KeyboardButton("✏️ Set Channel"),
+          types.KeyboardButton("🔀 Toggle Channel Posting"),
+          types.KeyboardButton("🔀 Toggle Publish Numbers"), types.KeyboardButton("🔙 Admin Panel"))
+    bot.send_message(chat_id,
+                     (f"📡 <b>CHANNEL SETTINGS</b>\n━━━━━━━━━━━━━━━━━━\n"
+                      f"Channel: <code>{html.escape(channel_target() or 'not set')}</code>\n"
+                      f"Auto Post: {'✅ ON' if get_bool_setting('channel_logging') else '❌ OFF'}\n"
+                      f"Publish Numbers: {'✅ ON' if get_bool_setting('channel_post_numbers') else '❌ OFF'}"),
+                     reply_markup=m)
+
+
+def _show_bot_settings(chat_id) -> None:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(types.KeyboardButton("🔀 Toggle Maintenance"), types.KeyboardButton("🔀 Toggle Approval"),
+          types.KeyboardButton("✏️ Set Support Username"), types.KeyboardButton("🔙 Admin Panel"))
+    bot.send_message(chat_id,
+                     (f"⚙️ <b>BOT SETTINGS</b>\n━━━━━━━━━━━━━━━━━━\n"
+                      f"Maintenance: {'🔴 ON' if get_bool_setting('maintenance_mode') else '🟢 OFF'}\n"
+                      f"Approval Mode: {'✅ ON' if get_bool_setting('approval_mode') else '❌ OFF'}\n"
+                      f"Support: @{html.escape(get_setting('support_username') or 'not set')}\n"
+                      f"Max Visits: <code>{get_setting('max_visits')}</code>"),
+                     reply_markup=m)
+
+
+def _show_admin_management(chat_id, uid) -> None:
+    admins = list_admins()
+    lines = ["👮 <b>ADMIN MANAGEMENT</b>", "━━━━━━━━━━━━━━━━━━"]
+    for a in admins:
+        lines.append(f"• <code>{a['user_id']}</code> — {a.get('role', 'ADMIN')}")
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    if is_owner(uid):
+        m.add(types.KeyboardButton("➕ Add Admin"), types.KeyboardButton("➖ Remove Admin"))
+    m.add(types.KeyboardButton("🔙 Admin Panel"))
+    if not is_owner(uid):
+        lines.append("\n<i>Only the OWNER can add/remove admins.</i>")
+    bot.send_message(chat_id, "\n".join(lines), reply_markup=m)
+
+
+def _run_diagnostics(chat_id) -> None:
+    status = bot.send_message(chat_id, "🩺 Running diagnostics…")
+    checks = []
+    checks.append(("Telegram API", True))
+    try:
+        get_conn().close()
+        checks.append(("Database", True))
+    except Exception:
+        checks.append(("Database", False))
+    try:
+        requests.get("https://api.ipify.org", timeout=6)
+        checks.append(("Direct HTTP", True))
+    except Exception:
+        checks.append(("Direct HTTP", False))
+    checks.append(("SOCKS5 support", _SOCKS5_AVAILABLE))
+    ok_ch, _ = verify_channel()
+    checks.append(("Channel posting", ok_ch))
+    report = "🩺 <b>SYSTEM DIAGNOSTICS</b>\n━━━━━━━━━━━━━━━━━━\n" + \
+             "\n".join(f"{'✅' if ok else '❌'} {name}" for name, ok in checks)
+    try:
+        bot.edit_message_text(chat_id=chat_id, message_id=status.message_id, text=report)
+    except Exception:
+        bot.send_message(chat_id, report)
+    bot.send_message(chat_id, "Done.", reply_markup=admin_keyboard())
+
+
+# =========================================================
+# Admin awaiting-input dispatch
+# =========================================================
+def _handle_admin_input(message, u, chat_id, text, state) -> None:
+    await_kind = state.get("await")
+    with _state_lock:
+        user_states[u.id] = {}
+
+    if await_kind == "BROADCAST":
+        audience = get_all_user_ids()
+        status = bot.send_message(chat_id, f"🚀 Broadcasting to {len(audience)} users…")
+        sent = failed = blocked = 0
+        for uid in audience:
             try:
                 bot.send_message(uid, text)
                 sent += 1
                 time.sleep(0.04)
+            except ApiTelegramException as exc:
+                if "blocked" in str(exc).lower() or "deactivated" in str(exc).lower():
+                    blocked += 1
+                else:
+                    failed += 1
             except Exception:
                 failed += 1
+        audit(u.id, "BROADCAST_SENT", details=f"sent={sent} failed={failed}")
         try:
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_msg.message_id,
-                text=(
-                    f"✅ <b>Broadcast Completed</b>\n"
-                    f"🎉 Sent: <code>{sent}</code>\n"
-                    f"❌ Failed: <code>{failed}</code>"
-                ),
-            )
+            bot.edit_message_text(chat_id=chat_id, message_id=status.message_id,
+                                  text=(f"✅ <b>Broadcast complete</b>\nTotal: {len(audience)}\n"
+                                        f"Sent: {sent}\nFailed: {failed}\nBlocked: {blocked}"))
         except Exception:
             pass
-        bot.send_message(chat_id, "Admin Console:", reply_markup=admin_keyboard())
+        bot.send_message(chat_id, "Admin Panel", reply_markup=admin_keyboard())
         return
 
-    # ── Admin: Add Single Proxy input ─────────────────────
-    if user.id in ADMIN_IDS and state.get("step") == "ADMIN_ADD_PROXY":
-        with _state_lock:
-            user_states[user.id] = {}
-        endpoint = text.strip()
-        parsed, err = parse_proxy(endpoint)
+    if await_kind == "ADD_PROXY":
+        parsed, err = parse_proxy(text)
         if not parsed:
-            bot.send_message(
-                chat_id,
-                (
-                    f"❌ <b>Invalid Proxy</b>\n\n"
-                    f"Reason: {html.escape(err)}\n\n"
-                    "<b>Supported formats:</b>\n"
-                    "• <code>http://ip:port</code>\n"
-                    "• <code>http://user:pass@ip:port</code>\n"
-                    "• <code>https://ip:port</code>\n"
-                    "• <code>socks5://ip:port</code>\n"
-                    "• <code>socks5://user:pass@ip:port</code>"
-                ),
-                reply_markup=proxy_manager_keyboard(),
-            )
+            bot.send_message(chat_id, f"❌ Invalid proxy: {html.escape(err)}",
+                             reply_markup=proxy_manager_keyboard())
             return
-
         if parsed.scheme.startswith("socks5") and not _SOCKS5_AVAILABLE:
-            bot.send_message(
-                chat_id,
-                (
-                    "⚠️ <b>SOCKS5 Not Available</b>\n\n"
-                    "PySocks is not installed.\n"
-                    "Add <code>requests[socks]</code> to requirements.txt and redeploy."
-                ),
-                reply_markup=proxy_manager_keyboard(),
-            )
+            bot.send_message(chat_id, "⚠️ SOCKS5 not available (add requests[socks]).",
+                             reply_markup=proxy_manager_keyboard())
             return
-
-        test_msg = bot.send_message(
-            chat_id, "⏳ <i>Testing proxy connectivity...</i>"
-        )
-        result = test_proxy(parsed, quick=True)
-
+        wait = bot.send_message(chat_id, "⏳ Testing proxy…")
+        res = test_proxy(parsed, quick=True)
+        added = db_add_proxy(parsed.raw, u.id)
+        row = db_get_proxy_by_endpoint(parsed.raw)
+        if row:
+            if res.working:
+                db_update_proxy_success(row["id"], res.latency_ms or 0, res.observed_ip or "", res.status)
+            else:
+                db_update_proxy_failure(row["id"], res.error_reason or "Initial test failed", res.status)
+        audit(u.id, "PROXY_ADDED", target=parsed.display)
         try:
-            bot.delete_message(chat_id, test_msg.message_id)
+            bot.delete_message(chat_id, wait.message_id)
         except Exception:
             pass
-
-        added = db_add_proxy(endpoint, user.id)
-        if added:
-            db_row = db_get_proxy_by_endpoint(endpoint)
-            if db_row:
-                if result.working:
-                    db_update_proxy_success(
-                        db_row["id"],
-                        result.latency_ms or 0,
-                        result.observed_ip or "",
-                    )
-                else:
-                    db_update_proxy_failure(db_row["id"], result.error_reason or "Initial test failed")
-
-        card = result.to_telegram_card()
-        status_line = "✅ <b>Proxy saved to database.</b>" if added else "⚠️ Proxy may already exist."
-        bot.send_message(
-            chat_id,
-            f"{status_line}\n\n{card}",
-            reply_markup=proxy_manager_keyboard(),
-        )
+        head = "✅ Saved." if added else "⚠️ Already existed (updated)."
+        bot.send_message(chat_id, f"{head}\n\n{res.card()}", reply_markup=proxy_manager_keyboard())
         return
 
-    # ── Admin: Bulk Add Proxies input ─────────────────────
-    if user.id in ADMIN_IDS and state.get("step") == "ADMIN_BULK_ADD_PROXIES":
-        with _state_lock:
-            user_states[user.id] = {}
+    if await_kind == "BULK_ADD":
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        added_count = 0
-        skipped_count = 0
-        invalid_count = 0
-        socks_unavailable = 0
-
-        status_msg = bot.send_message(chat_id, f"⏳ <i>Processing {len(lines)} entries...</i>")
-
-        for line in lines:
-            parsed, err = parse_proxy(line)
+        added = skipped = invalid = socks_skip = 0
+        for ln in lines:
+            parsed, err = parse_proxy(ln)
             if not parsed:
-                invalid_count += 1
+                invalid += 1
                 continue
             if parsed.scheme.startswith("socks5") and not _SOCKS5_AVAILABLE:
-                socks_unavailable += 1
+                socks_skip += 1
                 continue
-            if db_add_proxy(line, user.id):
-                added_count += 1
+            if db_add_proxy(parsed.raw, u.id):
+                added += 1
             else:
-                skipped_count += 1
-
-        socks_note = ""
-        if socks_unavailable:
-            socks_note = f"\n⚠️ SOCKS5 skipped (not installed): <code>{socks_unavailable}</code>"
-
-        try:
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_msg.message_id,
-                text=(
-                    f"✅ <b>Bulk Import Finished</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"➕ <b>Added:</b> <code>{added_count}</code>\n"
-                    f"🔁 <b>Already existed:</b> <code>{skipped_count}</code>\n"
-                    f"⚠️ <b>Invalid:</b> <code>{invalid_count}</code>"
-                    f"{socks_note}\n"
-                    f"📡 <b>Total Active Proxies:</b> <code>{proxy_manager.get_endpoint_count()}</code>"
-                ),
-            )
-        except Exception:
-            pass
-        bot.send_message(chat_id, "Proxy Manager:", reply_markup=proxy_manager_keyboard())
+                skipped += 1
+        audit(u.id, "PROXY_BULK_ADD", details=f"added={added}")
+        note = f"\n⚠️ SOCKS5 skipped: {socks_skip}" if socks_skip else ""
+        bot.send_message(chat_id,
+                         (f"✅ <b>Bulk import</b>\nImported: {added}\nDuplicate: {skipped}\n"
+                          f"Invalid: {invalid}{note}\nTotal active: {proxy_manager.get_endpoint_count()}"),
+                         reply_markup=proxy_manager_keyboard())
         return
 
-    # ── Admin: Test Single Proxy input ───────────────────
-    if user.id in ADMIN_IDS and state.get("step") == "ADMIN_TEST_SINGLE":
-        with _state_lock:
-            user_states[user.id] = {}
-        endpoint = text.strip()
-        parsed, err = parse_proxy(endpoint)
-        if not parsed:
-            bot.send_message(
-                chat_id,
-                f"❌ <b>Invalid proxy:</b> {html.escape(err)}",
-                reply_markup=proxy_manager_keyboard(),
-            )
+    if await_kind == "USER_SEARCH":
+        matches = search_users(text)
+        if not matches:
+            bot.send_message(chat_id, "No matching users.", reply_markup=admin_keyboard())
             return
-
-        wait_msg = bot.send_message(chat_id, "🔍 <i>Running detailed proxy test…</i>")
-        result = test_proxy(parsed, quick=False)
-        try:
-            bot.delete_message(chat_id, wait_msg.message_id)
-        except Exception:
-            pass
-
-        card = result.to_telegram_card()
-
-        # Inline buttons
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            types.InlineKeyboardButton("🔄 Retest", callback_data=f"retest_single_{endpoint[:80]}"),
-            types.InlineKeyboardButton("🔙 Proxy Manager", callback_data="proxy_manager"),
-        )
-        # Save option if not already in DB
-        db_row = db_get_proxy_by_endpoint(endpoint)
-        if not db_row:
-            markup.add(
-                types.InlineKeyboardButton("💾 Save Proxy", callback_data=f"save_proxy_{endpoint[:80]}")
-            )
-
-        bot.send_message(
-            chat_id,
-            f"🔍 <b>Single Proxy Test Result</b>\n\n{card}",
-            reply_markup=proxy_manager_keyboard(),
-        )
-        return
-
-    # ── Admin: Test Multiple Proxies input ───────────────
-    if user.id in ADMIN_IDS and state.get("step") == "ADMIN_TEST_BULK":
-        with _state_lock:
-            user_states[user.id] = {}
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            bot.send_message(chat_id, "⚠️ No proxies found in input.", reply_markup=proxy_manager_keyboard())
-            return
-
-        cancel_ev = threading.Event()
-        status_msg = bot.send_message(
-            chat_id,
-            f"🧪 <b>Testing {len(lines)} proxies...</b>",
-        )
-
-        def _bg():
-            _run_proxy_tests_in_bg(chat_id, status_msg.message_id, lines, cancel_ev, detailed=True)
-
-        t = threading.Thread(target=_bg, daemon=True)
-        t.start()
-        return
-
-    # ── Admin: Delete Proxy by ID input ──────────────────
-    if user.id in ADMIN_IDS and state.get("step") == "ADMIN_DELETE_PROXY":
-        with _state_lock:
-            user_states[user.id] = {}
-        if text.isdigit():
-            if db_delete_proxy(int(text)):
-                bot.send_message(
-                    chat_id,
-                    f"🗑️ <b>Proxy #{html.escape(text)} deleted.</b>",
-                    reply_markup=proxy_manager_keyboard(),
-                )
+        for us in matches[:8]:
+            card = (f"👤 <b>{html.escape(us.get('first_name') or 'User')}</b>\n"
+                    f"@{html.escape(us.get('username') or 'none')} · 🆔 <code>{us['user_id']}</code>\n"
+                    f"Status: {us.get('status', 'APPROVED')}\n"
+                    f"🔄 Jobs: {us.get('total_extractions', 0)} · 📱 Numbers: {us.get('total_numbers_found', 0)}\n"
+                    f"🕒 Last: {str(us.get('last_active') or '')[:16]}")
+            mk = types.InlineKeyboardMarkup()
+            if us.get("status") == "BLOCKED":
+                mk.add(types.InlineKeyboardButton("✅ Unblock", callback_data=f"approve_{us['user_id']}"))
             else:
-                bot.send_message(
-                    chat_id,
-                    f"⚠️ Proxy #{html.escape(text)} not found.",
-                    reply_markup=proxy_manager_keyboard(),
-                )
+                mk.add(types.InlineKeyboardButton("🚫 Block", callback_data=f"reject_{us['user_id']}"))
+            bot.send_message(chat_id, card, reply_markup=mk)
+        bot.send_message(chat_id, "🔎 Search complete.", reply_markup=admin_keyboard())
+        return
+
+    if await_kind == "SET_CHANNEL":
+        val = text.strip()
+        if not val.startswith("@") and not val.lstrip("-").isdigit():
+            val = "@" + val
+        set_setting("channel_username", val)
+        audit(u.id, "CHANNEL_SET", target=val)
+        ok, reason = verify_channel()
+        bot.send_message(chat_id,
+                         (f"✅ Channel set to <code>{html.escape(val)}</code>.\n"
+                          + ("✅ Verified." if ok else f"⚠️ Not verified: {html.escape(reason)}")),
+                         reply_markup=admin_keyboard())
+        return
+
+    if await_kind == "SET_SUPPORT":
+        set_setting("support_username", text.strip().lstrip("@"))
+        bot.send_message(chat_id, "✅ Support username updated.", reply_markup=admin_keyboard())
+        return
+
+    if await_kind == "ADD_ADMIN":
+        if is_owner(u.id) and text.strip().lstrip("-").isdigit():
+            add_admin(int(text.strip()), added_by=u.id)
+            audit(u.id, "ADMIN_ADDED", target=text.strip())
+            bot.send_message(chat_id, f"✅ Admin <code>{html.escape(text.strip())}</code> added.",
+                             reply_markup=admin_keyboard())
         else:
-            bot.send_message(
-                chat_id, "⚠️ Please send a numeric proxy ID.", reply_markup=proxy_manager_keyboard()
-            )
+            bot.send_message(chat_id, "❌ Send a numeric ID (owner only).", reply_markup=admin_keyboard())
         return
 
-    # ── Admin Menu Buttons ────────────────────────────────
-    if user.id in ADMIN_IDS:
-        if text == "🌐 Proxy Manager":
-            total_eps = proxy_manager.get_endpoint_count()
-            env_count = proxy_manager.env_count()
-            db_count = len(db_get_all_proxies())
-            bot.send_message(
-                chat_id,
-                (
-                    f"🌐 <b>Proxy Manager</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📡 <b>Total Active Endpoints:</b> <code>{total_eps}</code>\n"
-                    f"⚙️ <b>From Environment:</b> <code>{env_count}</code>\n"
-                    f"💾 <b>From Database:</b> <code>{db_count}</code>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Choose an option:"
-                ),
-                reply_markup=proxy_manager_keyboard(),
-            )
-            return
-
-        if text == "➕ Add Single Proxy":
-            with _state_lock:
-                user_states[user.id] = {"step": "ADMIN_ADD_PROXY"}
-            bot.send_message(
-                chat_id,
-                (
-                    "➕ <b>Add Single Proxy</b>\n\n"
-                    "Send the proxy in one of these formats:\n"
-                    "• <code>http://ip:port</code>\n"
-                    "• <code>http://username:password@ip:port</code>\n"
-                    "• <code>https://ip:port</code>\n"
-                    "• <code>socks5://ip:port</code>\n"
-                    "• <code>socks5://username:password@ip:port</code>\n\n"
-                    "<i>Credentials are stored securely and never shown in chat.</i>"
-                ),
-                reply_markup=back_cancel_keyboard(),
-            )
-            return
-
-        if text == "📦 Bulk Add Proxies":
-            with _state_lock:
-                user_states[user.id] = {"step": "ADMIN_BULK_ADD_PROXIES"}
-            bot.send_message(
-                chat_id,
-                (
-                    "📦 <b>Bulk Add Proxies</b>\n\n"
-                    "Paste your proxies below (one per line):\n\n"
-                    "<code>http://user:pass@1.2.3.4:8080\n"
-                    "http://5.6.7.8:8080\n"
-                    "socks5://9.10.11.12:1080</code>"
-                ),
-                reply_markup=back_cancel_keyboard(),
-            )
-            return
-
-        if text == "🧪 Test Single Proxy":
-            with _state_lock:
-                user_states[user.id] = {"step": "ADMIN_TEST_SINGLE"}
-            bot.send_message(
-                chat_id,
-                (
-                    "🧪 <b>Test Single Proxy</b>\n\n"
-                    "Send one proxy to test (any supported format):\n"
-                    "• <code>http://ip:port</code>\n"
-                    "• <code>socks5://ip:port</code>\n"
-                    "• etc."
-                ),
-                reply_markup=back_cancel_keyboard(),
-            )
-            return
-
-        if text == "📦 Test Multiple Proxies":
-            with _state_lock:
-                user_states[user.id] = {"step": "ADMIN_TEST_BULK"}
-            bot.send_message(
-                chat_id,
-                (
-                    "📦 <b>Test Multiple Proxies</b>\n\n"
-                    "Paste proxies to test (one per line):\n\n"
-                    "<code>http://1.2.3.4:8080\n"
-                    "socks5://5.6.7.8:1080</code>"
-                ),
-                reply_markup=back_cancel_keyboard(),
-            )
-            return
-
-        if text == "🧪 Test All Proxies":
-            all_eps = proxy_manager.get_all_raw()
-            if not all_eps:
-                bot.send_message(chat_id, "⚠️ No proxies configured.", reply_markup=proxy_manager_keyboard())
+    if await_kind == "REMOVE_ADMIN":
+        if is_owner(u.id) and text.strip().lstrip("-").isdigit():
+            tid = int(text.strip())
+            if tid == BOOTSTRAP_OWNER_ID:
+                bot.send_message(chat_id, "❌ Cannot remove the bootstrap owner.",
+                                 reply_markup=admin_keyboard())
                 return
-            status_msg = bot.send_message(
-                chat_id, f"🧪 <b>Testing {len(all_eps)} proxies…</b>"
-            )
-            cancel_ev = threading.Event()
-
-            def _bg_all():
-                _run_proxy_tests_in_bg(
-                    chat_id, status_msg.message_id, all_eps, cancel_ev, detailed=False
-                )
-
-            threading.Thread(target=_bg_all, daemon=True).start()
-            return
-
-        if text == "📋 List All Proxies":
-            db_proxies = db_get_all_proxies(active_only=False)
-            env_proxies = proxy_manager._env_proxies
-
-            if not db_proxies and not env_proxies:
-                bot.send_message(
-                    chat_id,
-                    "📋 <b>No proxies configured yet.</b>",
-                    reply_markup=proxy_manager_keyboard(),
-                )
-                return
-
-            if env_proxies:
-                lines = ["⚙️ <b>Environment Proxies (Read-Only):</b>"]
-                for ep in env_proxies:
-                    lines.append(f"• <code>{html.escape(ProxyManager.sanitize_display(ep))}</code>")
-                bot.send_message(
-                    chat_id, "\n".join(lines), reply_markup=proxy_manager_keyboard()
-                )
-
-            if db_proxies:
-                bot.send_message(chat_id, "💾 <b>Database Proxies:</b>")
-                # Send in pages of 8 to avoid huge messages
-                page_size = 8
-                for page_start in range(0, len(db_proxies), page_size):
-                    page = db_proxies[page_start: page_start + page_size]
-                    for item in page:
-                        sanitized = ProxyManager.sanitize_display(item["endpoint"])
-                        emoji = proxy_status_emoji(item)
-                        lat_str = f"{item['average_latency']:.0f} ms" if item.get("average_latency") else "N/A"
-                        ip_str = item.get("last_observed_ip") or "Unknown"
-                        card = (
-                            f"{emoji} <b>#{item['id']}</b> | <code>{html.escape(sanitized)}</code>\n"
-                            f"   Successes: {item.get('success_count', 0)} | "
-                            f"Failures: {item.get('failure_count', 0)}\n"
-                            f"   Latency: {lat_str} | Exit IP: <code>{html.escape(ip_str)}</code>"
-                        )
-                        del_markup = types.InlineKeyboardMarkup()
-                        del_markup.add(
-                            types.InlineKeyboardButton(
-                                f"🗑️ Delete #{item['id']}",
-                                callback_data=f"del_proxy_{item['id']}",
-                            )
-                        )
-                        try:
-                            bot.send_message(chat_id, card, reply_markup=del_markup)
-                        except Exception:
-                            pass
-                    time.sleep(0.3)
-            return
-
-        if text == "📊 Proxy Statistics":
-            stats = db_proxy_stats()
-            env_count = proxy_manager.env_count()
-            avg_lat = stats.get("avg_latency")
-            avg_lat_str = f"{avg_lat:.0f} ms" if avg_lat else "N/A"
-            last_test = str(stats.get("last_test_time") or "Never")[:19]
-            bot.send_message(
-                chat_id,
-                (
-                    f"📊 <b>Proxy Statistics</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📡 <b>Total (DB):</b> <code>{stats.get('total', 0)}</code>\n"
-                    f"⚙️ <b>From Env:</b> <code>{env_count}</code>\n"
-                    f"🟢 <b>Working:</b> <code>{stats.get('working', 0)}</code>\n"
-                    f"🟡 <b>Slow:</b> <code>{stats.get('slow', 0)}</code>\n"
-                    f"🔴 <b>Dead:</b> <code>{stats.get('dead', 0)}</code>\n"
-                    f"⚪ <b>Untested:</b> <code>{stats.get('untested', 0)}</code>\n"
-                    f"⚡ <b>Avg Latency:</b> <code>{avg_lat_str}</code>\n"
-                    f"🕒 <b>Last Tested:</b> <code>{html.escape(last_test)}</code>\n"
-                    f"━━━━━━━━━━━━━━━━━━"
-                ),
-                reply_markup=proxy_manager_keyboard(),
-            )
-            return
-
-        if text == "🔄 Retest Failed":
-            _trigger_retest_failed(chat_id)
-            return
-
-        if text == "🗑️ Delete Proxy":
-            with _state_lock:
-                user_states[user.id] = {"step": "ADMIN_DELETE_PROXY"}
-            bot.send_message(
-                chat_id,
-                "🗑️ <b>Delete Proxy</b>\n\nSend the numeric <b>proxy ID</b> to delete:",
-                reply_markup=back_cancel_keyboard(),
-            )
-            return
-
-        if text == "🗑️ Clear Dead Proxies":
-            deleted = db_clear_dead_proxies()
-            bot.send_message(
-                chat_id,
-                f"🗑️ <b>Cleared {deleted} dead proxy entries.</b>",
-                reply_markup=proxy_manager_keyboard(),
-            )
-            return
-
-        if text == "🗑️ Clear All Proxies":
-            deleted = db_clear_all_proxies()
-            bot.send_message(
-                chat_id,
-                f"🗑️ <b>Deleted {deleted} database proxies.</b>\nEnvironment proxies (if any) remain active.",
-                reply_markup=proxy_manager_keyboard(),
-            )
-            return
-
-        if text == "📈 Bot Stats":
-            stats = get_admin_stats()
-            proxy_count = proxy_manager.get_endpoint_count()
-            proxy_stats = db_proxy_stats()
-            bot.send_message(
-                chat_id,
-                (
-                    f"📈 <b>Bot System Statistics</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"👥 <b>Total Users:</b> <code>{stats.get('total_users', 0)}</code>\n"
-                    f"🔄 <b>Total Extractions:</b> <code>{stats.get('total_ex', 0)}</code>\n"
-                    f"📱 <b>Total Numbers Found:</b> <code>{stats.get('total_nums', 0)}</code>\n"
-                    f"🌐 <b>Active Proxies:</b> <code>{proxy_count}</code>\n"
-                    f"✅ <b>Working Proxies:</b> <code>{proxy_stats.get('working', 0)}</code>\n"
-                    f"━━━━━━━━━━━━━━━━━━"
-                ),
-                reply_markup=admin_keyboard(),
-            )
-            return
-
-        if text == "📢 Broadcast":
-            with _state_lock:
-                user_states[user.id] = {"awaiting_broadcast": True}
-            bot.send_message(
-                chat_id,
-                "📢 <b>Broadcast Console</b>\n\nType the message to send to all users:\n\n"
-                "<i>Tap ❌ Cancel to abort.</i>",
-                reply_markup=cancel_only_keyboard(),
-            )
-            return
-
-        if text == "👥 Recent Users":
-            conn = get_conn()
-            try:
-                rows = conn.execute(
-                    """SELECT user_id, first_name, username, total_numbers_found, joined_at
-                       FROM users ORDER BY joined_at DESC LIMIT 10"""
-                ).fetchall()
-            finally:
-                conn.close()
-
-            if not rows:
-                bot.send_message(chat_id, "No users registered yet.", reply_markup=admin_keyboard())
-                return
-
-            msg = "👥 <b>Recent 10 Users</b>\n━━━━━━━━━━━━━━━━━━\n\n"
-            for i, r in enumerate(rows, 1):
-                name = html.escape(r["first_name"] or "User")
-                uname = html.escape(r["username"] or "none")
-                msg += (
-                    f"<b>#{i}</b> {name} (<code>{r['user_id']}</code>)\n"
-                    f"📱 Found: {r['total_numbers_found']} | @{uname}\n\n"
-                )
-            bot.send_message(chat_id, msg, reply_markup=admin_keyboard())
-            return
-
-        if text in ("🟢 Maintenance: OFF", "🔴 Maintenance: ON"):
-            MAINTENANCE_MODE = not MAINTENANCE_MODE
-            status = "🔴 <b>ON</b> (Admins only)" if MAINTENANCE_MODE else "🟢 <b>OFF</b> (Publicly active)"
-            bot.send_message(
-                chat_id, f"🔧 <b>Maintenance Mode:</b> {status}", reply_markup=admin_keyboard()
-            )
-            return
-
-    # ── Standard User Menu ────────────────────────────────
-    if text == "🔗 Send New Link":
-        with _state_lock:
-            if user.id in active_jobs:
-                bot.send_message(
-                    chat_id,
-                    "⚠️ <b>A job is already running!</b>\nTap ❌ Cancel to stop it first.",
-                    reply_markup=cancel_only_keyboard(),
-                )
-                return
-            user_states[user.id] = {"step": "AWAITING_URL"}
-        bot.send_message(
-            chat_id,
-            (
-                "🔗 <b>Submit Target URL</b>\n\n"
-                "Send a valid HTTP/HTTPS link:\n\n"
-                "<i>Example:</i> <code>https://example.com/redirect</code>"
-            ),
-            reply_markup=cancel_only_keyboard(),
-        )
+            remove_admin(tid)
+            audit(u.id, "ADMIN_REMOVED", target=str(tid))
+            bot.send_message(chat_id, f"✅ Admin <code>{tid}</code> removed.", reply_markup=admin_keyboard())
+        else:
+            bot.send_message(chat_id, "❌ Send a numeric ID (owner only).", reply_markup=admin_keyboard())
         return
-
-    if text == "📊 My Stats":
-        stats = get_user_stats(user.id)
-        if not stats:
-            bot.send_message(chat_id, "📊 No stats yet. Run an extraction first!", reply_markup=main_keyboard())
-            return
-        bot.send_message(
-            chat_id,
-            (
-                f"📊 <b>Your Statistics</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>Name:</b> {html.escape(stats.get('first_name') or 'User')}\n"
-                f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
-                f"🔄 <b>Total Extractions:</b> <code>{stats.get('total_extractions', 0)}</code>\n"
-                f"📱 <b>Total Numbers Found:</b> <code>{stats.get('total_numbers_found', 0)}</code>\n"
-                f"📅 <b>Member Since:</b> <code>{html.escape(str(stats.get('joined_at', 'N/A'))[:10])}</code>\n"
-                f"━━━━━━━━━━━━━━━━━━"
-            ),
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    if text == "📋 My History":
-        history = get_user_history(user.id, limit=8)
-        if not history:
-            bot.send_message(
-                chat_id, "📋 <b>No extraction history yet.</b>", reply_markup=main_keyboard()
-            )
-            return
-        msg = "📋 <b>Your Recent Extractions</b>\n━━━━━━━━━━━━━━━━━━\n\n"
-        for i, h in enumerate(history, 1):
-            url_disp = html.escape((h["url"][:30] + "…") if len(h["url"]) > 30 else h["url"])
-            completed = html.escape(str(h.get("completed_at") or "")[:16])
-            mode_lbl = "🌐 IP" if h.get("mode") == "ROTATING" else "🟢 Norm"
-            msg += (
-                f"<b>#{i}</b> | <code>{completed}</code> [{mode_lbl}]\n"
-                f"🔗 <code>{url_disp}</code>\n"
-                f"🔄 Visits: <code>{h['cycles']}</code> | "
-                f"📱 Numbers: <code>{h['unique_numbers']}</code>\n\n"
-            )
-        bot.send_message(chat_id, msg, reply_markup=main_keyboard())
-        return
-
-    if text == "❓ Help":
-        socks_status = "✅ Available" if _SOCKS5_AVAILABLE else "❌ Not installed (add requests[socks])"
-        bot.send_message(
-            chat_id,
-            (
-                "❓ <b>Help & Overview</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "<b>What this bot does:</b>\n"
-                "Fetches HTTP/HTTPS URLs and extracts phone numbers from redirect chains.\n\n"
-                "<b>Two Extraction Modes:</b>\n"
-                "• 🟢 <b>WITHOUT IP:</b> Direct server connection.\n"
-                "• 🌐 <b>WITH IP ROTATION:</b> Rotates through configured proxy endpoints.\n\n"
-                "<b>Proxy Support:</b>\n"
-                "• HTTP / HTTPS / SOCKS5\n"
-                f"• SOCKS5: {socks_status}\n\n"
-                "<b>Features:</b>\n"
-                "• All numbers collected silently during extraction.\n"
-                "• Single final result with 📋 Copy + .txt download.\n"
-                "• Cancel at any time with ❌ Cancel."
-            ),
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    if text == "📞 Support":
-        bot.send_message(
-            chat_id,
-            (
-                "📞 <b>Support</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "For assistance, contact the admin."
-            ),
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    # ── Flow: AWAITING_URL ────────────────────────────────
-    if state.get("step") == "AWAITING_URL" or text.startswith(("http://", "https://")):
-        valid, err = validate_url(text)
-        if not valid:
-            bot.send_message(
-                chat_id,
-                f"⚠️ <b>Invalid URL</b>\n\n{html.escape(err)}\n\nPlease send a valid URL.",
-                reply_markup=cancel_only_keyboard(),
-            )
-            return
-
-        with _state_lock:
-            user_states[user.id] = {"step": "AWAITING_MODE", "url": text}
-
-        bot.send_message(
-            chat_id,
-            (
-                f"🔗 <b>Link Received</b>\n\n"
-                f"<code>{html.escape(text[:80])}{'…' if len(text) > 80 else ''}</code>\n\n"
-                f"<b>Choose Extraction Mode:</b>\n\n"
-                f"🟢 <b>WITHOUT IP</b> — Direct connection.\n\n"
-                f"🌐 <b>WITH IP ROTATION</b> — Rotates through configured proxy endpoints."
-            ),
-            reply_markup=mode_selection_keyboard(),
-        )
-        return
-
-    # ── Flow: AWAITING_MODE ───────────────────────────────
-    if state.get("step") == "AWAITING_MODE":
-        target_url = state.get("url", "")
-
-        if text == "🟢 WITHOUT IP":
-            with _state_lock:
-                user_states[user.id] = {
-                    "step": "AWAITING_CYCLES",
-                    "url": target_url,
-                    "mode": "NORMAL",
-                }
-            bot.send_message(
-                chat_id,
-                (
-                    f"🟢 <b>Normal Connection Mode</b>\n\n"
-                    f"🔗 <code>{html.escape(target_url[:60])}</code>\n\n"
-                    f"Select how many visits to run:"
-                ),
-                reply_markup=extraction_cycles_keyboard(),
-            )
-            return
-
-        if text == "🌐 WITH IP ROTATION":
-            if not proxy_manager.has_endpoints():
-                bot.send_message(
-                    chat_id,
-                    (
-                        "⚠️ <b>IP Rotation Unavailable</b>\n\n"
-                        "No proxy endpoints are configured.\n"
-                        "Admins can add proxies via <b>/admin → 🌐 Proxy Manager</b>.\n\n"
-                        "<i>You can still use 🟢 WITHOUT IP mode.</i>"
-                    ),
-                    reply_markup=mode_selection_keyboard(),
-                )
-                return
-
-            ep_count = proxy_manager.get_endpoint_count()
-            with _state_lock:
-                user_states[user.id] = {
-                    "step": "AWAITING_CYCLES",
-                    "url": target_url,
-                    "mode": "ROTATING",
-                }
-            bot.send_message(
-                chat_id,
-                (
-                    f"🌐 <b>IP Rotation Mode</b>\n\n"
-                    f"🔗 <code>{html.escape(target_url[:60])}</code>\n"
-                    f"📡 Available Proxies: <code>{ep_count}</code>\n\n"
-                    f"Select how many visits to run:"
-                ),
-                reply_markup=extraction_cycles_keyboard(),
-            )
-            return
-
-    # ── Flow: AWAITING_CYCLES ─────────────────────────────
-    if state.get("step") == "AWAITING_CYCLES":
-        count = _CYCLE_COUNT_MAP.get(text)
-        if count is not None:
-            target_url = state.get("url", "")
-            mode = state.get("mode", "NORMAL")
-
-            cancel_ev = threading.Event()
-            with _state_lock:
-                user_states[user.id] = {}
-                active_jobs[user.id] = cancel_ev
-
-            mode_name = "🌐 IP Rotation" if mode == "ROTATING" else "🟢 Normal Connection"
-            start_msg = bot.send_message(
-                chat_id,
-                (
-                    f"⏳ <b>EXTRACTION IN PROGRESS</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>Mode:</b> {mode_name}\n"
-                    f"<b>Visits:</b> 0/{count}\n"
-                    f"<b>Successful:</b> 0\n"
-                    f"<b>Failed:</b> 0\n"
-                    f"<b>Unique Numbers:</b> 0\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"<i>Initialising…</i>"
-                ),
-                reply_markup=cancel_only_keyboard(),
-            )
-
-            threading.Thread(
-                target=extraction_worker,
-                args=(chat_id, user.id, target_url, mode, count, start_msg.message_id, cancel_ev),
-                daemon=True,
-            ).start()
-            return
-
-    # ── Fallback ──────────────────────────────────────────
-    bot.send_message(
-        chat_id,
-        "❓ Please select an option from the menu or tap <b>🔗 Send New Link</b>.",
-        reply_markup=main_keyboard(),
-    )
 
 
 # =========================================================
-# Helper: Retest Failed Proxies
+# Entry point
 # =========================================================
-def _trigger_retest_failed(chat_id: int) -> None:
-    """Find proxies with failures and retest them in the background."""
-    conn = get_conn()
-    try:
-        rows = conn.execute(
-            """SELECT endpoint FROM admin_proxies
-               WHERE is_active = 1
-                 AND (failure_count > 0 OR last_tested IS NULL)
-               ORDER BY last_tested ASC NULLS FIRST"""
-        ).fetchall()
-    finally:
-        conn.close()
-
-    endpoints = [r["endpoint"] for r in rows]
-    if not endpoints:
-        bot.send_message(chat_id, "✅ No failed/untested proxies found.", reply_markup=proxy_manager_keyboard())
-        return
-
-    status_msg = bot.send_message(
-        chat_id,
-        f"🔄 <b>Retesting {len(endpoints)} failed/untested proxies…</b>",
-    )
-    cancel_ev = threading.Event()
-
-    def _bg():
-        _run_proxy_tests_in_bg(chat_id, status_msg.message_id, endpoints, cancel_ev, detailed=False)
-
-    threading.Thread(target=_bg, daemon=True).start()
-
-
-# =========================================================
-# Entry Point
-# =========================================================
-if __name__ == "__main__":
+def main() -> None:
     init_db()
-
-    socks_status = "✅ Available" if _SOCKS5_AVAILABLE else "❌ Not installed"
     logger.info("=" * 60)
-    logger.info("URL Fetcher Bot — Starting")
-    logger.info("Admins: %s", ADMIN_IDS)
-    logger.info("DB: %s", DB_FILE)
-    logger.info("Proxy endpoints: %d", proxy_manager.get_endpoint_count())
-    logger.info("SOCKS5 support: %s", socks_status)
-    logger.info("Max concurrency: %d", MAX_CONCURRENCY)
+    logger.info("URL Extraction Bot — starting")
+    logger.info("✅ Database ready: %s", DB_FILE)
+    logger.info("✅ Admins: %s", [a["user_id"] for a in list_admins()])
+    logger.info("✅ Proxy endpoints: %d", proxy_manager.get_endpoint_count())
+    logger.info("✅ SOCKS5 support: %s", "yes" if _SOCKS5_AVAILABLE else "no (add requests[socks])")
+    logger.info("✅ Channel: %s", channel_target() or "not set")
     logger.info("=" * 60)
 
     try:
         bot.remove_webhook()
         time.sleep(1)
-        logger.info("Webhook cleared.")
     except Exception as exc:
-        logger.warning("Webhook clear notice: %s", exc)
+        logger.warning("Webhook clear: %s", exc)
 
     logger.info("Polling started.")
     while True:
@@ -2769,3 +2800,7 @@ if __name__ == "__main__":
             logger.warning("Polling interrupted: %s", exc)
             time.sleep(4)
             logger.info("Reconnecting…")
+
+
+if __name__ == "__main__":
+    main()
