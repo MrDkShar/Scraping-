@@ -1,4 +1,3 @@
-pyTelegramBotAPI==4.24.0
-requests[socks]==2.32.3
-# PySocks is pulled in by requests[socks]; pinned explicitly for clarity:
-PySocks==1.7.1
+pyTelegramBotAPI==4.18.0
+requests==2.31.0
+pycryptodome>=3.19.0
