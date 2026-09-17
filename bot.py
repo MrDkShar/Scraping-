@@ -113,9 +113,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 BOT_TOKEN = _env_str("BOT_TOKEN")
-if not BOT_TOKEN:
-    logger.critical("8553353076:AAFgLdPCaSL_TfZds10qQS1_Hr5iGnn0e5M")
-    sys.exit(1)
+if not BOT_TOKEN= "8553353076:AAFgLdPCaSL_TfZds10qQS1_Hr5iGnn0e5M"
 
 ADMIN_IDS: list[int] = [
     int(x.strip())
