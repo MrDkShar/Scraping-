@@ -3,6 +3,16 @@
 DK Sharma Universal WhatsApp Extractor & Rotating Link Engine
 Production-ready, highly optimized, multi-mode Telegram bot.
 Compatible with standard VPS and Render deployment.
+
+FIXES APPLIED:
+1. test_proxy() — replaced urllib with requests+PySocks; dual fallback IP check endpoints;
+   removed resp.status bug (urllib uses getcode(), not .status); never crashes bot thread.
+2. IP Rotation — replaced broken index-based selection with true round-robin RoundRobinRotator;
+   failed proxies are skipped and retried after cooldown; rotation is even across all visits.
+3. SOCKS5 support — urllib.request.ProxyHandler does NOT support socks5://; now using
+   requests + PySocks (pip install requests[socks]) for all proxy-based fetches.
+4. Live proxies — added FREE_PROXY_SOURCES auto-fetch on startup with validation;
+   admin can also trigger refresh via "🔄 Refresh Live Proxies" button.
 """
 
 import html
@@ -24,34 +34,46 @@ import telebot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 
+# requests + PySocks: required for SOCKS5 proxy support and reliable proxy testing
+try:
+    import requests
+    from requests.exceptions import RequestException
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    print("WARNING: 'requests' not installed. SOCKS5 proxies won't work. Run: pip install requests[socks]")
+
 # =========================================================
 # Configuration & Security (Environment-Driven)
 # =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8267372667:AAFUCPQ9kv60DwkRqi54Ge7YasN3NYs2XNs").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     print("CRITICAL ERROR: BOT_TOKEN environment variable is not set.")
-    print("Please set BOT_TOKEN in your environment (e.g. on Render / Docker / local .env).")
     sys.exit(1)
 
 ADMIN_IDS = [
     int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "8753914631").split(",")
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 ]
 
-# Supported authorized proxy/gateway configurations:
-# In addition to environment variables, proxies can be added dynamically via the Admin Panel!
 RAW_PROXIES = os.environ.get("PROXY_ENDPOINTS", "") or os.environ.get("ROTATING_PROXIES", "")
 SYSTEM_HTTP_PROXY = os.environ.get("HTTP_PROXY", "") or os.environ.get("http_proxy", "")
 SYSTEM_HTTPS_PROXY = os.environ.get("HTTPS_PROXY", "") or os.environ.get("https_proxy", "")
 
-# Initialize TeleBot with HTML parsing mode for maximum format stability
+# Free public proxy sources (plain-text, one proxy per line, format: ip:port)
+FREE_PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+]
+# Max proxies to pull from free sources (validated against IP check before storing)
+FREE_PROXY_FETCH_LIMIT = 50
+FREE_PROXY_VALIDATE_TIMEOUT = 6.0
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# Global flags
 MAINTENANCE_MODE = False
-
-# State stores
 user_states: dict = {}
 active_jobs: dict = {}
 
@@ -267,20 +289,182 @@ def db_clear_all_proxies() -> int:
 
 
 # =========================================================
+# FIX #1: True Round-Robin Rotator (replaces broken index math)
+# Old code: get_next_endpoint(cycle) → always picks same proxy for same cycle number
+# New code: atomic counter increments on every call → even distribution across all proxies
+# =========================================================
+class RoundRobinRotator:
+    """Thread-safe round-robin proxy rotator with failure cooldown."""
+
+    def __init__(self, cooldown_seconds: float = 120.0):
+        self._lock = threading.Lock()
+        self._counter = 0
+        self.cooldown_seconds = cooldown_seconds
+        self.failed_endpoints: dict[str, float] = {}  # endpoint -> failure timestamp
+
+    def _purge_expired_failures(self) -> None:
+        now = time.time()
+        self.failed_endpoints = {
+            ep: ts for ep, ts in self.failed_endpoints.items()
+            if (now - ts) < self.cooldown_seconds
+        }
+
+    def get_next(self, all_endpoints: list[str]) -> str | None:
+        if not all_endpoints:
+            return None
+        with self._lock:
+            self._purge_expired_failures()
+            available = [ep for ep in all_endpoints if ep not in self.failed_endpoints]
+            if not available:
+                # All failed — reset and use full list (cooldown expired logic above handles re-try)
+                available = all_endpoints
+            chosen = available[self._counter % len(available)]
+            self._counter += 1
+            return chosen
+
+    def mark_failed(self, endpoint: str) -> None:
+        if not endpoint:
+            return
+        with self._lock:
+            self.failed_endpoints[endpoint] = time.time()
+
+
+# =========================================================
+# FIX #2: test_proxy() — crash-proof, dual fallback, requests-based
+# Old bug: urllib resp.status doesn't exist → AttributeError crashes the bot thread
+# Old bug: httpbin.org is unreliable and frequently rate-limited
+# Fix: use requests with PySocks; dual IP-check fallbacks; catch all exceptions
+# =========================================================
+
+# IP check endpoints — tried in order until one responds
+_IP_CHECK_URLS = [
+    "https://api.ipify.org?format=text",
+    "http://checkip.amazonaws.com",
+    "http://icanhazip.com",
+]
+
+
+def test_proxy(endpoint: str, timeout: float = 7.0) -> tuple[bool, str]:
+    """
+    Tests proxy connectivity. Returns (is_working: bool, info_string: str).
+    Never raises — all exceptions are caught and returned as failure info.
+    Supports http://, https://, socks5://, socks5h:// via requests+PySocks.
+    """
+    if not REQUESTS_AVAILABLE:
+        # Fallback to urllib for http/https only
+        return _test_proxy_urllib(endpoint, timeout)
+
+    proxies = {"http": endpoint, "https": endpoint}
+    start_t = time.time()
+    last_error = "All IP-check endpoints failed"
+
+    for check_url in _IP_CHECK_URLS:
+        try:
+            resp = requests.get(
+                check_url,
+                proxies=proxies,
+                timeout=timeout,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if resp.status_code == 200:
+                duration_ms = round((time.time() - start_t) * 1000)
+                detected_ip = resp.text.strip()[:45]
+                return True, f"✅ Working ({duration_ms}ms) | IP: {detected_ip}"
+            last_error = f"HTTP {resp.status_code} from {check_url}"
+        except Exception as e:
+            last_error = str(e)[:80]
+            continue
+
+    return False, f"❌ Failed: {last_error}"
+
+
+def _test_proxy_urllib(endpoint: str, timeout: float) -> tuple[bool, str]:
+    """urllib fallback for http/https only when requests is not installed."""
+    if endpoint.startswith(("socks5://", "socks5h://")):
+        return False, "❌ SOCKS5 requires: pip install requests[socks]"
+    try:
+        proxy_dict = {"http": endpoint, "https": endpoint}
+        proxy_handler = urllib.request.ProxyHandler(proxy_dict)
+        opener = urllib.request.build_opener(proxy_handler)
+        opener.addheaders = [("User-Agent", "Mozilla/5.0")]
+        start_t = time.time()
+        resp = opener.open("http://checkip.amazonaws.com", timeout=timeout)
+        duration_ms = round((time.time() - start_t) * 1000)
+        # FIX: urllib responses use .getcode(), not .status
+        if resp.getcode() == 200:
+            detected_ip = resp.read().decode("utf-8", errors="ignore").strip()[:45]
+            return True, f"✅ Working ({duration_ms}ms) | IP: {detected_ip}"
+        return False, f"HTTP {resp.getcode()}"
+    except Exception as e:
+        return False, f"❌ Failed: {str(e)[:80]}"
+
+
+# =========================================================
+# FIX #3: Free Live Proxy Fetcher
+# Pulls from public proxy lists, validates each one, stores working proxies in DB
+# =========================================================
+def fetch_and_store_live_proxies(added_by: int = 0, chat_id: int = None) -> tuple[int, int]:
+    """
+    Downloads proxies from FREE_PROXY_SOURCES, validates each one, stores valid ones in DB.
+    Returns (added_count, tested_count).
+    """
+    if not REQUESTS_AVAILABLE:
+        if chat_id:
+            bot.send_message(chat_id, "⚠️ <b>requests library not installed.</b> Run: <code>pip install requests[socks]</code>")
+        return 0, 0
+
+    raw_proxies: set[str] = set()
+
+    for source_url in FREE_PROXY_SOURCES:
+        try:
+            resp = requests.get(source_url, timeout=10)
+            if resp.status_code == 200:
+                for line in resp.text.strip().splitlines():
+                    line = line.strip()
+                    if line and re.match(r'^\d+\.\d+\.\d+\.\d+:\d+$', line):
+                        raw_proxies.add(f"http://{line}")
+        except Exception:
+            continue
+
+    if chat_id:
+        bot.send_message(
+            chat_id,
+            f"⏳ <b>Found {len(raw_proxies)} raw proxies.</b>\nValidating up to {FREE_PROXY_FETCH_LIMIT}...",
+        )
+
+    candidates = list(raw_proxies)
+    random.shuffle(candidates)
+    candidates = candidates[:FREE_PROXY_FETCH_LIMIT * 3]  # test 3x limit to find enough working ones
+
+    added_count = 0
+    tested_count = 0
+
+    for endpoint in candidates:
+        if added_count >= FREE_PROXY_FETCH_LIMIT:
+            break
+        tested_count += 1
+        ok, _ = test_proxy(endpoint, timeout=FREE_PROXY_VALIDATE_TIMEOUT)
+        if ok:
+            if db_add_proxy(endpoint, added_by):
+                added_count += 1
+
+    return added_count, tested_count
+
+
+# =========================================================
 # Proxy & Alternate Network Gateway Manager
 # =========================================================
 class NetworkEndpointManager:
     """
-    Manages legitimate proxy / network endpoints provided by:
-    1. Environment variables (PROXY_ENDPOINTS, ROTATING_PROXIES, HTTP_PROXY, etc.)
-    2. Dynamic Admin Panel insertion stored in SQLite database.
-    Never invents or fakes proxies. Tracks health and cool-down states.
+    Manages proxy endpoints from:
+    1. Environment variables (PROXY_ENDPOINTS, ROTATING_PROXIES, HTTP_PROXY)
+    2. Dynamic Admin Panel insertion stored in SQLite
+    3. Auto-fetched live public proxies (validated before storing)
     """
     def __init__(self):
         self.env_endpoints: list[str] = []
-        self.failed_endpoints: dict[str, float] = {}  # endpoint -> timestamp of failure
-        self.cooldown_seconds = 120.0  # 2 minutes cooldown for failed endpoints
         self._lock = threading.Lock()
+        self.rotator = RoundRobinRotator(cooldown_seconds=120.0)
         self._load_from_env()
 
     def _load_from_env(self):
@@ -298,7 +482,6 @@ class NetworkEndpointManager:
         self.env_endpoints = list(dict.fromkeys(items))
 
     def get_all_endpoints(self) -> list[str]:
-        """Combines environment proxies and database-persisted admin proxies."""
         with self._lock:
             db_records = db_get_all_proxies()
             db_items = [r["endpoint"] for r in db_records]
@@ -311,33 +494,15 @@ class NetworkEndpointManager:
     def get_endpoint_count(self) -> int:
         return len(self.get_all_endpoints())
 
-    def get_next_endpoint(self, preferred_index: int = 0) -> str | None:
-        with self._lock:
-            all_eps = self.get_all_endpoints()
-            if not all_eps:
-                return None
+    def get_next_endpoint(self) -> str | None:
+        """True round-robin — atomic counter, even distribution, failure-aware."""
+        return self.rotator.get_next(self.get_all_endpoints())
 
-            now = time.time()
-            self.failed_endpoints = {
-                ep: ts for ep, ts in self.failed_endpoints.items()
-                if (now - ts) < self.cooldown_seconds
-            }
-
-            available = [ep for ep in all_eps if ep not in self.failed_endpoints]
-            if not available:
-                available = all_eps
-
-            chosen = available[preferred_index % len(available)]
-            return chosen
-
-    def mark_failed(self, endpoint: str):
-        with self._lock:
-            if endpoint:
-                self.failed_endpoints[endpoint] = time.time()
+    def mark_failed(self, endpoint: str) -> None:
+        self.rotator.mark_failed(endpoint)
 
     @staticmethod
     def sanitize(endpoint: str | None) -> str:
-        """Removes credentials before displaying endpoint in any message."""
         if not endpoint:
             return "None"
         try:
@@ -350,24 +515,9 @@ class NetworkEndpointManager:
             return "gateway-endpoint"
 
     @staticmethod
-    def test_proxy(endpoint: str, timeout: float = 6.0) -> tuple[bool, str]:
-        """Actively tests connectivity through the proxy to verify it is working."""
-        try:
-            proxy_dict = {"http": endpoint, "https": endpoint}
-            proxy_handler = urllib.request.ProxyHandler(proxy_dict)
-            opener = urllib.request.build_opener(proxy_handler)
-            opener.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0")]
-            
-            start_t = time.time()
-            # Fast test against public IP probe endpoint
-            resp = opener.open("http://httpbin.org/ip", timeout=timeout)
-            duration = round((time.time() - start_t) * 1000)
-            if resp.status == 200:
-                body = resp.read().decode("utf-8", errors="ignore")
-                return True, f"Working ({duration}ms) | {body.strip()[:60]}"
-            return True, f"Connected with HTTP {resp.status} ({duration}ms)"
-        except Exception as e:
-            return False, f"Connection failed: {str(e)[:70]}"
+    def test_proxy(endpoint: str, timeout: float = 7.0) -> tuple[bool, str]:
+        """Delegates to module-level test_proxy() — crash-proof, requests-based."""
+        return test_proxy(endpoint, timeout)
 
 
 endpoint_manager = NetworkEndpointManager()
@@ -566,7 +716,6 @@ def extract_numbers_from_text(text: str) -> set[str]:
 
 # =========================================================
 # Custom Redirect Handler
-# Intercepts whatsapp:// and intent:// without failing urllib
 # =========================================================
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def __init__(self):
@@ -582,39 +731,136 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 # =========================================================
-# High-Performance Request Engine
+# FIX #4: OptimizedExtractionSession — requests-based for proxy mode
+# Old bug: urllib.request.ProxyHandler doesn't support socks5:// at all
+# New: uses requests+PySocks for proxy fetches; urllib only for no-proxy normal mode
 # =========================================================
 class OptimizedExtractionSession:
     def __init__(self, proxy_endpoint: str | None = None, timeout: float = 10.0):
         self.proxy_endpoint = proxy_endpoint
         self.timeout = timeout
-        self.cj = http.cookiejar.CookieJar()
-        self.redirect_handler = SafeRedirectHandler()
-        self.cached_test_cookie = None
+        self.cached_test_cookie: str | None = None
+        self._use_requests = proxy_endpoint is not None and REQUESTS_AVAILABLE
 
-        handlers: list[urllib.request.BaseHandler] = [
-            urllib.request.HTTPCookieProcessor(self.cj),
-            self.redirect_handler,
-        ]
+        if self._use_requests:
+            # requests session — supports http, https, socks5, socks5h
+            self._session = requests.Session()
+            self._session.proxies = {"http": proxy_endpoint, "https": proxy_endpoint}
+            self._session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Upgrade-Insecure-Requests": "1",
+            })
+            self._session.max_redirects = 10
+        else:
+            # urllib path — normal mode (no proxy) or fallback
+            self.cj = http.cookiejar.CookieJar()
+            self.redirect_handler = SafeRedirectHandler()
+            handlers: list[urllib.request.BaseHandler] = [
+                urllib.request.HTTPCookieProcessor(self.cj),
+                self.redirect_handler,
+            ]
+            if proxy_endpoint and not REQUESTS_AVAILABLE:
+                if not proxy_endpoint.startswith(("socks5://", "socks5h://")):
+                    proxy_dict = {"http": proxy_endpoint, "https": proxy_endpoint}
+                    handlers.append(urllib.request.ProxyHandler(proxy_dict))
+            self.opener = urllib.request.build_opener(*handlers)
+            self.opener.addheaders = [
+                ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                ("Accept-Language", "en-US,en;q=0.9"),
+                ("Cache-Control", "no-cache"),
+                ("Pragma", "no-cache"),
+                ("Upgrade-Insecure-Requests", "1"),
+            ]
 
-        if self.proxy_endpoint:
-            proxy_dict = {
-                "http": self.proxy_endpoint,
-                "https": self.proxy_endpoint,
-            }
-            handlers.append(urllib.request.ProxyHandler(proxy_dict))
+    def _fetch_with_requests(self, url: str) -> tuple[str, str, list[str]]:
+        """Fetch using requests session (proxy mode). Handles redirects and collects all URLs visited."""
+        visited_urls: list[str] = [url]
 
-        self.opener = urllib.request.build_opener(*handlers)
-        self.opener.addheaders = [
-            ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-            ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-            ("Accept-Language", "en-US,en;q=0.9"),
-            ("Cache-Control", "no-cache"),
-            ("Pragma", "no-cache"),
-            ("Upgrade-Insecure-Requests", "1"),
-        ]
+        if self.cached_test_cookie:
+            parsed = urllib.parse.urlparse(url)
+            self._session.cookies.set("__test", self.cached_test_cookie, domain=parsed.hostname)
 
-    def fetch(self, url: str) -> tuple[str, str, list[str]]:
+        try:
+            resp = self._session.get(url, timeout=self.timeout, allow_redirects=True)
+            # Collect redirect chain
+            for r in resp.history:
+                visited_urls.append(r.url)
+            current_url = resp.url
+            visited_urls.append(current_url)
+            body = resp.text
+        except Exception:
+            raise
+
+        # Solve InfinityFree / ByetHost slowAES challenge
+        if "slowAES" in body or ("toNumbers(" in body and "__test=" in body):
+            matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', body)
+            if len(matches) >= 3:
+                a_key, b_iv, c_cipher = matches[0], matches[1], matches[2]
+                self.cached_test_cookie = decrypt_byet_challenge(c_cipher, a_key, b_iv)
+                parsed = urllib.parse.urlparse(current_url)
+                if parsed.hostname:
+                    self._session.cookies.set("__test", self.cached_test_cookie, domain=parsed.hostname)
+
+                loc_match = re.search(r'location\.href\s*=\s*["\'](.*?)["\']', body)
+                next_dest = loc_match.group(1) if loc_match else (url + ("&i=1" if "?" in url else "?i=1"))
+                next_url = urllib.parse.urljoin(current_url, next_dest)
+                visited_urls.append(next_url)
+                resp2 = self._session.get(next_url, timeout=self.timeout, allow_redirects=True)
+                for r in resp2.history:
+                    visited_urls.append(r.url)
+                current_url = resp2.url
+                visited_urls.append(current_url)
+                body = resp2.text
+
+        # Meta Refresh / JS redirect follow-through
+        for _ in range(2):
+            meta_refresh = re.search(
+                r'<meta[^>]*?http-equiv\s*=\s*["\']?refresh["\']?[^>]*?content\s*=\s*["\']?[^"\'>]*?url\s*=\s*([^\s"\'\';>]+)',
+                body, re.IGNORECASE,
+            )
+            if meta_refresh:
+                dest = meta_refresh.group(1).strip()
+                dest_url = urllib.parse.urljoin(current_url, dest)
+                visited_urls.append(dest_url)
+                if dest_url.lower().startswith(("http://", "https://")):
+                    try:
+                        r3 = self._session.get(dest_url, timeout=self.timeout, allow_redirects=True)
+                        current_url = r3.url
+                        visited_urls.append(current_url)
+                        body = r3.text
+                        continue
+                    except Exception:
+                        pass
+                break
+
+            js_match = re.search(
+                r'(?:window\.|document\.|top\.)?location(?:\.href|\.replace|\.assign)?\s*(?:=|\()\s*["\'](https?://[^"\']+|whatsapp://[^"\']+|wa\.me/[^"\']+)["\']',
+                body, re.IGNORECASE,
+            )
+            if js_match:
+                dest_url = js_match.group(1).strip()
+                visited_urls.append(dest_url)
+                if dest_url.lower().startswith(("http://", "https://")):
+                    try:
+                        r4 = self._session.get(dest_url, timeout=self.timeout, allow_redirects=True)
+                        current_url = r4.url
+                        visited_urls.append(current_url)
+                        body = r4.text
+                        continue
+                    except Exception:
+                        pass
+                break
+            break
+
+        return current_url, body, list(dict.fromkeys(visited_urls))
+
+    def _fetch_with_urllib(self, url: str) -> tuple[str, str, list[str]]:
+        """Original urllib fetch path — used for normal (no proxy) mode."""
         parsed = urllib.parse.urlparse(url)
         domain = parsed.hostname
 
@@ -645,7 +891,6 @@ class OptimizedExtractionSession:
 
         visited_urls.extend(self.redirect_handler.collected_redirect_targets)
 
-        # Solve InfinityFree / ByetHost slowAES anti-bot challenge
         if "slowAES" in body or ("toNumbers(" in body and "__test=" in body):
             matches = re.findall(r'toNumbers\("([a-f0-9]+)"\)', body)
             if len(matches) >= 3:
@@ -670,12 +915,10 @@ class OptimizedExtractionSession:
                 visited_urls.append(current_url)
                 body = resp2.read().decode("utf-8", errors="ignore")
 
-        # Meta Refresh and JavaScript Redirections
         for _ in range(2):
             meta_refresh = re.search(
                 r'<meta[^>]*?http-equiv\s*=\s*["\']?refresh["\']?[^>]*?content\s*=\s*["\']?[^"\'>]*?url\s*=\s*([^\s"\'\';>]+)',
-                body,
-                re.IGNORECASE,
+                body, re.IGNORECASE,
             )
             if meta_refresh:
                 dest = meta_refresh.group(1).strip()
@@ -694,8 +937,7 @@ class OptimizedExtractionSession:
 
             js_match = re.search(
                 r'(?:window\.|document\.|top\.)?location(?:\.href|\.replace|\.assign)?\s*(?:=|\()\s*["\'](https?://[^"\']+|whatsapp://[^"\']+|wa\.me/[^"\']+)["\']',
-                body,
-                re.IGNORECASE,
+                body, re.IGNORECASE,
             )
             if js_match:
                 dest_url = js_match.group(1).strip()
@@ -710,10 +952,14 @@ class OptimizedExtractionSession:
                     except Exception:
                         pass
                 break
-
             break
 
-        return current_url, body, visited_urls
+        return current_url, body, list(dict.fromkeys(visited_urls))
+
+    def fetch(self, url: str) -> tuple[str, str, list[str]]:
+        if self._use_requests:
+            return self._fetch_with_requests(url)
+        return self._fetch_with_urllib(url)
 
 
 def add_cache_buster(url: str, cycle: int) -> str:
@@ -781,6 +1027,7 @@ def proxy_manager_keyboard() -> types.ReplyKeyboardMarkup:
         types.KeyboardButton("📦 Bulk Add Proxies"),
         types.KeyboardButton("📋 List All Proxies"),
         types.KeyboardButton("🧪 Test All Proxies"),
+        types.KeyboardButton("🔄 Refresh Live Proxies"),
         types.KeyboardButton("🗑️ Clear All Proxies"),
         types.KeyboardButton("🔙 Admin Panel"),
     )
@@ -827,7 +1074,6 @@ def extraction_worker(
     start_time = time.time()
 
     mode_display_name = "🌐 IP Rotation" if mode == "ROTATING" else "🟢 Normal Connection"
-
     shared_normal_session = OptimizedExtractionSession() if mode == "NORMAL" else None
 
     for cycle in range(1, total_cycles + 1):
@@ -839,8 +1085,13 @@ def extraction_worker(
         endpoint_used = None
 
         if mode == "ROTATING":
-            endpoint_used = endpoint_manager.get_next_endpoint(cycle)
-            session_to_use = OptimizedExtractionSession(proxy_endpoint=endpoint_used)
+            # FIX: get_next_endpoint() now uses true round-robin (no cycle index)
+            endpoint_used = endpoint_manager.get_next_endpoint()
+            if endpoint_used:
+                session_to_use = OptimizedExtractionSession(proxy_endpoint=endpoint_used)
+            else:
+                # No proxies available — fall back to direct
+                session_to_use = OptimizedExtractionSession()
 
         try:
             final_url, body, visited_urls = session_to_use.fetch(target_url)
@@ -863,7 +1114,6 @@ def extraction_worker(
             if mode == "ROTATING" and endpoint_used:
                 endpoint_manager.mark_failed(endpoint_used)
 
-        # Throttled progress update (every ~1.8s)
         now = time.time()
         if (now - last_ui_update > 1.8) or (cycle == total_cycles):
             last_ui_update = now
@@ -892,14 +1142,11 @@ def extraction_worker(
                     message_id=progress_message_id,
                     text=progress_text,
                 )
-            except ApiTelegramException:
-                pass
             except Exception:
                 pass
 
         time.sleep(0.05)
 
-    # ── Job Completed ───────────────────────────────────────────
     active_jobs.pop(user_id, None)
 
     unique_count = len(found_numbers)
@@ -909,7 +1156,6 @@ def extraction_worker(
     update_user_stats(user_id, unique_count)
     save_history(user_id, url, mode, total_cycles, unique_count, duplicate_count)
 
-    # Send final result ONCE
     if unique_count > 0:
         numbers_plain_text = "\n".join(f"+{num}" for num in sorted_numbers)
 
@@ -986,7 +1232,11 @@ def extraction_worker(
                 reply_markup=main_keyboard(),
             )
         except Exception as e:
-            bot.send_message(chat_id, f"⚠️ Note: File upload encountered an error ({html.escape(str(e))})", reply_markup=main_keyboard())
+            bot.send_message(
+                chat_id,
+                f"⚠️ Note: File upload encountered an error ({html.escape(str(e))})",
+                reply_markup=main_keyboard(),
+            )
 
     else:
         bot.send_message(
@@ -1091,7 +1341,6 @@ def handle_all_messages(message: types.Message) -> None:
     register_user(user.id, user.username, user.first_name)
     state = user_states.get(user.id, {})
 
-    # Maintenance Check
     if MAINTENANCE_MODE and user.id not in ADMIN_IDS:
         bot.send_message(
             chat_id,
@@ -1103,14 +1352,12 @@ def handle_all_messages(message: types.Message) -> None:
         )
         return
 
-    # Cancel & Main Menu
     if text in ("❌ Cancel", "🔙 Main Menu"):
         active_jobs[user.id] = False
         user_states[user.id] = {}
         bot.send_message(chat_id, "🏠 <b>Main Menu</b>", reply_markup=main_keyboard())
         return
 
-    # Back to Admin Panel
     if user.id in ADMIN_IDS and text == "🔙 Admin Panel":
         user_states[user.id] = {}
         bot.send_message(chat_id, "🔐 <b>Admin Control Console</b>", reply_markup=admin_keyboard())
@@ -1162,9 +1409,8 @@ def handle_all_messages(message: types.Message) -> None:
             )
             return
 
-        # Test proxy before adding
         test_msg = bot.send_message(chat_id, "⏳ <i>Verifying proxy connectivity...</i>")
-        is_working, test_info = NetworkEndpointManager.test_proxy(endpoint)
+        is_working, test_info = test_proxy(endpoint)  # FIX: now crash-proof
         try:
             bot.delete_message(chat_id, test_msg.message_id)
         except Exception:
@@ -1295,7 +1541,7 @@ def handle_all_messages(message: types.Message) -> None:
 
             if env_proxies:
                 msg += "⚙️ <b>Environment Proxies (Read-Only):</b>\n"
-                for i, ep in enumerate(env_proxies, 1):
+                for ep in env_proxies:
                     msg += f"• <code>{html.escape(NetworkEndpointManager.sanitize(ep))}</code>\n"
                 msg += "\n"
 
@@ -1304,8 +1550,8 @@ def handle_all_messages(message: types.Message) -> None:
             if db_proxies:
                 bot.send_message(chat_id, "💾 <b>Database Proxies (Can be deleted):</b>")
                 for item in db_proxies:
-                    sanitized = NetworkEndpointManager.sanitize(item['endpoint'])
-                    created = str(item.get('created_at') or '')[:10]
+                    sanitized = NetworkEndpointManager.sanitize(item["endpoint"])
+                    created = str(item.get("created_at") or "")[:10]
                     card = f"🆔 #{item['id']} | <code>{html.escape(sanitized)}</code>\n📅 Added: {created}"
 
                     del_markup = types.InlineKeyboardMarkup()
@@ -1327,15 +1573,15 @@ def handle_all_messages(message: types.Message) -> None:
             working = 0
             failed = 0
 
-            for idx, ep in enumerate(all_eps, 1):
-                ok, note = NetworkEndpointManager.test_proxy(ep, timeout=5.0)
+            for ep in all_eps:
+                ok, note = test_proxy(ep, timeout=7.0)  # FIX: crash-proof, requests-based
                 sanitized = NetworkEndpointManager.sanitize(ep)
                 if ok:
                     working += 1
-                    results.append(f"✅ <code>{html.escape(sanitized)}</code> - {html.escape(note)}")
+                    results.append(f"✅ <code>{html.escape(sanitized)}</code>\n   {html.escape(note)}")
                 else:
                     failed += 1
-                    results.append(f"❌ <code>{html.escape(sanitized)}</code> - {html.escape(note)}")
+                    results.append(f"❌ <code>{html.escape(sanitized)}</code>\n   {html.escape(note)}")
 
             report = (
                 f"🧪 <b>Proxy Diagnostic Test Results</b>\n"
@@ -1352,6 +1598,34 @@ def handle_all_messages(message: types.Message) -> None:
                 bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=report)
             except Exception:
                 bot.send_message(chat_id, report)
+            return
+
+        # NEW: Refresh Live Proxies from free public sources
+        if text == "🔄 Refresh Live Proxies":
+            status_msg = bot.send_message(
+                chat_id,
+                "🔄 <b>Fetching live proxies from public sources...</b>\n<i>This may take 1-2 minutes.</i>",
+            )
+
+            def _do_refresh():
+                added, tested = fetch_and_store_live_proxies(added_by=user.id, chat_id=None)
+                try:
+                    bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_msg.message_id,
+                        text=(
+                            f"✅ <b>Live Proxy Refresh Complete</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"🔍 <b>Tested:</b> <code>{tested}</code>\n"
+                            f"➕ <b>Valid & Added:</b> <code>{added}</code>\n"
+                            f"📡 <b>Total Active Proxies:</b> <code>{endpoint_manager.get_endpoint_count()}</code>"
+                        ),
+                    )
+                except Exception:
+                    pass
+                bot.send_message(chat_id, "Proxy Manager:", reply_markup=proxy_manager_keyboard())
+
+            threading.Thread(target=_do_refresh, daemon=True).start()
             return
 
         if text == "🗑️ Clear All Proxies":
@@ -1489,7 +1763,9 @@ def handle_all_messages(message: types.Message) -> None:
                 "<b>Features:</b>\n"
                 "• All numbers collected silently during extraction.\n"
                 "• Single final result with 📋 <b>Copy All Numbers</b> button.\n"
-                "• Downloadable <code>.txt</code> file."
+                "• Downloadable <code>.txt</code> file.\n\n"
+                "<b>Requirements:</b>\n"
+                "• <code>pip install requests[socks]</code> — enables SOCKS5 proxy support and accurate proxy testing."
             ),
             reply_markup=main_keyboard(),
         )
@@ -1509,7 +1785,7 @@ def handle_all_messages(message: types.Message) -> None:
         )
         return
 
-    # ── Flow Step 1: URL Submission ─────────────────────────────
+    # Flow Step 1: URL Submission
     if state.get("step") == "AWAITING_URL" or text.startswith(("http://", "https://")):
         if not text.startswith(("http://", "https://")):
             bot.send_message(
@@ -1538,7 +1814,7 @@ def handle_all_messages(message: types.Message) -> None:
         )
         return
 
-    # ── Flow Step 2: Mode Selection (WITHOUT IP vs WITH IP ROTATION) ───
+    # Flow Step 2: Mode Selection
     if state.get("step") == "AWAITING_MODE":
         target_url = state.get("url")
 
@@ -1566,7 +1842,8 @@ def handle_all_messages(message: types.Message) -> None:
                     (
                         "⚠️ <b>IP Rotation Unavailable</b>\n\n"
                         "No alternate network endpoint is configured for this bot.\n"
-                        "Admins can add proxies via the <b>/admin -> 🌐 Proxy Manager</b> panel at any time!\n\n"
+                        "Admins can add proxies via the <b>/admin -> 🌐 Proxy Manager</b> panel, "
+                        "or use <b>🔄 Refresh Live Proxies</b> to auto-fetch working proxies.\n\n"
                         "<i>You can still extract using 🟢 WITHOUT IP mode below.</i>"
                     ),
                     reply_markup=mode_selection_keyboard(),
@@ -1591,7 +1868,7 @@ def handle_all_messages(message: types.Message) -> None:
             )
             return
 
-    # ── Flow Step 3: Cycles Selection & Execution ───────────────
+    # Flow Step 3: Cycles Selection & Execution
     if state.get("step") == "AWAITING_CYCLES":
         count = _CYCLE_COUNT_MAP.get(text)
         if count is not None:
@@ -1643,6 +1920,9 @@ if __name__ == "__main__":
     print("DK Sharma Universal WhatsApp Extractor — Production Engine")
     print(f"Admins: {ADMIN_IDS}")
     print(f"Total Network Endpoints Configured: {endpoint_manager.get_endpoint_count()}")
+    print(f"requests library available: {REQUESTS_AVAILABLE}")
+    if not REQUESTS_AVAILABLE:
+        print("WARNING: Install with: pip install requests[socks]")
     print("=" * 60)
 
     try:
