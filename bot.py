@@ -46,14 +46,14 @@ except ImportError:
 # =========================================================
 # Configuration & Security (Environment-Driven)
 # =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8267372667:AAFUCPQ9kv60DwkRqi54Ge7YasN3NYs2XNs").strip()
 if not BOT_TOKEN:
     print("CRITICAL ERROR: BOT_TOKEN environment variable is not set.")
     sys.exit(1)
 
 ADMIN_IDS = [
     int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "").split(",")
+    for x in os.environ.get("ADMIN_IDS", "8753914631").split(",")
     if x.strip().isdigit()
 ]
 
