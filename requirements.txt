@@ -1,15 +1,18 @@
-# DK Sharma Bot — production dependencies (Render/VPS, Python 3.10+)
+# --- WhatsApp / Telegram extraction bot (fox_tor_bot.py) ---
 
-# Telegram Bot API — >=4.20 exposes types.CopyTextButton and
-# InlineKeyboardButton(copy_text=...) used by the channel copy buttons.
-pyTelegramBotAPI>=4.20.0,<5.0.0
+# Telegram Bot API — telebot package
+pyTelegramBotAPI>=4.14.0
 
-# HTTP engine with connection pooling / keep-alive
-requests>=2.31.0,<3.0.0
+# HTTP engine
+requests>=2.31.0
 
-# SOCKS4/SOCKS5/SOCKS5H proxy support for requests
+# SOCKS5/SOCKS5H proxy support for requests (Tor routing in IP_ROTATION mode)
 PySocks>=1.7.1
 
-# AES for ByetHost/InfinityFree challenge (pure-Python fallback included;
-# this just makes it faster — safe to omit on minimal hosts)
-pycryptodome>=3.19.0; python_version >= "3.8"
+# Tor controller — bootstrap monitoring, ControlPort auth, NEWNYM rotation
+stem>=1.8.2
+# optional — only if you deploy behind a webhook
+# flask>=3.0.0
+
+# optional — C-accelerated JSON (drop-in, faster polling)
+# orjson>=3.9.0
