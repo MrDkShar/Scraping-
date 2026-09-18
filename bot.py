@@ -1,31 +1,3 @@
-"""
-DK Sharma Bot — WhatsApp Number Extractor (Production Edition v2)
-Render/VPS compatible. Single-file deployment.
-
-v2 upgrade (audited refactor of v1):
-  • Centralized navigation state machine: every input screen has 🔙 Back and
-    ❌ Cancel; Back never cancels a running extraction job.
-  • Atomic active-job registration: active_jobs[user_id] = job_id with a
-    threading.Event cancellation primitive checked at every stage.
-  • Fast extraction: thread-local requests.Session reuse (keep-alive),
-    ThreadPoolExecutor bounded visit concurrency, no per-visit exit-IP
-    re-check (cached last_observed_ip + configurable verify interval),
-    batched DB writes, short transactions, WAL.
-  • Proxy engine: racing multi-endpoint verification (first success wins),
-    configurable latency classification, weighted pool selection,
-    proxy-vs-target failure distinction, scope-aware bulk retest,
-    configurable live proxy sources (fetch → parse → dedupe → test → pool),
-    background auto-retest with configurable interval/batch.
-  • Channel auto-post: polished result card, real clipboard CopyTextButton
-    chunks (≤256 chars), share button, optional TXT attachment, async with
-    bounded exponential-backoff retries and error classification.
-  • Safety: no hardcoded secrets, friendly error messages, credential-safe
-    logs, startup config validation, rate-limit-safe Telegram wrappers.
-
-Privacy: only fetches URLs the operator is authorized to process. No CAPTCHA
-bypass, no login bypass, no private-account scraping.
-"""
-
 import os
 import re
 import io
@@ -45,6 +17,7 @@ import atexit
 import logging
 import shutil
 import subprocess
+import ipaddress
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -116,7 +89,7 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 3600.0) -
     return max(lo, min(hi, v))
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAE1FqoEyZhmV6eUP-qIP9xzCU32Mha5qQw").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAEe5s3pw5mRDoTSZDIbSKtSHf-YEhCXdVs").strip()  # REQUIRED env var — a token committed to source is a compromised token
 if not BOT_TOKEN:
     sys.stderr.write(
         "FATAL: BOT_TOKEN environment variable is not set.\n"
@@ -334,11 +307,26 @@ def _tor_download(url: str, dest: str) -> str:
 
 def _tor_extract(archive: str, dest: str) -> None:
     os.makedirs(dest, exist_ok=True)
+    dest_real = os.path.realpath(dest)
+
+    def _safe_member(member_name: str) -> bool:
+        p = os.path.realpath(os.path.join(dest, member_name))
+        return p == dest_real or p.startswith(dest_real + os.sep)
+
     if archive.endswith((".tar.gz", ".tgz")):
         with tarfile.open(archive, "r:gz") as tar:
-            tar.extractall(dest)
+            try:
+                tar.extractall(dest, filter="data")  # Python >= 3.12
+            except TypeError:
+                for m in tar.getmembers():
+                    if not _safe_member(m.name):
+                        raise RuntimeError("Unsafe path in Tor archive")
+                tar.extractall(dest)
     elif archive.endswith(".zip"):
         with zipfile.ZipFile(archive) as z:
+            for n in z.namelist():
+                if not _safe_member(n):
+                    raise RuntimeError("Unsafe path in Tor archive")
             z.extractall(dest)
     else:
         raise RuntimeError("Unsupported Tor archive type")
@@ -1819,13 +1807,21 @@ def _verify_exit_ip(p: dict, timeout: float) -> tuple:
             r = requests.get(ep, proxies=proxies, timeout=timeout,
                              headers={"User-Agent": _TEST_UA})
             latency = int((time.time() - t0) * 1000)
+            if r.status_code == 407:
+                auth_failed.set()
+                return
             if r.status_code == 200:
                 ip = r.text.strip()
                 if _IP_RE.match(ip) and "ip" not in result:
                     result["ip"] = ip
                     result["latency"] = latency
-        except requests.exceptions.ProxyAuthenticationRequired:
-            auth_failed.set()
+        except requests.exceptions.ProxyError as e:
+            # requests has no ProxyAuthenticationRequired — the old except clause
+            # raised AttributeError the moment ANY network error reached it
+            if "407" in str(e):
+                auth_failed.set()
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout):
+            result["timeouts"] = result.get("timeouts", 0) + 1
         except Exception:
             pass
 
@@ -1846,6 +1842,8 @@ def _verify_exit_ip(p: dict, timeout: float) -> tuple:
         return None, -407
     if "ip" in result:
         return result["ip"], result["latency"]
+    if result.get("timeouts", 0) >= 2:
+        return None, -2   # verification endpoints consistently timed out
     return None, -1
 
 
@@ -1879,6 +1877,11 @@ def test_proxy(p: dict, timeout: Optional[int] = None) -> dict:
                 "error": "host:port unreachable"}
 
     ip, latency = _verify_exit_ip(p, t)
+    if latency == -2:
+        # TIMEOUT is a real status now — before this it could never be returned,
+        # so the retest loop / cleanup branches keyed on it were dead code
+        return {"status": "TIMEOUT", "latency_ms": 0, "exit_ip": "",
+                "error": "proxy timed out during exit-ip verification"}
     if latency == -407:
         return {"status": "AUTH_FAILED", "latency_ms": 0, "exit_ip": "",
                 "error": "HTTP 407 proxy auth required"}
@@ -2293,8 +2296,7 @@ def bulk_test_proxies(scope: str = "all", progress_cb=None,
             sep=" ", timespec="seconds")
         rows += [r for r in list_proxies(limit=500, statuses=HEALTHY_STATUSES)
                  if (r["last_tested"] or "") < stale_cutoff]
-    if scope == "all":
-        rows = [r for r in rows if r["health_status"] != "WORKING" or True]
+    # scope "all": every stored proxy is eligible — the old filter was a no-op
     # de-dupe ids
     seen_ids = set()
     pending = []
@@ -3736,6 +3738,17 @@ def validate_url(text: str) -> Optional[str]:
     if host != "localhost" and "." not in host and not re.match(
             r"^\d{1,3}(\.\d{1,3}){3}$", host):
         return None
+    # SSRF hardening: never fetch loopback / private / reserved targets.
+    # (The old regex explicitly ACCEPTED localhost and any IP literal.)
+    if host.lower() == "localhost" or host.lower().endswith(".local"):
+        return None
+    try:
+        _ip = ipaddress.ip_address(host)
+        if (_ip.is_private or _ip.is_loopback or _ip.is_reserved
+                or _ip.is_link_local or _ip.is_multicast):
+            return None
+    except ValueError:
+        pass  # DNS hostname, not an IP literal
     if p.port is not None and not (1 <= p.port <= 65535):
         return None
     return t
@@ -3920,6 +3933,11 @@ def _start_job(chat_id, user, url, mode, visits):
     if not msg:
         safe_send_message(chat_id, "⚠️ Could not start the job. Please try again.")
         return
+    with _state_lock:
+        # Reserve the user's job slot BEFORE the worker thread starts so a fast
+        # double-tap can't launch a second job; the worker replaces this
+        # placeholder (-1) with the real job_id atomically on startup.
+        active_jobs[user.id] = -1
     threading.Thread(
         target=extraction_worker,
         args=(chat_id, user.id, user.username, url, visits, mode, msg.message_id),
@@ -4246,9 +4264,17 @@ def on_callback(c: types.CallbackQuery):
     chat_id = c.message.chat.id
     msg_id = c.message.message_id
 
-    # Access control — "Allow All" OFF locks callbacks too
+    # Access control — SAME policy as the message gate: restriction is active
+    # when Allow-All is OFF *or* the allowed-users list is non-empty (the old
+    # gate only checked Allow-All, so granted-list mode leaked every callback).
     if not is_admin(u.id):
-        if get_setting("allow_all", "1") != "1" and not is_allowed_user(u.id):
+        cu = get_user(u.id)
+        if cu and (cu["blocked"] or cu["status"] != "APPROVED"):
+            safe_answer_callback(c.id, "🚫 Access blocked.", show_alert=True)
+            return
+        allow_all = get_setting("allow_all", "1") == "1"
+        restricted = (not allow_all) or bool(list_allowed_users(limit=1))
+        if restricted and not is_allowed_user(u.id):
             safe_answer_callback(c.id, "🚫 Access restricted by admin.",
                                  show_alert=True)
             return
@@ -5066,16 +5092,22 @@ def _handle_proxy_add(chat_id, admin_id, text):
     audit_log(admin_id, "PROXY_ADDED", str(pid), text)
     clear_user_state(admin_id)
     safe_send_message(chat_id, f"✅ Proxy `#{pid}` added. Testing…")
-    res = test_proxy(p)
-    update_proxy_health(pid, res)
-    safe_send_message(
-        chat_id,
-        (f"🧪 *Test result — Proxy #{pid}*\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"Status: `{res['status']}`\n"
-         f"Latency: `{res['latency_ms']}ms`\n"
-         f"Exit IP: `{res['exit_ip'] or '—'}`"),
-        reply_markup=proxy_center_keyboard())
+
+    def _bg_test():
+        # TCP + HTTP verification can take 10–20s — never block a telebot
+        # handler thread on it
+        res = test_proxy(p)
+        update_proxy_health(pid, res)
+        safe_send_message(
+            chat_id,
+            (f"🧪 *Test result — Proxy #{pid}*\n"
+             f"━━━━━━━━━━━━━━━━━━━━\n"
+             f"Status: `{res['status']}`\n"
+             f"Latency: `{res['latency_ms']}ms`\n"
+             f"Exit IP: `{res['exit_ip'] or '—'}`"),
+            reply_markup=proxy_center_keyboard())
+
+    threading.Thread(target=_bg_test, daemon=True).start()
 
 
 def _handle_proxy_bulk(chat_id, admin_id, text):
@@ -5119,8 +5151,8 @@ def _show_proxy_sources(chat_id, edit_msg=False):
         v = cfg[f"proxy_source_{i}"]
         lines.append(f"Source {i}: `{_mask(v)[:45] if v else '— not set —'}`")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_Sources must return a plain-text proxy list (or a provider API "
-                 "configured with PROXY\\_PROVIDER\\_TOKEN env var)._")
+    lines.append("Sources must return a plain-text proxy list (or a provider API "
+                 "configured with the `PROXY_PROVIDER_TOKEN` env var).")
     mk = types.InlineKeyboardMarkup(row_width=3)
     mk.add(*[types.InlineKeyboardButton(f"🔌 Source {i}", callback_data=f"pxsrc_{i}")
              for i in (1, 2, 3)])
@@ -5155,6 +5187,7 @@ def _proxy_test_worker(chat_id, admin_id, scope, cancel_ev):
          f"━━━━━━━━━━━━━━━━━━━━\n`0%`"),
         reply_markup=mk)
     if not msg:
+        proxy_test_jobs.pop(admin_id, None)  # don't leave a phantom running entry
         return
     last_edit = [0.0]
 
@@ -5235,6 +5268,7 @@ def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev):
          "Fetching from configured sources…"),
         reply_markup=mk)
     if not msg:
+        proxy_fetch_jobs.pop(admin_id, None)  # don't leave a phantom running entry
         return
 
     sources = configured_proxy_sources()
@@ -5528,7 +5562,7 @@ def _show_admins(chat_id):
         lines.append(f"{r['role']} @{r['username'] or '—'} (`{r['user_id']}`)")
     lines.append(f"OWNER (env) admins: {', '.join(str(a) for a in ADMIN_IDS) or '—'}")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_Add admins via ADMIN\\_IDS env var._")
+    lines.append("Add admins via the `ADMIN_IDS` env var.")
     safe_send_message(chat_id, "\n".join(lines), reply_markup=admin_keyboard())
 
 
