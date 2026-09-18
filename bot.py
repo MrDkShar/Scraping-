@@ -37,7 +37,11 @@ import random
 import sqlite3
 import threading
 import urllib.parse
+import urllib.request
+import tarfile
+import zipfile
 import socket
+import atexit
 import logging
 import shutil
 import subprocess
@@ -53,6 +57,13 @@ try:
     _SOCKS_OK = True
 except Exception:
     _SOCKS_OK = False
+
+try:
+    from stem import Signal
+    from stem.control import Controller
+    _STEM_OK = True
+except Exception:
+    _STEM_OK = False
 
 import telebot
 from telebot import types
@@ -105,7 +116,7 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 3600.0) -
     return max(lo, min(hi, v))
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAEO4eCM9mobB95N1LXsWAeTAKSdcVaqI2Y").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAE1FqoEyZhmV6eUP-qIP9xzCU32Mha5qQw").strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "FATAL: BOT_TOKEN environment variable is not set.\n"
@@ -139,6 +150,15 @@ IP_MAX_PROXY_ATTEMPTS = _env_int("IP_MAX_PROXY_ATTEMPTS", 10, 1, 30)
 PROXY_RETEST_INTERVAL = _env_int("PROXY_RETEST_INTERVAL", 300, 60, 86400)
 PROXY_RETEST_BATCH = _env_int("PROXY_RETEST_BATCH", 30, 1, 200)
 PROXY_VERIFY_IP_INTERVAL = _env_int("PROXY_VERIFY_IP_INTERVAL", 300, 30, 86400)
+
+# FOX Tor engine — the official IP_ROTATION network layer (no external proxies)
+TOR_SOCKS_PORT = _env_int("TOR_SOCKS_PORT", 9050, 1024, 65535)
+TOR_CONTROL_PORT = _env_int("TOR_CONTROL_PORT", 9051, 1024, 65535)
+TOR_BOOTSTRAP_TIMEOUT = _env_int("TOR_BOOTSTRAP_TIMEOUT", 180, 30, 600)
+TOR_ROTATE_EVERY = _env_int("TOR_ROTATE_EVERY", 1, 1, 1000)
+TOR_MIN_ROTATE_INTERVAL = _env_int("TOR_MIN_ROTATE_INTERVAL", 10, 5, 600)
+TOR_IP_CHECK_URL = os.environ.get("TOR_IP_CHECK_URL", "https://checkip.amazonaws.com").strip()
+TOR_BASE_DIR = os.environ.get("TOR_HOME", os.path.join(os.path.expanduser("~"), ".fox_tor"))
 
 # Configurable latency classification (milliseconds)
 LAT_FAST_MAX = _env_int("LATENCY_FAST_MAX", 999, 100, 60000)
@@ -188,6 +208,491 @@ job_cancel: dict = {}             # job_id -> threading.Event
 job_owner: dict = {}              # job_id -> user_id
 proxy_test_jobs: dict = {}        # admin_id -> threading.Event (cancel bulk tests)
 proxy_fetch_jobs: dict = {}       # admin_id -> threading.Event (cancel fetches)
+
+# =========================================================
+# FOX TOR ENGINE — centralized TorManager service
+# (ported from IP-FOX: binary discovery, auto-install, torrc,
+#  process control, bootstrap monitor, NEWNYM rotation,
+#  IP verification — GUI removed, thread-safe, single source
+#  of truth for the IP_ROTATION network layer)
+# =========================================================
+TOR_IS_WINDOWS = os.name == "nt"
+TOR_CREATE_NO_WINDOW = 0x08000000 if TOR_IS_WINDOWS else 0
+TOR_BUNDLE_DIR = os.path.join(TOR_BASE_DIR, "tor_bundle")
+TOR_DATA_DIR = os.path.join(TOR_BASE_DIR, "tor_data")
+TORRC_PATH = os.path.join(TOR_BASE_DIR, "torrc")
+TOR_LOG_PATH = os.path.join(TOR_BASE_DIR, "tor.log")
+TOR_DOWNLOAD_DIR = os.path.join(TOR_BASE_DIR, "downloads")
+
+TOR_PROXIES = {
+    "http": f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}",
+    "https": f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}",
+}
+
+
+def _tor_write_torrc() -> None:
+    os.makedirs(TOR_BASE_DIR, exist_ok=True)
+    os.makedirs(TOR_DATA_DIR, exist_ok=True)
+    dp = TOR_DATA_DIR.replace("\\", "/")
+    lp = TOR_LOG_PATH.replace("\\", "/")
+    content = (
+        f"SocksPort {TOR_SOCKS_PORT}\n"
+        f"ControlPort {TOR_CONTROL_PORT}\n"
+        f"CookieAuthentication 0\n"
+        f"DataDirectory {dp}\n"
+        f"Log notice file {lp}\n"
+    )
+    with open(TORRC_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def _tor_find_exe() -> Optional[str]:
+    exe_name = "tor.exe" if TOR_IS_WINDOWS else "tor"
+    if os.path.isdir(TOR_BUNDLE_DIR):
+        for root, _dirs, files in os.walk(TOR_BUNDLE_DIR):
+            if exe_name in files:
+                return os.path.join(root, exe_name)
+    candidates = [
+        "/usr/bin/tor",
+        "/usr/local/bin/tor",
+        "/usr/sbin/tor",
+        os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")),
+                     "Desktop", "Tor Browser", "Browser", "TorBrowser", "Tor", "tor.exe"),
+        r"C:\Program Files\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
+        r"C:\Program Files (x86)\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return shutil.which("tor")
+
+
+def _tor_kill_all() -> bool:
+    killed = False
+    try:
+        if TOR_IS_WINDOWS:
+            r = subprocess.run(["taskkill", "/F", "/IM", "tor.exe"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=TOR_CREATE_NO_WINDOW)
+        else:
+            r = subprocess.run(["pkill", "-f", "tor"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        killed = (r.returncode == 0)
+    except Exception:
+        pass
+    if killed:
+        log.info("TOR killed lingering process(es)")
+    return killed
+
+
+def _tor_latest_url() -> tuple:
+    json_url = "https://aus1.torproject.org/torbrowser/update_3/release/downloads.json"
+    try:
+        req = urllib.request.Request(json_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.load(r)
+        version = data.get("version")
+        if version:
+            if TOR_IS_WINDOWS:
+                name = f"tor-expert-bundle-windows-x86_64-{version}.tar.gz"
+            elif sys.platform == "darwin":
+                name = f"tor-expert-bundle-macos-x86_64-{version}.tar.gz"
+            else:
+                name = f"tor-expert-bundle-linux-x86_64-{version}.tar.gz"
+            url = f"https://archive.torproject.org/tor-package-archive/torbrowser/{version}/{name}"
+            return url, version
+    except Exception:
+        pass
+    v = "13.5.4"
+    name = (f"tor-expert-bundle-windows-x86_64-{v}.tar.gz" if TOR_IS_WINDOWS
+            else f"tor-expert-bundle-linux-x86_64-{v}.tar.gz")
+    return f"https://archive.torproject.org/tor-package-archive/torbrowser/{v}/{name}", v
+
+
+def _tor_download(url: str, dest: str) -> str:
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=180) as r, open(dest, "wb") as f:
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+    return dest
+
+
+def _tor_extract(archive: str, dest: str) -> None:
+    os.makedirs(dest, exist_ok=True)
+    if archive.endswith((".tar.gz", ".tgz")):
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(dest)
+    elif archive.endswith(".zip"):
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(dest)
+    else:
+        raise RuntimeError("Unsupported Tor archive type")
+
+
+class TorManager:
+    """
+    Single owner of the Tor lifecycle: discover/install → start → bootstrap →
+    IP verify → NEWNYM rotation → health recovery → clean shutdown.
+    All public methods are thread-safe; rotation is atomic (one NEWNYM at a
+    time, rate-limited) no matter how many visit workers run in parallel.
+    """
+
+    def __init__(self):
+        self._proc = None
+        self._exe = None
+        self._ready = False
+        self._current_ip = ""
+        self._last_rotate_ts = 0.0
+        self._rotation_count = 0
+        self._rotation_log = deque(maxlen=200)   # rotation audit records
+        self._start_lock = threading.Lock()       # startup/restart serialized
+        self._rotation_lock = threading.Lock()    # NEWNYM serialized
+        self._ip_lock = threading.Lock()
+        self._monitor_started = False
+        self._shutdown = False
+
+    # ---------- lifecycle ----------
+    def exe_path(self) -> Optional[str]:
+        if self._exe and os.path.exists(self._exe):
+            return self._exe
+        self._exe = _tor_find_exe()
+        return self._exe
+
+    def install(self) -> Optional[str]:
+        """Auto-setup: download + extract the Tor Expert Bundle (from IP-FOX)."""
+        try:
+            url, ver = _tor_latest_url()
+            log.info("TOR_INSTALL version=%s url=%s", ver, url)
+            archive = os.path.join(TOR_DOWNLOAD_DIR, os.path.basename(url))
+            _tor_download(url, archive)
+            _tor_extract(archive, TOR_BUNDLE_DIR)
+            exe = _tor_find_exe()
+            if exe:
+                self._exe = exe
+                log.info("TOR_INSTALL_OK exe=%s", exe)
+            else:
+                log.warning("TOR_INSTALL extracted but binary not found")
+            return exe
+        except Exception as e:
+            log.warning("TOR_INSTALL_FAIL err=%s", _mask(str(e)[:150]))
+            return None
+
+    def is_running(self) -> bool:
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+        # adopt an already-running Tor that owns our SOCKS port
+        return self._socks_open()
+
+    def _socks_open(self) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", TOR_SOCKS_PORT), timeout=1.5):
+                return True
+        except Exception:
+            return False
+
+    def _control_ok(self) -> bool:
+        if not _STEM_OK:
+            return False
+        try:
+            with Controller.from_port(port=TOR_CONTROL_PORT) as c:
+                c.authenticate()
+            return True
+        except Exception:
+            return False
+
+    def start(self) -> bool:
+        """Launch Tor (or adopt a running one) and wait for the SOCKS port."""
+        with self._start_lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return True
+            if self._socks_open() and self._control_ok():
+                log.info("TOR adopted already-running instance")
+                return True
+            exe = self.exe_path()
+            if not exe:
+                return False
+            try:
+                _tor_kill_all()
+                time.sleep(0.5)
+                _tor_write_torrc()
+                self._proc = subprocess.Popen(
+                    [exe, "-f", TORRC_PATH],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=TOR_CREATE_NO_WINDOW,
+                )
+                for _ in range(90):
+                    if self._proc.poll() is not None:
+                        log.warning("TOR exited during startup — see %s", TOR_LOG_PATH)
+                        self._proc = None
+                        return False
+                    if self._socks_open():
+                        return True
+                    time.sleep(0.5)
+                log.warning("TOR SOCKS port did not open")
+                self._kill_proc()
+                return False
+            except Exception as e:
+                log.warning("TOR_START_FAIL err=%s", _mask(str(e)[:150]))
+                self._kill_proc()
+                return False
+
+    def wait_until_ready(self, timeout: int = None) -> tuple:
+        """Wait for bootstrap PROGRESS=100 via ControlPort."""
+        timeout = timeout or TOR_BOOTSTRAP_TIMEOUT
+        start = time.time()
+        last_phase = ""
+        while time.time() - start < timeout:
+            if self._shutdown:
+                return False, "shutdown"
+            if self._proc is not None and self._proc.poll() is not None:
+                return False, "Tor exited unexpectedly"
+            try:
+                with Controller.from_port(port=TOR_CONTROL_PORT) as c:
+                    c.authenticate()
+                    phase = c.get_info("status/bootstrap-phase", default="")
+                    if "PROGRESS=100" in phase:
+                        return True, phase
+                    last_phase = phase.strip()
+            except Exception:
+                pass
+            time.sleep(1)
+        return False, f"Timeout waiting for bootstrap ({last_phase or 'no progress'})"
+
+    def get_bootstrap_status(self) -> str:
+        try:
+            with Controller.from_port(port=TOR_CONTROL_PORT) as c:
+                c.authenticate()
+                return c.get_info("status/bootstrap-phase", default="unknown")
+        except Exception:
+            return "unavailable"
+
+    def ensure_ready(self, status_cb=None) -> bool:
+        """
+        FULL-AUTO entry point: config check → detect/install → start →
+        SOCKS/ControlPort verify → bootstrap 100% → public IP verify → READY.
+        Called lazily by the first IP_ROTATION job; idempotent afterwards.
+        """
+        with self._start_lock:
+            if self._ready and self.is_running():
+                return True
+            self._ready = False
+            if not _SOCKS_OK:
+                log.warning("TOR not ready: PySocks missing")
+                return False
+            if not _STEM_OK:
+                log.warning("TOR not ready: stem missing")
+                return False
+            try:
+                if status_cb:
+                    status_cb("🧅 Locating Tor…")
+                if not self.exe_path():
+                    if status_cb:
+                        status_cb("🧅 Installing Tor (one-time setup)…")
+                    if not self.install():
+                        return False
+                if status_cb:
+                    status_cb("🧅 Starting Tor…")
+                if not self.start():
+                    return False
+                if status_cb:
+                    status_cb("🧅 Bootstrapping Tor network…")
+                ok, info = self.wait_until_ready()
+                if not ok:
+                    log.warning("TOR bootstrap failed: %s", info)
+                    return False
+                if status_cb:
+                    status_cb("🧅 Verifying Tor exit IP…")
+                try:
+                    self._set_ip(self.get_current_ip())
+                except Exception as e:
+                    log.warning("TOR initial IP check failed: %s", _mask(str(e)[:120]))
+                self._ready = True
+                self._start_monitor()
+                log.info("TOR_READY ip=%s", self.current_ip() or "?")
+                return True
+            except Exception as e:
+                log.warning("TOR_READY_FAIL err=%s", _mask(str(e)[:150]))
+                return False
+
+    # ---------- IP / rotation ----------
+    def get_current_ip(self) -> str:
+        """Live exit-IP check THROUGH Tor (never direct). Only called on
+        READY/rotation — per-visit code uses the cached current_ip()."""
+        r = requests.get(TOR_IP_CHECK_URL, proxies=TOR_PROXIES, timeout=25)
+        r.raise_for_status()
+        return r.text.strip()
+
+    def current_ip(self) -> str:
+        with self._ip_lock:
+            return self._current_ip
+
+    def _set_ip(self, ip: str) -> None:
+        with self._ip_lock:
+            self._current_ip = ip
+
+    def request_newnym(self) -> None:
+        if not _STEM_OK:
+            raise RuntimeError("stem not installed")
+        with Controller.from_port(port=TOR_CONTROL_PORT) as c:
+            c.authenticate()
+            c.signal(Signal.NEWNYM)
+        time.sleep(3)  # let Tor build the fresh circuit
+
+    def rotate_and_verify(self, cancel_event: Optional[threading.Event] = None,
+                          force: bool = False) -> bool:
+        """
+        Atomic rotation: lock → previous IP → health → NEWNYM → wait →
+        verify public IP → record. Serialized across ALL workers and
+        rate-limited to respect Tor's NEWNYM constraints. Never fakes a
+        success: if the exit IP did not change, that is recorded honestly.
+        """
+        with self._rotation_lock:
+            now = time.time()
+            wait = TOR_MIN_ROTATE_INTERVAL - (now - self._last_rotate_ts)
+            if wait > 0 and not force:
+                # A circuit was rotated moments ago — reuse it rather than
+                # spam NEWNYM (Tor rate-limits it anyway).
+                if cancel_event is not None and cancel_event.wait(timeout=wait):
+                    return False
+                if cancel_event is None:
+                    time.sleep(wait)
+            if not self.health_check():
+                if not self.recover():
+                    return False
+            old_ip = self.current_ip()
+            try:
+                self.request_newnym()
+            except Exception as e:
+                log.warning("TOR_NEWNYM_FAIL err=%s", _mask(str(e)[:120]))
+                return False
+            self._last_rotate_ts = time.time()
+            self._rotation_count += 1
+            try:
+                new_ip = self.get_current_ip()
+            except Exception as e:
+                log.warning("TOR verify-after-rotate failed: %s", _mask(str(e)[:100]))
+                new_ip = ""
+            changed = bool(new_ip) and new_ip != old_ip
+            self._rotation_log.append({
+                "ts": datetime.utcnow().isoformat(timespec="seconds"),
+                "rotation_id": self._rotation_count,
+                "old_ip": old_ip or "-", "new_ip": new_ip or "-",
+                "changed": changed,
+            })
+            if new_ip:
+                self._set_ip(new_ip)
+            log.info("TOR_ROTATE id=%s old=%s new=%s changed=%s",
+                     self._rotation_count, old_ip or "-", new_ip or "-", changed)
+            return True
+
+    def proxy_dict(self) -> dict:
+        """Drop-in proxy dict for Scraper/proxy_to_requests — routes through
+        local Tor SOCKS5H (remote DNS). This is the ONLY network path used
+        by IP_ROTATION visits; no external proxy pool involvement."""
+        return {"protocol": "socks5h", "host": "127.0.0.1", "port": TOR_SOCKS_PORT,
+                "username": "", "password": "",
+                "endpoint": f"127.0.0.1:{TOR_SOCKS_PORT}"}
+
+    # ---------- health / recovery ----------
+    def health_check(self) -> bool:
+        """Process alive + SOCKS reachable (+ ControlPort when we own it)."""
+        if self._proc is not None and self._proc.poll() is not None:
+            return False
+        if not self._socks_open():
+            return False
+        if self._proc is not None and not self._control_ok():
+            return False
+        return True
+
+    def recover(self) -> bool:
+        """Adaptive recovery: restart a dead Tor, re-bootstrap, re-verify IP.
+        Called on repeated transport failures — never per target failure."""
+        log.warning("TOR_RECOVERY attempting controlled restart")
+        with self._start_lock:
+            self._ready = False
+            self._kill_proc()
+            _tor_kill_all()
+            time.sleep(1)
+            if not self.start():
+                return False
+            ok, _info = self.wait_until_ready()
+            if not ok:
+                return False
+            try:
+                self._set_ip(self.get_current_ip())
+            except Exception:
+                pass
+            self._ready = True
+            log.info("TOR_RECOVERED ip=%s", self.current_ip() or "?")
+            return True
+
+    def _start_monitor(self) -> None:
+        if self._monitor_started:
+            return
+        self._monitor_started = True
+
+        def _loop():
+            fails = 0
+            while not self._shutdown:
+                time.sleep(30)
+                if self._shutdown or not self._ready:
+                    continue
+                if self.health_check():
+                    fails = 0
+                    continue
+                fails += 1
+                log.warning("TOR_MONITOR degraded (%s/2)", fails)
+                if fails >= 2:
+                    self.recover()
+                    fails = 0
+        threading.Thread(target=_loop, daemon=True, name="tor-monitor").start()
+
+    def status_dict(self) -> dict:
+        return {
+            "running": self.is_running(),
+            "ready": self._ready,
+            "ip": self.current_ip(),
+            "bootstrap": self.get_bootstrap_status() if self.is_running() else "stopped",
+            "rotations": self._rotation_count,
+            "exe": self._exe or "",
+        }
+
+    # ---------- shutdown ----------
+    def _kill_proc(self) -> None:
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=6)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+        except Exception:
+            pass
+        self._proc = None
+
+    def stop(self) -> None:
+        with self._start_lock:
+            self._ready = False
+            self._kill_proc()
+            log.info("TOR stopped")
+
+    def restart(self) -> bool:
+        self.stop()
+        time.sleep(0.5)
+        return self.ensure_ready()
+
+    def shutdown(self) -> None:
+        """Clean shutdown: stop monitor + terminate the Tor process we own."""
+        self._shutdown = True
+        self._ready = False
+        self._kill_proc()
+
+
+tor_manager = TorManager()
 
 # =========================================================
 # Database
@@ -2158,6 +2663,19 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
     log.info("JOB_START job=%s user=%s mode=%s visits=%s url=%s",
              job_id, user_id, mode, count, _mask(url))
 
+    # --- FULL-AUTO Tor pre-flight: install/start/bootstrap/verify on demand ---
+    tor_ok = True
+    if mode == "IP_ROTATION":
+        _emit(st, "🧅 Starting Tor engine…", proxy_protocol="TOR")
+        tor_ok = tor_manager.ensure_ready(status_cb=lambda s: _emit(st, s))
+        if tor_ok:
+            _emit(st, "🧅 Tor ready", proxy_protocol="TOR",
+                  exit_ip=tor_manager.current_ip())
+        else:
+            _emit(st, "Tor engine unavailable")
+    tor_rot_lock = threading.Lock()
+    tor_visit_counter = [0]
+
     if mode == "IP_ROTATION":
         max_workers = max(1, int(get_setting("ip_turbo_concurrency",
                                              str(IP_TURBO_CONCURRENCY))))
@@ -2181,86 +2699,62 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
         status_code = 0
 
         if mode == "IP_ROTATION":
-            proxies = proxy_pool.select(count=1)
-            if not proxies:
+            # Official network layer: TorManager → SOCKS5H → target.
+            # No external proxy list, no provider, no proxy_pool involvement.
+            if not tor_ok:
                 with st["lock"]:
                     st["visit"] += 1
                     st["failed"] += 1
                     st["speed_window"].append((time.time(), st["visit"]))
-                pending_attempts.append((job_id, visit, None, "", "NO_PROXY", 0,
-                                         "no verified proxy available"))
+                pending_attempts.append((job_id, visit, None, "", "TOR_UNAVAILABLE", 0,
+                                         "Tor engine not ready"))
                 return
-            proxy_row = proxies[0]
-            proxy_dict = {k: proxy_row[k] for k in
-                          ("protocol", "host", "port", "username", "password", "endpoint")}
-            attempt_proxy_id = proxy_row["id"]
-            # Always use cached IP — NEVER make an extra IP-check request per visit
-            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
-            _emit(st, "Fetching via proxy…",
-                  proxy_protocol=proxy_row["protocol"].upper(),
-                  exit_ip=attempt_exit_ip)
-
-            # TURBO: keep rotating through fresh proxies until one works.
-            # Each failed proxy is auto-marked and never retried in this visit.
-            max_attempts = max(3, int(get_setting("ip_max_proxy_attempts",
-                                                  str(IP_MAX_PROXY_ATTEMPTS))))
-            tried_ids = set()
+            # Rotation policy — MODE A: rotate every N visits.
+            # Rotation itself is atomic + rate-limited inside TorManager.
+            rotate_every = max(1, int(get_setting("tor_rotate_every", str(TOR_ROTATE_EVERY))))
+            with tor_rot_lock:
+                tor_visit_counter[0] += 1
+                due = tor_visit_counter[0] > 1 and (tor_visit_counter[0] - 1) % rotate_every == 0
+            if due and not cancel_event.is_set():
+                _emit(st, "🧅 Rotating Tor circuit…")
+                tor_manager.rotate_and_verify(cancel_event)
+                _emit(st, "🧅 Circuit ready", exit_ip=tor_manager.current_ip())
+            _emit(st, "Fetching via Tor…", proxy_protocol="TOR",
+                  exit_ip=tor_manager.current_ip())
             last_status = "REQUEST_FAILED"
-            for attempt in range(max_attempts):
+            for attempt in range(max_retries + 1):
                 if cancel_event.is_set():
-                    proxy_pool.release(proxy_row["id"])
                     return
                 t0 = time.time()
                 try:
-                    scraper = Scraper(proxy=proxy_dict)
+                    # Session isolation: fresh session per visit — no cross-target
+                    # cookies and no stale connections surviving a circuit rotation.
+                    scraper = Scraper(proxy=tor_manager.proxy_dict(), session=_new_session())
                     final_url, body, visited, status_code = scraper.fetch(
                         url, cancel_event=cancel_event)
                     attempt_latency = int((time.time() - t0) * 1000)
-                    # Use cached IP — zero extra network calls per visit
-                    attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
+                    attempt_exit_ip = tor_manager.current_ip()
                     ok = True
                     break
                 except JobCancelled:
-                    proxy_pool.release(proxy_row["id"])
                     return
                 except Exception as e:
                     attempt_latency = int((time.time() - t0) * 1000)
                     attempt_err = str(e)[:120]
                     last_status = _classify_err(e)
                     status_code = 0
-                    # proxy-layer failure → mark proxy; target failure → keep proxy
-                    if _is_proxy_error(last_status):
-                        proxy_pool.mark_used_failure(
-                            proxy_row["id"],
-                            "AUTH_FAILED" if last_status == "AUTH_FAILED" else "TCP_FAILED",
-                            attempt_err)
-                    else:
-                        update_proxy_health(proxy_row["id"],
-                                            {"status": "TARGET_FAILED", "latency_ms": 0,
-                                             "exit_ip": "", "error": attempt_err})
-                        proxy_pool.release(proxy_row["id"])
-                    tried_ids.add(proxy_row["id"])
-                    # permanent target-level failures are not retried
                     if last_status == "DNS_FAILED":
-                        break
-                    # retry with a DIFFERENT fresh proxy — always, not just "safely"
-                    if attempt < max_attempts - 1:
-                        nxt = proxy_pool.select(count=1, exclude=tried_ids)
-                        if nxt:
-                            proxy_row = nxt[0]
-                            proxy_dict = {k: proxy_row[k] for k in
-                                          ("protocol", "host", "port", "username",
-                                           "password", "endpoint")}
-                            attempt_proxy_id = proxy_row["id"]
-                            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
-                            _emit(st, "Rotating to fresh proxy…")
-                            continue
+                        break  # permanent target failure — never retried
+                    if attempt < max_retries:
+                        # transport failure → check Tor health, recover, back off
+                        if not tor_manager.health_check():
+                            _emit(st, "🧅 Tor degraded — recovering…")
+                            tor_manager.recover()
+                        time.sleep(min(2 ** attempt, 8))  # bounded exponential backoff
+                        continue
                     break
             if ok:
                 attempt_status = "OK" if attempt == 0 else "OK_RETRY"
-                # Mark success WITHOUT verifying exit IP (no network call = fast)
-                proxy_pool.mark_used_success(proxy_row["id"], attempt_latency,
-                                             attempt_exit_ip)
             else:
                 attempt_status = last_status
         else:
@@ -2280,36 +2774,27 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                 attempt_status = _classify_err(e)
                 attempt_latency = int((time.time() - t0) * 1000)
 
-        # --- IP mode: target blocked the exit IP (403/429/5xx) → rotate & retry ---
+        # --- Tor mode: target blocked the exit IP (403/429/5xx) → NEWNYM & retry ---
         if ok and mode == "IP_ROTATION" and (
                 status_code in (403, 429) or 500 <= status_code < 600):
             for _ in range(3):
                 if cancel_event.is_set():
                     break
-                nxt = proxy_pool.select(count=1)
-                if not nxt:
+                _emit(st, "🧅 Target blocked — rotating circuit…")
+                if not tor_manager.rotate_and_verify(cancel_event, force=True):
                     break
-                nrow = nxt[0]
-                ndict = {k: nrow[k] for k in
-                         ("protocol", "host", "port", "username",
-                          "password", "endpoint")}
                 try:
-                    scraper = Scraper(proxy=ndict)
+                    scraper = Scraper(proxy=tor_manager.proxy_dict(), session=_new_session())
                     final_url, body, visited, status_code = scraper.fetch(
                         url, cancel_event=cancel_event)
-                    proxy_pool.mark_used_success(
-                        nrow["id"], 0, nrow.get("last_observed_ip") or "")
+                    attempt_exit_ip = tor_manager.current_ip()
                     if status_code < 400:
-                        attempt_proxy_id = nrow["id"]
-                        attempt_exit_ip = nrow.get("last_observed_ip") or ""
-                        _emit(st, "Rotated past target block…")
+                        _emit(st, "🧅 Rotated past target block…")
                         break
                 except JobCancelled:
-                    proxy_pool.release(nrow["id"])
                     return
                 except Exception:
-                    proxy_pool.mark_used_failure(nrow["id"], "TCP_FAILED",
-                                                 "block-rotate retry failed")
+                    pass
 
         # --- target-level permanent failures are NOT retried (404 etc.) ---
         if ok and status_code >= 400:
@@ -2492,6 +2977,7 @@ def friendly_error(status: str) -> str:
         "HTTP_404": "🔎 Target returned 404 (not found)",
         "HTTP_429": "⏳ Target rate-limited (429)",
         "NO_PROXY": "🌐 No verified proxy available",
+        "TOR_UNAVAILABLE": "🧅 Tor engine unavailable",
         "TARGET_FAILED": "🎯 Target request failed",
     }.get(status, "❌ Request failed")
 
@@ -5085,6 +5571,8 @@ def startup_self_check():
     except Exception as e:
         checks.append(f"❌ Proxy Manager: {e}")
     checks.append(f"{'✅' if _SOCKS_OK else '❌'} SOCKS5 support")
+    checks.append(f"{'✅' if _STEM_OK else '❌'} Tor control (stem)")
+    checks.append(f"🧅 Tor binary: {tor_manager.exe_path() or 'auto-installs on first IP Rotation job'}")
     ch = get_setting("channel_username", DEFAULT_CHANNEL)
     checks.append(f"📡 Channel: {ch or 'not configured'}")
     srcs = configured_proxy_sources()
@@ -5100,6 +5588,7 @@ def startup_self_check():
 
 
 def main():
+    atexit.register(tor_manager.shutdown)  # clean Tor shutdown on exit
     checks = startup_self_check()
     if not any("Telegram API: @" in c for c in checks):
         sys.stderr.write("FATAL: Telegram API unreachable at startup. "
