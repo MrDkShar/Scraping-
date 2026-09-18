@@ -105,7 +105,7 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 3600.0) -
     return max(lo, min(hi, v))
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAFkO8gV-CdCitVcVD2-0dPSC0Yz_VP-toM").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAGGQYTA-LPWR5wX0BPPbB9ay8UNJY41DQg").strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "FATAL: BOT_TOKEN environment variable is not set.\n"
@@ -123,17 +123,19 @@ ADMIN_IDS = [
 DB_PATH = os.environ.get("DATABASE_PATH", "bot_database.db")
 DEFAULT_CHANNEL = os.environ.get("CHANNEL_USERNAME", "")
 
-REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 10, 2, 120)
-CONNECT_TIMEOUT = _env_int("CONNECT_TIMEOUT", 5, 1, 60)
-READ_TIMEOUT = _env_int("READ_TIMEOUT", 8, 1, 120)
-MAX_CONCURRENCY = _env_int("MAX_CONCURRENCY", 32, 1, 64)
+REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 15, 2, 120)
+CONNECT_TIMEOUT = _env_int("CONNECT_TIMEOUT", 6, 1, 60)
+READ_TIMEOUT = _env_int("READ_TIMEOUT", 10, 1, 120)
+MAX_CONCURRENCY = _env_int("MAX_CONCURRENCY", 8, 1, 32)
 PROGRESS_INTERVAL = _env_float("PROGRESS_INTERVAL", 1.0, 0.5, 10.0)
 MAX_VISITS_PER_JOB = _env_int("MAX_VISITS_PER_JOB", 100, 1, 500)
 MAX_RESPONSE_SIZE = _env_int("MAX_RESPONSE_SIZE", 5 * 1024 * 1024, 65536, 50 * 1024 * 1024)
 MAX_REDIRECTS = _env_int("MAX_REDIRECTS", 10, 1, 30)
-MAX_RETRIES_PER_VISIT = _env_int("MAX_RETRIES_PER_VISIT", 3, 0, 5)
-PROXY_TEST_CONCURRENCY = _env_int("PROXY_TEST_CONCURRENCY", 32, 1, 128)
-PROXY_HEALTH_TIMEOUT = _env_int("PROXY_HEALTH_TIMEOUT", 8, 2, 60)
+MAX_RETRIES_PER_VISIT = _env_int("MAX_RETRIES_PER_VISIT", 2, 0, 5)
+PROXY_TEST_CONCURRENCY = _env_int("PROXY_TEST_CONCURRENCY", 48, 1, 128)
+PROXY_HEALTH_TIMEOUT = _env_int("PROXY_HEALTH_TIMEOUT", 6, 2, 60)
+IP_TURBO_CONCURRENCY = _env_int("IP_TURBO_CONCURRENCY", 24, 1, 64)
+IP_MAX_PROXY_ATTEMPTS = _env_int("IP_MAX_PROXY_ATTEMPTS", 10, 1, 30)
 PROXY_RETEST_INTERVAL = _env_int("PROXY_RETEST_INTERVAL", 300, 60, 86400)
 PROXY_RETEST_BATCH = _env_int("PROXY_RETEST_BATCH", 30, 1, 200)
 PROXY_VERIFY_IP_INTERVAL = _env_int("PROXY_VERIFY_IP_INTERVAL", 300, 30, 86400)
@@ -152,6 +154,16 @@ PROXY_SOURCES_ENV = [
     os.environ.get(f"PROXY_SOURCE_{i}", "").strip()
     for i in (1, 2, 3)
     if os.environ.get(f"PROXY_SOURCE_{i}", "").strip()
+]
+
+# Built-in public proxy lists — used automatically when the admin has not
+# configured any PROXY_SOURCE_* URLs, so "Fetch Latest" works out of the box.
+BUILTIN_PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
 ]
 
 BOOTSTRAP_OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
@@ -384,6 +396,7 @@ def init_db() -> None:
 _DEFAULT_SETTINGS = {
     "maintenance_mode": "0",
     "approval_mode": "0",
+    "allow_all": "1",
     "channel_logging": "0",
     "channel_username": DEFAULT_CHANNEL,
     "support_username": "",
@@ -392,11 +405,12 @@ _DEFAULT_SETTINGS = {
     "request_timeout": str(REQUEST_TIMEOUT),
     "connect_timeout": str(CONNECT_TIMEOUT),
     "read_timeout": str(READ_TIMEOUT),
-    "allow_all_users": "1",   # 1=anyone with APPROVED status can use bot; 0=allowed_users list enforced
     "proxy_enabled": "1",
-    "max_concurrency": str(MAX_CONCURRENCY),  # default 32 — turbo mode
+    "max_concurrency": str(MAX_CONCURRENCY),  # default 8 for fast proxy rotation
     "progress_interval": str(PROGRESS_INTERVAL),
     "max_retries_per_visit": str(MAX_RETRIES_PER_VISIT),
+    "ip_turbo_concurrency": str(IP_TURBO_CONCURRENCY),
+    "ip_max_proxy_attempts": str(IP_MAX_PROXY_ATTEMPTS),
     "channel_include_username": "1",
     "channel_include_uid": "0",
     "channel_include_method": "1",
@@ -1484,10 +1498,18 @@ class ProxyPool:
             finally:
                 conn.close()
 
-    def select(self, count: int = 1) -> list:
+    def select(self, count: int = 1, exclude: Optional[set] = None) -> list:
         """Lease up to `count` distinct healthy proxies (weighted, no immediate reuse)."""
         with self._lock:
             avail = self.healthy_proxies()
+            if exclude:
+                filtered = [r for r in avail if r["id"] not in exclude]
+                if filtered:
+                    avail = filtered
+            # speed: prefer verified FAST/WORKING proxies when we have enough
+            quick = [r for r in avail if r["health_status"] in ("FAST", "WORKING")]
+            if len(quick) >= 3:
+                avail = quick
             if not avail:
                 return []
             now = time.time()
@@ -1653,8 +1675,9 @@ def bulk_test_proxies(scope: str = "all", progress_cb=None,
 # =========================================================
 def configured_proxy_sources() -> list:
     cfg = get_settings_batch(["proxy_source_1", "proxy_source_2", "proxy_source_3"])
-    return [cfg[k].strip() for k in ("proxy_source_1", "proxy_source_2", "proxy_source_3")
+    srcs = [cfg[k].strip() for k in ("proxy_source_1", "proxy_source_2", "proxy_source_3")
             if cfg[k].strip()]
+    return srcs if srcs else list(BUILTIN_PROXY_SOURCES)
 
 
 def fetch_proxy_source(url: str, timeout: int = 30) -> str:
@@ -1738,47 +1761,24 @@ def last_proxy_fetch() -> Optional[dict]:
 # Number Extraction Pipeline
 # =========================================================
 _WA_PATTERNS = [
-    # wa.me — primary signal, highest confidence
     (re.compile(r'wa\.me/(?:message/[A-Za-z0-9]+[^"\s]*?)?(\+?\d{6,15})', re.IGNORECASE), "wa.me"),
-    # URL query params covering all common field names
-    (re.compile(r'(?:phone|number|mobile|tel|to|recipient|send_to|wa|contact|ph)=(\+?\d{6,15})', re.IGNORECASE), "query_parameter"),
-    # WhatsApp deeplink variants
-    (re.compile(r'whatsapp://send[/?].*?phone=(\+?\d{6,15})', re.IGNORECASE), "whatsapp_url"),
+    (re.compile(r'(?:phone|number|mobile|tel|to|recipient|send_to)=(\+?\d{6,15})', re.IGNORECASE), "query_parameter"),
+    (re.compile(r'whatsapp://send\?phone=(\+?\d{6,15})', re.IGNORECASE), "whatsapp_url"),
     (re.compile(r'api\.whatsapp\.com/send[/?][^"\'\s]*phone=(\+?\d{6,15})', re.IGNORECASE), "whatsapp_api"),
     (re.compile(r'web\.whatsapp\.com/send[/?][^"\'\s]*phone=(\+?\d{6,15})', re.IGNORECASE), "whatsapp_web"),
     (re.compile(r'whatsapp\.com/send[/?][^"\'\s]*phone=(\+?\d{6,15})', re.IGNORECASE), "whatsapp_url"),
-    # Standard tel: links
     (re.compile(r'tel:(\+?\d{6,15})', re.IGNORECASE), "tel_link"),
-    # Android intent
     (re.compile(r'intent://send/(\+?\d{6,15})', re.IGNORECASE), "intent"),
-    # URL fragment
-    (re.compile(r'#(?:phone|number|mobile|wa)=(\+?\d{6,15})', re.IGNORECASE), "url_fragment"),
-    # Inline text: "Call us: +91XXXXXXXXXX" / "Contact: 91XXXXXXXXXX" patterns in HTML body
-    (re.compile(r'(?:call|contact|whatsapp|reach|chat)\s*(?:us|now|me|here|at|on|:)\s*[:\-]?\s*(\+?(?:91|0)?[6-9]\d{9})', re.IGNORECASE), "inline_text"),
-    # Standalone Indian mobile — only when anchored by word boundary to reduce noise
-    (re.compile(r'(?<![0-9])(\+?91[6-9]\d{9})(?![0-9])', re.IGNORECASE), "india_mobile_91"),
-    (re.compile(r'(?<![0-9])(0[6-9]\d{9})(?![0-9])'), "india_mobile_0"),
+    (re.compile(r'#(?:phone|number)=(\+?\d{6,15})', re.IGNORECASE), "url_fragment"),
 ]
 
 _JSON_FIELD_RE = re.compile(
-    r'"(?:phone|phone_number|mobile|mobile_number|whatsapp|wa_number|wa|recipient|'
-    r'send_to|number|to|contact|ph|cell)"\s*:\s*"(\+?\d{6,15})"',
+    r'"(?:phone|phone_number|mobile|mobile_number|whatsapp|wa_number|recipient|send_to|number|to)"\s*:\s*"(\+?\d{6,15})"',
     re.IGNORECASE,
 )
 
 _ATTR_RE = re.compile(
-    r'(?:href|data-phone|data-mobile|data-whatsapp|data-number|data-tel|data-wa|data-contact)\s*=\s*["\']([^"\']*\+?\d{6,15}[^"\']*)["\']',
-    re.IGNORECASE,
-)
-
-# Catches numbers in plain text nodes inside <p>, <span>, <div>, <a> tags
-_HTML_TEXT_PHONE_RE = re.compile(
-    r'>\s*(\+?(?:91|0)[6-9]\d{9})\s*<',
-)
-
-# Catches numbers in data-* attributes with arbitrary names
-_DATA_ATTR_ANY_RE = re.compile(
-    r'data-[a-z\-]+\s*=\s*["\'](\+?(?:91)?[6-9]\d{9})["\']',
+    r'(?:href|data-phone|data-mobile|data-whatsapp|data-number|data-tel)\s*=\s*["\']([^"\']*\+?\d{6,15}[^"\']*)["\']',
     re.IGNORECASE,
 )
 
@@ -1793,23 +1793,10 @@ _JS_LOCATION_RE = re.compile(
 
 
 def _looks_like_false_positive(digits: str) -> bool:
-    """Reject timestamps, IDs, order numbers and random long numeric strings.
-    Never rejects valid Indian mobile numbers (10-digit 6-9 prefix, 12-digit 91+6-9)."""
+    """Reject timestamps, IDs, order numbers and random long numeric strings."""
     n = len(digits)
     if n < NUM_MIN_LEN or n > NUM_MAX_LEN:
         return True
-
-    # Fast-pass: Indian mobile patterns are never false positives
-    # 10-digit starting with 6-9 (bare mobile)
-    if n == 10 and digits[0] in "6789":
-        return False
-    # 12-digit starting with 91 + 6-9 (country code + mobile)
-    if n == 12 and digits[:2] == "91" and digits[2] in "6789":
-        return False
-    # 11-digit starting with 0 + 6-9 (STD + mobile)
-    if n == 11 and digits[0] == "0" and digits[1] in "6789":
-        return False
-
     # unix timestamps (s/ms/us) — 10 digits starting 1xxx for plausible years
     if n == 10 and digits[0] == "1" and digits[1] in "0123456789":
         try:
@@ -1820,15 +1807,10 @@ def _looks_like_false_positive(digits: str) -> bool:
             pass
     if n == 13 and digits.startswith(("15", "16", "17", "18", "19", "20")):
         return True  # epoch milliseconds
-
-    # all same digit / obvious sequences — likely an ID or placeholder
+    # all same digit / obvious sequences
     if len(set(digits)) <= 2:
         return True
     if digits in ("0123456789" * 2, "1234567890" * 2):
-        return True
-    # Repeating-block patterns (e.g. 123123123123)
-    half = digits[:n // 2]
-    if half and digits == half * (n // len(half)):
         return True
     return False
 
@@ -1846,51 +1828,30 @@ def _normalize(raw: str) -> Optional[str]:
 
 
 def extract_numbers(text: str, source: str, default_method: str = "html") -> list:
-    """Return list of (normalized, method) tuples found in text.
-    Applies every pattern layer in order of confidence; stops adding dupes."""
+    """Return list of (normalized, method) tuples found in text."""
     if not text:
         return []
     out, seen = [], set()
     decoded = urllib.parse.unquote(text)
     decoded2 = urllib.parse.unquote(decoded)
-    # Samples: raw, single-decoded, double-decoded (covers %2B91%2C etc.)
-    samples = [text, decoded]
-    if decoded2 != decoded:
-        samples.append(decoded2)
-
+    samples = {text, decoded, decoded2}
     for sample in samples:
-        # Layer 1: explicit URL/WA patterns
         for pat, method in _WA_PATTERNS:
             for m in pat.findall(sample):
-                raw = m if isinstance(m, str) else m[0]
-                n = _normalize(raw)
+                n = _normalize(m)
                 if n and n not in seen:
                     seen.add(n)
                     out.append((n, method))
-        # Layer 2: JSON field names
         for m in _JSON_FIELD_RE.findall(sample):
             n = _normalize(m)
             if n and n not in seen:
                 seen.add(n)
                 out.append((n, "json_field"))
-        # Layer 3: HTML attribute values
         for m in _ATTR_RE.findall(sample):
             n = _normalize(m)
             if n and n not in seen:
                 seen.add(n)
                 out.append((n, "html_attribute"))
-        # Layer 4: data-* attributes with arbitrary names
-        for m in _DATA_ATTR_ANY_RE.findall(sample):
-            n = _normalize(m)
-            if n and n not in seen:
-                seen.add(n)
-                out.append((n, "data_attr"))
-        # Layer 5: numbers visible in HTML text nodes (between tags)
-        for m in _HTML_TEXT_PHONE_RE.findall(sample):
-            n = _normalize(m)
-            if n and n not in seen:
-                seen.add(n)
-                out.append((n, "html_text"))
     return out
 
 
@@ -2197,7 +2158,11 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
     log.info("JOB_START job=%s user=%s mode=%s visits=%s url=%s",
              job_id, user_id, mode, count, _mask(url))
 
-    max_workers = max(1, int(get_setting("max_concurrency", str(MAX_CONCURRENCY))))
+    if mode == "IP_ROTATION":
+        max_workers = max(1, int(get_setting("ip_turbo_concurrency",
+                                             str(IP_TURBO_CONCURRENCY))))
+    else:
+        max_workers = max(1, int(get_setting("max_concurrency", str(MAX_CONCURRENCY))))
     max_retries = int(get_setting("max_retries_per_visit", str(MAX_RETRIES_PER_VISIT)))
 
     # --- single visit (runs inside worker pool) ---
@@ -2235,9 +2200,13 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                   proxy_protocol=proxy_row["protocol"].upper(),
                   exit_ip=attempt_exit_ip)
 
-            tries = 1 + max_retries
+            # TURBO: keep rotating through fresh proxies until one works.
+            # Each failed proxy is auto-marked and never retried in this visit.
+            max_attempts = max(3, int(get_setting("ip_max_proxy_attempts",
+                                                  str(IP_MAX_PROXY_ATTEMPTS))))
+            tried_ids = set()
             last_status = "REQUEST_FAILED"
-            for attempt in range(tries):
+            for attempt in range(max_attempts):
                 if cancel_event.is_set():
                     proxy_pool.release(proxy_row["id"])
                     return
@@ -2270,9 +2239,13 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                                             {"status": "TARGET_FAILED", "latency_ms": 0,
                                              "exit_ip": "", "error": attempt_err})
                         proxy_pool.release(proxy_row["id"])
-                    # retry with a DIFFERENT proxy only when safely retryable
-                    if attempt < tries - 1 and _is_retryable_target(0, last_status):
-                        nxt = proxy_pool.select(count=1)
+                    tried_ids.add(proxy_row["id"])
+                    # permanent target-level failures are not retried
+                    if last_status == "DNS_FAILED":
+                        break
+                    # retry with a DIFFERENT fresh proxy — always, not just "safely"
+                    if attempt < max_attempts - 1:
+                        nxt = proxy_pool.select(count=1, exclude=tried_ids)
                         if nxt:
                             proxy_row = nxt[0]
                             proxy_dict = {k: proxy_row[k] for k in
@@ -2280,7 +2253,7 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                                            "password", "endpoint")}
                             attempt_proxy_id = proxy_row["id"]
                             attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
-                            _emit(st, "Retrying with alternate proxy…")
+                            _emit(st, "Rotating to fresh proxy…")
                             continue
                     break
             if ok:
@@ -2306,6 +2279,37 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                 attempt_err = str(e)[:120]
                 attempt_status = _classify_err(e)
                 attempt_latency = int((time.time() - t0) * 1000)
+
+        # --- IP mode: target blocked the exit IP (403/429/5xx) → rotate & retry ---
+        if ok and mode == "IP_ROTATION" and (
+                status_code in (403, 429) or 500 <= status_code < 600):
+            for _ in range(3):
+                if cancel_event.is_set():
+                    break
+                nxt = proxy_pool.select(count=1)
+                if not nxt:
+                    break
+                nrow = nxt[0]
+                ndict = {k: nrow[k] for k in
+                         ("protocol", "host", "port", "username",
+                          "password", "endpoint")}
+                try:
+                    scraper = Scraper(proxy=ndict)
+                    final_url, body, visited, status_code = scraper.fetch(
+                        url, cancel_event=cancel_event)
+                    proxy_pool.mark_used_success(
+                        nrow["id"], 0, nrow.get("last_observed_ip") or "")
+                    if status_code < 400:
+                        attempt_proxy_id = nrow["id"]
+                        attempt_exit_ip = nrow.get("last_observed_ip") or ""
+                        _emit(st, "Rotated past target block…")
+                        break
+                except JobCancelled:
+                    proxy_pool.release(nrow["id"])
+                    return
+                except Exception:
+                    proxy_pool.mark_used_failure(nrow["id"], "TCP_FAILED",
+                                                 "block-rotate retry failed")
 
         # --- target-level permanent failures are NOT retried (404 etc.) ---
         if ok and status_code >= 400:
@@ -2962,6 +2966,7 @@ def visits_keyboard(max_visits: int) -> types.InlineKeyboardMarkup:
 
 
 def admin_keyboard() -> types.InlineKeyboardMarkup:
+    allow_all = get_setting("allow_all", "1") == "1"
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.add(
         types.InlineKeyboardButton("📊 Dashboard", callback_data="adm_dashboard"),
@@ -2975,6 +2980,9 @@ def admin_keyboard() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("👮 Admins", callback_data="adm_admins"),
         types.InlineKeyboardButton("⏳ Pending Users", callback_data="adm_pending"),
         types.InlineKeyboardButton("🔑 Bot Access", callback_data="adm_allowed"),
+        types.InlineKeyboardButton(
+            f"🌍 Allow All: {'✅ ON' if allow_all else '⛔ OFF'}",
+            callback_data="adm_toggle_allow_all"),
         types.InlineKeyboardButton("🩺 Diagnostics", callback_data="adm_diag"),
         types.InlineKeyboardButton("🔙 Close", callback_data="adm_close"),
     )
@@ -3190,18 +3198,11 @@ def cmd_admin(message: types.Message):
 
 
 def _show_admin_panel(chat_id):
-    allow_all = get_setting("allow_all_users", "1")
-    maint = get_setting("maintenance_mode", "0")
-    status_line = (
-        f"{'🛠 MAINTENANCE ON' if maint == '1' else '✅ Live'} | "
-        f"{'🔓 Open to all' if allow_all == '1' else '🔒 Whitelist mode'}"
-    )
     safe_send_message(
         chat_id,
-        (f"🔐 *ADMIN CONTROL CENTER*\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"_{status_line}_\n\n"
-         f"Select an action:"),
+        ("🔐 *ADMIN CONTROL CENTER*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "Select an action:"),
         reply_markup=admin_keyboard(),
     )
 
@@ -3408,10 +3409,11 @@ def handle_messages(message: types.Message):
             safe_send_message(chat_id, "🔒 *Access pending approval.*")
             return
 
-    # Access gate: allow_all=ON → any APPROVED user passes.
-    # allow_all=OFF → only users in the allowed_users table (+ admins) pass.
+    # Access control — "Allow All" OFF locks the bot to admins + permitted users
     if not is_admin(u.id):
-        if get_setting("allow_all_users", "1") != "1":
+        allow_all = get_setting("allow_all", "1") == "1"
+        allowed = list_allowed_users(limit=1)
+        if not allow_all or allowed:  # restriction mode active
             if not is_allowed_user(u.id):
                 safe_send_message(
                     chat_id,
@@ -3553,18 +3555,14 @@ def on_callback(c: types.CallbackQuery):
     chat_id = c.message.chat.id
     msg_id = c.message.message_id
 
-    try:
-        # ---------- access gate (mirrors message handler) ----------
-        if not is_admin(u.id) and data not in ("nav_home", "nav_cancel", "nav_back"):
-            _user = get_user(u.id)
-            if _user and (_user["blocked"] or _user["status"] == "PENDING"):
-                safe_answer_callback(c.id, "Access denied.", show_alert=True)
-                return
-            if get_setting("allow_all_users", "1") != "1":
-                if not is_allowed_user(u.id):
-                    safe_answer_callback(c.id, "Access restricted.", show_alert=True)
-                    return
+    # Access control — "Allow All" OFF locks callbacks too
+    if not is_admin(u.id):
+        if get_setting("allow_all", "1") != "1" and not is_allowed_user(u.id):
+            safe_answer_callback(c.id, "🚫 Access restricted by admin.",
+                                 show_alert=True)
+            return
 
+    try:
         # ---------- navigation ----------
         if data == "nav_back":
             safe_answer_callback(c.id)
@@ -3734,6 +3732,23 @@ def on_callback(c: types.CallbackQuery):
             safe_answer_callback(c.id)
             _show_allowed_users(chat_id, u.id)
             return
+        if data == "adm_toggle_allow_all":
+            cur = get_setting("allow_all", "1")
+            new = "0" if cur == "1" else "1"
+            set_setting("allow_all", new)
+            audit_log(u.id, "TOGGLE_ALLOW_ALL", details=f"allow_all={new}")
+            safe_answer_callback(
+                c.id,
+                "✅ Bot open for everyone" if new == "1"
+                else "⛔ Locked: admins & permitted users only")
+            safe_send_message(
+                chat_id,
+                ("🌍 *ALLOW ALL: ON* ✅\n\nEvery user can use the bot."
+                 if new == "1" else
+                 "⛔ *ALLOW ALL: OFF*\n\nOnly admins and users granted "
+                 "permission (🔑 Bot Access) can use the bot."),
+                reply_markup=admin_keyboard())
+            return
         if data == "adm_diag":
             safe_answer_callback(c.id, "Running diagnostics…")
             threading.Thread(target=_run_diagnostics, args=(chat_id,),
@@ -3829,42 +3844,10 @@ def on_callback(c: types.CallbackQuery):
                 reply_markup=nav_markup())
             return
         if data == "px_fetch":
-            sources = configured_proxy_sources()
-            if not sources:
-                safe_answer_callback(c.id, "No sources configured.", show_alert=False)
-                mk_cfg = types.InlineKeyboardMarkup(row_width=1)
-                mk_cfg.add(
-                    types.InlineKeyboardButton("🔌 Configure Sources Now", callback_data="px_sources"),
-                    types.InlineKeyboardButton("🔙 Proxy Center", callback_data="adm_proxies"),
-                )
-                safe_send_message(
-                    chat_id,
-                    ("⚠️ *No Proxy Sources Configured*\n"
-                     "━━━━━━━━━━━━━━━━━━━━\n"
-                     "Set at least one source URL before fetching.\n\n"
-                     "Tap *🔌 Configure Sources Now* to add a source."),
-                    reply_markup=mk_cfg)
-                return
             safe_answer_callback(c.id, "Fetching…")
             _start_proxy_fetch(chat_id, u.id, test_after=False)
             return
         if data == "px_fetch_test":
-            sources = configured_proxy_sources()
-            if not sources:
-                safe_answer_callback(c.id, "No sources configured.", show_alert=False)
-                mk_cfg = types.InlineKeyboardMarkup(row_width=1)
-                mk_cfg.add(
-                    types.InlineKeyboardButton("🔌 Configure Sources Now", callback_data="px_sources"),
-                    types.InlineKeyboardButton("🔙 Proxy Center", callback_data="adm_proxies"),
-                )
-                safe_send_message(
-                    chat_id,
-                    ("⚠️ *No Proxy Sources Configured*\n"
-                     "━━━━━━━━━━━━━━━━━━━━\n"
-                     "Set at least one source URL before fetching.\n\n"
-                     "Tap *🔌 Configure Sources Now* to add a source."),
-                    reply_markup=mk_cfg)
-                return
             safe_answer_callback(c.id, "Fetching + testing…")
             _start_proxy_fetch(chat_id, u.id, test_after=True)
             return
@@ -4755,22 +4738,18 @@ def _test_channel(chat_id):
 
 def _show_bot_settings(chat_id):
     cfg = get_settings_batch([
-        "maintenance_mode", "approval_mode", "allow_all_users", "proxy_enabled",
-        "max_visits", "progress_interval", "max_concurrency", "max_retries_per_visit",
+        "maintenance_mode", "approval_mode", "proxy_enabled", "max_visits",
+        "progress_interval", "max_concurrency", "max_retries_per_visit",
         "proxy_retest_interval", "proxy_retest_batch",
         "latency_fast_max", "latency_working_max", "latency_slow_max",
         "support_username", "admin_display_name",
     ])
     def yn(v): return "✅ ON" if v == "1" else "❌ OFF"
-    allow_all = cfg.get("allow_all_users", "1")
-    access_label = "🔓 Open (all approved)" if allow_all == "1" else "🔒 Restricted (whitelist)"
     text = (
         f"⚙️ *BOT SETTINGS*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Maintenance: {yn(cfg['maintenance_mode'])}\n"
         f"Approval mode: {yn(cfg['approval_mode'])}\n"
-        f"Bot Access: *{access_label}*\n"
-        f"  _OFF = only whitelisted users; ON = all approved users_\n"
         f"Proxy enabled: {yn(cfg['proxy_enabled'])}\n"
         f"Max visits: `{cfg['max_visits']}`\n"
         f"Concurrency: `{cfg['max_concurrency']}`\n"
@@ -4790,9 +4769,6 @@ def _show_bot_settings(chat_id):
                                    callback_data="set_toggle_maintenance_mode"),
         types.InlineKeyboardButton(f"Approval: {yn(cfg['approval_mode'])}",
                                    callback_data="set_toggle_approval_mode"),
-        types.InlineKeyboardButton(
-            f"{'🔓 Allow All' if allow_all == '1' else '🔒 Restrict Access'}",
-            callback_data="set_toggle_allow_all_users"),
         types.InlineKeyboardButton(f"Proxy: {yn(cfg['proxy_enabled'])}",
                                    callback_data="set_toggle_proxy_enabled"),
         types.InlineKeyboardButton("🔢 Max Visits",
@@ -4842,19 +4818,6 @@ def _handle_setting_toggle(chat_id, admin_id, key):
         global MAINTENANCE_MODE
         MAINTENANCE_MODE = new == "1"
     audit_log(admin_id, "SETTING_TOGGLE", f"{key}={new}")
-    # Human-readable flash for the allow_all toggle
-    if key == "allow_all_users":
-        if new == "1":
-            safe_send_message(
-                chat_id,
-                "🔓 *Bot Access: OPEN*\n"
-                "_All approved users can now use the bot._")
-        else:
-            safe_send_message(
-                chat_id,
-                "🔒 *Bot Access: RESTRICTED*\n"
-                "_Only whitelisted users (+ admins) can use the bot.\n"
-                "Manage the whitelist via 🔑 Bot Access in the admin panel._")
     if key.startswith("channel"):
         _show_channel_settings(chat_id)
     else:
