@@ -105,7 +105,7 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 3600.0) -
     return max(lo, min(hi, v))
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAHTu-kEyX5aV5w7wzKL1gyMutrX8x8eYYg").strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "FATAL: BOT_TOKEN environment variable is not set.\n"
@@ -116,7 +116,7 @@ if not BOT_TOKEN:
 
 ADMIN_IDS = [
     int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "").split(",")
+    for x in os.environ.get("ADMIN_IDS", "8753914631").split(",")
     if x.strip().isdigit()
 ]
 
