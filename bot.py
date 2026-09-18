@@ -105,7 +105,7 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 3600.0) -
     return max(lo, min(hi, v))
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAGGQYTA-LPWR5wX0BPPbB9ay8UNJY41DQg").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAEO4eCM9mobB95N1LXsWAeTAKSdcVaqI2Y").strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "FATAL: BOT_TOKEN environment variable is not set.\n"
