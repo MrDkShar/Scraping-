@@ -105,7 +105,7 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 3600.0) -
     return max(lo, min(hi, v))
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAGgsMDZ6gvl64cdT2tPjwfeR1iXluWJu1g").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "FATAL: BOT_TOKEN environment variable is not set.\n"
@@ -116,7 +116,7 @@ if not BOT_TOKEN:
 
 ADMIN_IDS = [
     int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "8753914631").split(",")
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 ]
 
@@ -126,13 +126,13 @@ DEFAULT_CHANNEL = os.environ.get("CHANNEL_USERNAME", "")
 REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 15, 2, 120)
 CONNECT_TIMEOUT = _env_int("CONNECT_TIMEOUT", 6, 1, 60)
 READ_TIMEOUT = _env_int("READ_TIMEOUT", 10, 1, 120)
-MAX_CONCURRENCY = _env_int("MAX_CONCURRENCY", 4, 1, 16)
+MAX_CONCURRENCY = _env_int("MAX_CONCURRENCY", 8, 1, 32)
 PROGRESS_INTERVAL = _env_float("PROGRESS_INTERVAL", 1.0, 0.5, 10.0)
 MAX_VISITS_PER_JOB = _env_int("MAX_VISITS_PER_JOB", 100, 1, 500)
 MAX_RESPONSE_SIZE = _env_int("MAX_RESPONSE_SIZE", 5 * 1024 * 1024, 65536, 50 * 1024 * 1024)
 MAX_REDIRECTS = _env_int("MAX_REDIRECTS", 10, 1, 30)
 MAX_RETRIES_PER_VISIT = _env_int("MAX_RETRIES_PER_VISIT", 2, 0, 5)
-PROXY_TEST_CONCURRENCY = _env_int("PROXY_TEST_CONCURRENCY", 8, 1, 64)
+PROXY_TEST_CONCURRENCY = _env_int("PROXY_TEST_CONCURRENCY", 16, 1, 64)
 PROXY_HEALTH_TIMEOUT = _env_int("PROXY_HEALTH_TIMEOUT", 8, 2, 60)
 PROXY_RETEST_INTERVAL = _env_int("PROXY_RETEST_INTERVAL", 300, 60, 86400)
 PROXY_RETEST_BATCH = _env_int("PROXY_RETEST_BATCH", 30, 1, 200)
@@ -335,6 +335,15 @@ def init_db() -> None:
                     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id         INTEGER PRIMARY KEY,
+                    username        TEXT,
+                    first_name      TEXT,
+                    granted_by      INTEGER,
+                    granted_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    note            TEXT
+                );
+
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_hostport ON proxies(host, port);
                 CREATE INDEX IF NOT EXISTS idx_jobs_user     ON extraction_jobs(user_id);
                 CREATE INDEX IF NOT EXISTS idx_jobs_date     ON extraction_jobs(started_at);
@@ -384,7 +393,7 @@ _DEFAULT_SETTINGS = {
     "connect_timeout": str(CONNECT_TIMEOUT),
     "read_timeout": str(READ_TIMEOUT),
     "proxy_enabled": "1",
-    "max_concurrency": str(MAX_CONCURRENCY),
+    "max_concurrency": str(MAX_CONCURRENCY),  # default 8 for fast proxy rotation
     "progress_interval": str(PROGRESS_INTERVAL),
     "max_retries_per_visit": str(MAX_RETRIES_PER_VISIT),
     "channel_include_username": "1",
@@ -468,6 +477,62 @@ def audit_log(admin_id: int, action: str, target: str = "", details: str = "") -
                 (admin_id, action, _mask(str(target))[:200], _mask(str(details))[:300]),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+
+# ---------- Allowed Users (Bot Access Permission) ----------
+def is_allowed_user(user_id: int) -> bool:
+    """Check if user has been granted bot access permission by admin."""
+    with _db_lock:
+        conn = get_conn()
+        try:
+            r = conn.execute(
+                "SELECT 1 FROM allowed_users WHERE user_id=?", (user_id,)
+            ).fetchone()
+            return r is not None
+        finally:
+            conn.close()
+
+
+def grant_user_permission(user_id: int, username: str, first_name: str,
+                          granted_by: int, note: str = "") -> bool:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO allowed_users
+                   (user_id, username, first_name, granted_by, note)
+                   VALUES(?,?,?,?,?)""",
+                (user_id, username, first_name, granted_by, note),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            return False
+        finally:
+            conn.close()
+
+
+def revoke_user_permission(user_id: int) -> bool:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cur = conn.execute("DELETE FROM allowed_users WHERE user_id=?", (user_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def list_allowed_users(limit: int = 50) -> list:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM allowed_users ORDER BY granted_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
         finally:
             conn.close()
 
@@ -1466,7 +1531,8 @@ class ProxyPool:
             else:
                 self._in_use[proxy_id] = n - 1
 
-    def mark_used_success(self, proxy_id: int, latency: int, exit_ip: str) -> None:
+    def mark_used_success(self, proxy_id: int, latency: int, exit_ip: str = "") -> None:
+        # Lightweight update — no extra network call, just record latency/success
         update_proxy_health(proxy_id, {"status": _classify_latency(latency) if latency > 0 else "WORKING",
                                        "latency_ms": latency, "exit_ip": exit_ip, "error": ""})
         self.release(proxy_id)
@@ -1590,21 +1656,32 @@ def configured_proxy_sources() -> list:
             if cfg[k].strip()]
 
 
-def fetch_proxy_source(url: str, timeout: int = 20) -> str:
+def fetch_proxy_source(url: str, timeout: int = 30) -> str:
     """Fetch a proxy list from an admin-configured source URL (plain text)."""
-    headers = {"User-Agent": _TEST_UA}
+    headers = {
+        "User-Agent": _TEST_UA,
+        "Accept": "text/plain,text/html,*/*",
+        "Accept-Encoding": "gzip, deflate",
+    }
     token = os.environ.get("PROXY_PROVIDER_TOKEN", "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    r = requests.get(url, headers=headers, timeout=timeout, stream=True)
+    # Use a fresh session (not thread-local) to avoid proxy interference
+    s = requests.Session()
+    s.headers.update(headers)
+    adapter = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=1)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    r = s.get(url, timeout=(10, timeout), stream=True, allow_redirects=True)
     r.raise_for_status()
     chunks, size = [], 0
     for chunk in r.iter_content(chunk_size=65536):
         if chunk:
             size += len(chunk)
-            if size > 4 * 1024 * 1024:
+            if size > 8 * 1024 * 1024:  # 8MB max
                 break
             chunks.append(chunk)
+    s.close()
     return b"".join(chunks).decode("utf-8", errors="ignore")
 
 
@@ -1779,8 +1856,9 @@ def _new_session() -> requests.Session:
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
     })
+    # Larger pool for high-concurrency proxy rotation (speeds up parallel visits)
     adapter = requests.adapters.HTTPAdapter(
-        pool_connections=4, pool_maxsize=8, max_retries=0)
+        pool_connections=16, pool_maxsize=32, max_retries=0)
     s.mount("http://", adapter)
     s.mount("https://", adapter)
     return s
@@ -2088,9 +2166,11 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
             proxy_dict = {k: proxy_row[k] for k in
                           ("protocol", "host", "port", "username", "password", "endpoint")}
             attempt_proxy_id = proxy_row["id"]
+            # Always use cached IP — NEVER make an extra IP-check request per visit
+            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
             _emit(st, "Fetching via proxy…",
                   proxy_protocol=proxy_row["protocol"].upper(),
-                  exit_ip=proxy_row.get("last_observed_ip") or "")
+                  exit_ip=attempt_exit_ip)
 
             tries = 1 + max_retries
             last_status = "REQUEST_FAILED"
@@ -2104,9 +2184,8 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                     final_url, body, visited, status_code = scraper.fetch(
                         url, cancel_event=cancel_event)
                     attempt_latency = int((time.time() - t0) * 1000)
-                    # NO extra exit-IP request per visit — reuse fresh cached IP
-                    if proxy_ip_fresh(proxy_row):
-                        attempt_exit_ip = proxy_row["last_observed_ip"] or ""
+                    # Use cached IP — zero extra network calls per visit
+                    attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
                     ok = True
                     break
                 except JobCancelled:
@@ -2137,11 +2216,13 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                                           ("protocol", "host", "port", "username",
                                            "password", "endpoint")}
                             attempt_proxy_id = proxy_row["id"]
+                            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
                             _emit(st, "Retrying with alternate proxy…")
                             continue
                     break
             if ok:
                 attempt_status = "OK" if attempt == 0 else "OK_RETRY"
+                # Mark success WITHOUT verifying exit IP (no network call = fast)
                 proxy_pool.mark_used_success(proxy_row["id"], attempt_latency,
                                              attempt_exit_ip)
             else:
@@ -2830,6 +2911,7 @@ def admin_keyboard() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("🛠 Maintenance", callback_data="adm_maint"),
         types.InlineKeyboardButton("👮 Admins", callback_data="adm_admins"),
         types.InlineKeyboardButton("⏳ Pending Users", callback_data="adm_pending"),
+        types.InlineKeyboardButton("🔑 Bot Access", callback_data="adm_allowed"),
         types.InlineKeyboardButton("🩺 Diagnostics", callback_data="adm_diag"),
         types.InlineKeyboardButton("🔙 Close", callback_data="adm_close"),
     )
@@ -2846,9 +2928,11 @@ def proxy_center_keyboard() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("📋 Working Only", callback_data="px_working"),
         types.InlineKeyboardButton("🧪 Test All", callback_data="px_test_all"),
         types.InlineKeyboardButton("🔄 Retest Unhealthy", callback_data="px_retest"),
-        types.InlineKeyboardButton("🗑 Cleanup Dead", callback_data="px_cleanup"),
+        types.InlineKeyboardButton("🗑 Delete Dead", callback_data="px_cleanup"),
+        types.InlineKeyboardButton("🗑 Delete Failed", callback_data="px_del_failed"),
         types.InlineKeyboardButton("📋 List", callback_data="px_list"),
         types.InlineKeyboardButton("🔌 Sources", callback_data="px_sources"),
+        types.InlineKeyboardButton("📊 Stats", callback_data="px_dashboard"),
         types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"),
     )
     return mk
@@ -3182,6 +3266,12 @@ def _handle_text_input(message: types.Message, state: dict) -> bool:
         _show_channel_settings(chat_id)
         return True
 
+    # --- allowed user search ---
+    if step == "await_allowed_search" and is_admin(u.id):
+        clear_user_state(u.id)
+        _handle_grant_access_search(chat_id, u.id, text)
+        return True
+
     # --- generic settings value ---
     if step == "await_setting_value" and is_admin(u.id):
         key = data.get("key")
@@ -3247,6 +3337,18 @@ def handle_messages(message: types.Message):
         if user["status"] == "PENDING":
             safe_send_message(chat_id, "🔒 *Access pending approval.*")
             return
+
+    # If allowed_users list is non-empty, only those users + admins can use bot
+    if not is_admin(u.id):
+        allowed = list_allowed_users(limit=1)
+        if allowed:  # restriction mode active
+            if not is_allowed_user(u.id):
+                safe_send_message(
+                    chat_id,
+                    "🚫 *Access Restricted.*\n\n"
+                    "You do not have permission to use this bot.\n"
+                    "Contact the administrator for access.")
+                return
 
     # state-driven text input first
     state = get_user_state(u.id)
@@ -3492,7 +3594,8 @@ def on_callback(c: types.CallbackQuery):
                 data.startswith("uhist_") or data.startswith("unums_") or
                 data.startswith("ublock_") or data.startswith("uunblock_") or
                 data.startswith("ajob_") or data.startswith("appr_") or
-                data.startswith("rej_") or data.startswith("chan_")):
+                data.startswith("rej_") or data.startswith("chan_") or
+                data.startswith("alw_") or data.startswith("rvu_")):
             if not is_admin(u.id):
                 safe_answer_callback(c.id, "Not authorized.", show_alert=True)
                 return
@@ -3545,6 +3648,10 @@ def on_callback(c: types.CallbackQuery):
         if data == "adm_pending":
             safe_answer_callback(c.id)
             _show_pending(chat_id, u.id)
+            return
+        if data == "adm_allowed":
+            safe_answer_callback(c.id)
+            _show_allowed_users(chat_id, u.id)
             return
         if data == "adm_diag":
             safe_answer_callback(c.id, "Running diagnostics…")
@@ -3600,6 +3707,45 @@ def on_callback(c: types.CallbackQuery):
         if data == "px_cleanup":
             safe_answer_callback(c.id)
             _cleanup_dead_proxies(chat_id, u.id)
+            return
+        if data == "px_del_failed":
+            safe_answer_callback(c.id)
+            _cleanup_failed_proxies(chat_id, u.id)
+            return
+        if data.startswith("alw_grant_"):
+            tid = int(data.split("_")[2])
+            target = get_user(tid)
+            if target:
+                grant_user_permission(tid, target.get("username", ""),
+                                      target.get("first_name", ""), u.id)
+                audit_log(u.id, "BOT_ACCESS_GRANTED", str(tid))
+                safe_answer_callback(c.id, "✅ Access granted.")
+                # Notify the user
+                safe_send_message(
+                    tid,
+                    "✅ *Bot access granted!*\n\n"
+                    "You can now use this bot. Use /start to begin.")
+            else:
+                safe_answer_callback(c.id, "User not found.", show_alert=True)
+            _show_allowed_users(chat_id, u.id)
+            return
+        if data.startswith("rvu_"):
+            tid = int(data.split("_")[1])
+            revoke_user_permission(tid)
+            audit_log(u.id, "BOT_ACCESS_REVOKED", str(tid))
+            safe_answer_callback(c.id, "Access revoked.")
+            _show_allowed_users(chat_id, u.id)
+            return
+        if data.startswith("alw_search"):
+            safe_answer_callback(c.id)
+            set_user_state(u.id, "allowed_search", step="await_allowed_search")
+            safe_send_message(
+                chat_id,
+                ("🔑 *GRANT BOT ACCESS*\n"
+                 "━━━━━━━━━━━━━━━━━━━━\n"
+                 "Send the user's Telegram ID or username to grant them bot access.\n\n"
+                 "━━━━━━━━━━━━━━━━━━━━"),
+                reply_markup=nav_markup())
             return
         if data == "px_fetch":
             safe_answer_callback(c.id, "Fetching…")
@@ -3777,7 +3923,7 @@ _SETTING_INPUTS = {
     "progress_interval": {"label": "Progress update interval (seconds)",
                           "type": "float", "min": 0.8, "max": 10.0},
     "max_concurrency": {"label": "Max concurrent visits per job",
-                        "type": "int", "min": 1, "max": 16},
+                        "type": "int", "min": 1, "max": 32},
     "max_retries_per_visit": {"label": "Max proxy retries per visit",
                               "type": "int", "min": 0, "max": 5},
     "latency_fast_max": {"label": "FAST latency ceiling (ms)",
@@ -4690,6 +4836,85 @@ def _run_diagnostics(chat_id):
         safe_edit_message(chat_id, msg.message_id, body)
     else:
         safe_send_message(chat_id, body)
+
+
+# =========================================================
+# Delete Failed Proxies (not Dead/TCP_FAILED, but FAILED status from job)
+# =========================================================
+def _cleanup_failed_proxies(chat_id, admin_id):
+    """Delete proxies that have repeatedly failed (high consecutive_failures)."""
+    with _db_lock:
+        conn = get_conn()
+        try:
+            # Failed = AUTH_FAILED, TCP_FAILED, INVALID with any consecutive failures
+            cur = conn.execute(
+                """DELETE FROM proxies WHERE health_status IN
+                   ('AUTH_FAILED','TCP_FAILED','INVALID','TIMEOUT')
+                   AND consecutive_failures >= 1""")
+            n = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+    audit_log(admin_id, "PROXY_FAILED_CLEANUP", f"removed {n}")
+    safe_send_message(chat_id, f"🗑 Removed `{n}` failed proxies (AUTH/TCP/Invalid/Timeout).",
+                      reply_markup=proxy_center_keyboard())
+
+
+# =========================================================
+# Bot Access Permission — Allowed Users Panel
+# =========================================================
+def _show_allowed_users(chat_id, admin_id):
+    users = list_allowed_users(limit=30)
+    lines = [
+        "🔑 *BOT ACCESS PERMISSIONS*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "_Users below have been granted bot access by admin._",
+        "",
+    ]
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    if users:
+        for au in users:
+            lines.append(
+                f"• `{au['user_id']}` @{au['username'] or '—'} "
+                f"({au['first_name'] or '—'})")
+            mk.add(types.InlineKeyboardButton(
+                f"❌ Revoke {au['user_id']}",
+                callback_data=f"rvu_{au['user_id']}"))
+    else:
+        lines.append("_No allowed users set yet._")
+        lines.append("_By default, all approved users can use the bot._")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(
+        "ℹ️ Grant access to a specific user by searching their ID/username below.\n"
+        "_If the Allowed Users list is empty, all approved users have access._\n"
+        "_Once you add anyone here, ONLY those users + admins can use the bot._"
+    )
+    mk.add(types.InlineKeyboardButton("➕ Grant Access", callback_data="alw_search"))
+    mk.add(types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"))
+    safe_send_message(chat_id, "\n".join(lines), reply_markup=mk)
+
+
+def _handle_grant_access_search(chat_id, admin_id, query):
+    """Search users by ID or username, show grant buttons."""
+    users = search_users(query, limit=10)
+    if not users:
+        safe_send_message(
+            chat_id,
+            f"🔍 No user found for `{query}`.\n"
+            "Make sure the user has started the bot at least once.",
+            reply_markup=admin_keyboard())
+        return
+    lines = ["🔍 *SELECT USER TO GRANT ACCESS*", "━━━━━━━━━━━━━━━━━━━━"]
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    for u in users:
+        lines.append(
+            f"`{u['user_id']}` @{u['username'] or '—'} {u['first_name'] or '—'}")
+        mk.add(types.InlineKeyboardButton(
+            f"✅ Grant: {u['first_name'] or u['user_id']}",
+            callback_data=f"alw_grant_{u['user_id']}"))
+    mk.add(types.InlineKeyboardButton("🔙 Back", callback_data="adm_allowed"))
+    safe_send_message(chat_id, "\n".join(lines), reply_markup=mk)
 
 
 # =========================================================
