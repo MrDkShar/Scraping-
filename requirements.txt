@@ -16,3 +16,8 @@ stem>=1.8.2
 
 # optional — C-accelerated JSON (drop-in, faster polling)
 # orjson>=3.9.0
+
+pyTelegramBotAPI>=4.14.0
+requests>=2.31.0
+PySocks>=1.7.1
+stem>=1.8.2
