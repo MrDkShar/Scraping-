@@ -1,35 +1,39 @@
 """
-DK Sharma Bot — WhatsApp Number Extractor (Production Edition)
-Render/VPS compatible. Single-file deployment.
+DK SCRAPING BOT — Production Edition
+=====================================
+Single-file Telegram bot for authorized public-URL phone-number extraction.
 
-Major subsystems:
-  • SQLite with WAL + safe migration (users, admins, proxies, extraction_jobs,
-    extraction_job_numbers, extraction_attempts, settings, admin_audit_log,
-    channel_posts, pending_users)
-  • Multi-stage proxy health tester (syntax → TCP → real HTTP request →
-    multi-endpoint exit-IP verification → classification). Never marks a
-    proxy DEAD just because one IP-check service timed out.
-  • Thread-safe ProxyPool with rotation, exponential cooldown, health score,
-    per-proxy stats, and target-vs-proxy failure distinction.
-  • Modular number-extraction pipeline (URL/redirect/query/HTML/JSON/attrs/
-    wa.me/tel) with method + source tracking per number.
-  • Independent progress updater thread (rate-limited, flood-safe) so the
-    UI keeps moving even during a slow network request.
-  • Channel auto-posting with permission verification + retry.
-  • Approval system, multi-admin (OWNER/ADMIN/MODERATOR), maintenance mode,
-    broadcast, audit log, settings persistence, background proxy retest.
-  • Pure-Python AES-128-CBC decryptor for ByetHost/InfinityFree challenge.
+Upgraded from the existing DK Sharma Bot codebase. Preserves the original
+SQLite/WAL schema, approval system, multi-admin roles, proxy pool, channel
+posting, background retest, and extraction pipeline. Adds:
+
+  • Centralized navigation (Back / Cancel on every state screen)
+  • Robust session state machine with 15-min auto-expiry
+  • True thread-safe cancellation (threading.Event per job) + pause/resume
+  • Bulk multi-URL extraction with bounded worker pool + per-host limits
+  • Job IDs in DK-XXXXXX format with full lifecycle tracking
+  • Optimized IP mode — cached exit-IP, no per-request IP verification
+  • SSRF protection (blocks private/loopback/link-local targets)
+  • Fetch-latest-proxies with pluggable source adapters
+  • CSV / JSON / TXT export, copy-friendly output
+  • Crash recovery: RUNNING → INTERRUPTED on restart
+  • Confirmation dialogs for destructive actions
+  • Premium UI with consistent branding, pagination, empty states
+  • Telegram flood-safe helpers (edit throttling, retry-after handling)
+  • No hardcoded secrets — BOT_TOKEN from env only
 
 Privacy: only fetches URLs the operator is authorized to process. No CAPTCHA
-bypass, no login bypass, no private-account scraping.
+bypass, no login bypass, no private-account scraping, no anti-bot evasion.
 """
 
 import os
 import re
+import io
 import time
 import json
 import html
 import random
+import string
 import sqlite3
 import threading
 import urllib.parse
@@ -37,6 +41,7 @@ import urllib.request
 import urllib.error
 import http.cookiejar
 import socket
+import ipaddress
 import ssl
 import logging
 import shutil
@@ -44,11 +49,12 @@ import subprocess
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Dict, Set, Tuple
 
 import requests
+
 try:
-    import socks  # PySocks (required for SOCKS5)
+    import socks   # PySocks — required for SOCKS proxies
     _SOCKS_OK = True
 except Exception:
     _SOCKS_OK = False
@@ -58,52 +64,63 @@ from telebot import types
 from telebot.apihelper import ApiTelegramException
 
 # =========================================================
-# Logging (structured, credential-safe)
+#  Logging  (structured, credential-safe)
 # =========================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("bot")
+log = logging.getLogger("dkbot")
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def _mask(s: str) -> str:
-    """Mask credentials in any string before it reaches logs/messages."""
-    return re.sub(r"(://)([^:@/\s]+):([^@/\s]+)(@)", r"\1***:***\4", s or "")
+    """Strip credentials from any string before it reaches logs or UI."""
+    if not s:
+        return ""
+    s = re.sub(r"(://)([^:@/\s]+):([^@/\s]+)(@)", r"\1***:***\4", s)
+    return s
 
 
 # =========================================================
-# Configuration & Environment
+#  Configuration  (all from environment — no hardcoded secrets)
 # =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAEyTnBUF76vioo3Jw0tsRnLEpLeMKHA7Tc").strip()
 if not BOT_TOKEN:
-    # Fallback retained from the original source for local testing only;
-    # production must set BOT_TOKEN env var.
-    BOT_TOKEN = "8553353076:AAFgLdPCaSL_TfZds10qQS1_Hr5iGnn0e5M"
+    raise SystemExit(
+        "FATAL: BOT_TOKEN environment variable is not set. "
+        "Refusing to start without a token. Set BOT_TOKEN in your environment."
+    )
 
-ADMIN_IDS = [
+ADMIN_IDS: List[int] = [
     int(x.strip())
     for x in os.environ.get("ADMIN_IDS", "8753914631").split(",")
     if x.strip().isdigit()
 ]
 
-DB_PATH = os.environ.get("DATABASE_PATH", "bot_database.db")
-DEFAULT_CHANNEL = os.environ.get("CHANNEL_USERNAME", "@HshDkSharmaBotsmall")
+DB_PATH         = os.environ.get("DATABASE_PATH", "bot_database.db")
+DEFAULT_CHANNEL = os.environ.get("CHANNEL_USERNAME", "")
 
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
-CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "6"))
-READ_TIMEOUT = int(os.environ.get("READ_TIMEOUT", "10"))
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "4"))
-PROGRESS_INTERVAL = float(os.environ.get("PROGRESS_INTERVAL", "1.0"))
-MAX_VISITS_PER_JOB = int(os.environ.get("MAX_VISITS_PER_JOB", "100"))
-MAX_RESPONSE_SIZE = int(os.environ.get("MAX_RESPONSE_SIZE", str(5 * 1024 * 1024)))
-MAX_REDIRECTS = int(os.environ.get("MAX_REDIRECTS", "10"))
-PROXY_TEST_CONCURRENCY = int(os.environ.get("PROXY_TEST_CONCURRENCY", "8"))
-PROXY_HEALTH_TIMEOUT = int(os.environ.get("PROXY_HEALTH_TIMEOUT", "8"))
+# ---- tunables (sensible defaults) ----
+REQUEST_TIMEOUT         = int(os.environ.get("REQUEST_TIMEOUT", "15"))
+CONNECT_TIMEOUT         = int(os.environ.get("CONNECT_TIMEOUT", "6"))
+READ_TIMEOUT            = int(os.environ.get("READ_TIMEOUT", "10"))
+MAX_CONCURRENCY         = int(os.environ.get("MAX_CONCURRENCY", "4"))
+PROGRESS_INTERVAL       = float(os.environ.get("PROGRESS_INTERVAL", "1.2"))
+MAX_VISITS_PER_JOB      = int(os.environ.get("MAX_VISITS_PER_JOB", "100"))
+MAX_RESPONSE_SIZE       = int(os.environ.get("MAX_RESPONSE_SIZE", str(5 * 1024 * 1024)))
+MAX_REDIRECTS           = int(os.environ.get("MAX_REDIRECTS", "10"))
+MAX_RETRIES             = int(os.environ.get("MAX_RETRIES", "2"))
+PROXY_TEST_CONCURRENCY  = int(os.environ.get("PROXY_TEST_CONCURRENCY", "12"))
+PROXY_HEALTH_TIMEOUT    = int(os.environ.get("PROXY_HEALTH_TIMEOUT", "8"))
+PROXY_CACHE_TTL         = int(os.environ.get("PROXY_CACHE_TTL", "300"))   # seconds
+MAX_URLS_PER_BATCH      = int(os.environ.get("MAX_URLS_PER_BATCH", "500"))
+MAX_CONCURRENT_JOBS     = int(os.environ.get("MAX_CONCURRENT_JOBS", "3"))
+SESSION_EXPIRY_MIN      = int(os.environ.get("SESSION_EXPIRY_MIN", "15"))
+BULK_WORKERS            = int(os.environ.get("BULK_WORKERS", "8"))
+PER_HOST_LIMIT          = int(os.environ.get("PER_HOST_LIMIT", "2"))
 
-# Initial bootstrap admin (from spec). Authorization is ALWAYS by numeric ID.
 BOOTSTRAP_OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
 
 bot = telebot.TeleBot(
@@ -114,29 +131,131 @@ bot = telebot.TeleBot(
 )
 
 # =========================================================
-# State (all protected by locks)
+#  Global state  (all guarded by locks)
 # =========================================================
-MAINTENANCE_MODE = False  # mirrored from DB settings at startup
+MAINTENANCE_MODE = False
 
-_state_lock = threading.RLock()
-user_states: dict = {}            # user_id -> dict of flags
-active_jobs: dict = {}            # user_id -> job_id (running) | absent
-job_state: dict = {}              # job_id -> JobState dict (live progress)
+_state_lock  = threading.RLock()
+user_states: Dict[int, dict] = {}      # user_id  -> session dict
+active_jobs:  Dict[int, Set[str]] = {}  # user_id  -> set of job_codes (multi-job)
+job_state:    Dict[str, dict] = {}      # job_code -> live JobState dict
 
-# =========================================================
-# Database
-# =========================================================
 _db_lock = threading.RLock()
 
-_SCHEMA_VERSION = 4
+# =========================================================
+#  Markdown helpers  (escape dynamic content safely)
+# =========================================================
+_MD_SPECIAL = re.compile(r"([_*`\[\]])")
+
+
+def md_esc(text) -> str:
+    """Escape MarkdownV1 special characters in dynamic content."""
+    if text is None:
+        return ""
+    return _MD_SPECIAL.sub(r"\\\1", str(text))
+
+
+def _short(text: str, n: int = 60) -> str:
+    if not text:
+        return ""
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _bar(pct: int, width: int = 12) -> str:
+    pct = max(0, min(100, pct))
+    done = pct * width // 100
+    return "█" * done + "░" * (width - done)
+
+
+def _fmt_duration(ms: int) -> str:
+    s = ms / 1000
+    if s < 60:
+        return f"{s:.1f}s"
+    m, sec = divmod(int(s), 60)
+    if m < 60:
+        return f"{m:02d}:{sec:02d}"
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat(sep=" ", timespec="seconds")
+
+
+def _job_code(job_id: int) -> str:
+    """Stable 6-hex display code from numeric job id."""
+    return f"DK-{job_id & 0xFFFFFF:06X}"
+
+
+# =========================================================
+#  Telegram-safe send / edit helpers  (flood protection)
+# =========================================================
+def _safe_edit(chat_id: int, msg_id: int, text: str,
+               markup=None, parse_mode: str = "Markdown") -> bool:
+    """Edit a message, swallowing 'not modified' and handling 429."""
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id, text=text,
+            parse_mode=parse_mode, reply_markup=markup,
+        )
+        return True
+    except ApiTelegramException as e:
+        msg = str(e).lower()
+        if "not modified" in msg:
+            return True
+        if "retry after" in msg or "429" in msg:
+            m = re.search(r"retry after (\d+)", msg)
+            time.sleep(int(m.group(1)) + 1 if m else 2)
+            return False
+        return False
+    except Exception:
+        return False
+
+
+def _safe_send(chat_id: int, text: str, markup=None,
+               parse_mode: str = "Markdown") -> Optional[types.Message]:
+    """Send a message; fall back to plain text if Markdown fails."""
+    try:
+        return bot.send_message(
+            chat_id, text, parse_mode=parse_mode, reply_markup=markup,
+        )
+    except ApiTelegramException as e:
+        if "retry after" in str(e).lower() or "429" in str(e):
+            m = re.search(r"retry after (\d+)", str(e), re.I)
+            time.sleep(int(m.group(1)) + 1 if m else 2)
+            try:
+                return bot.send_message(chat_id, text, parse_mode=parse_mode,
+                                        reply_markup=markup)
+            except Exception:
+                return bot.send_message(chat_id, text, reply_markup=markup)
+        try:
+            return bot.send_message(chat_id, text, reply_markup=markup)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _answer_cb(c: types.CallbackQuery, text: str = "") -> None:
+    try:
+        bot.answer_callback_query(c.id, text)
+    except Exception:
+        pass
+
+
+# =========================================================
+#  Database  (SQLite + WAL, safe additive migration)
+# =========================================================
+_SCHEMA_VERSION = 5
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=20)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -160,8 +279,10 @@ def init_db() -> None:
                     first_name            TEXT,
                     status                TEXT DEFAULT 'APPROVED',
                     blocked               INTEGER DEFAULT 0,
+                    plan                  TEXT DEFAULT 'FREE',
                     total_extractions     INTEGER DEFAULT 0,
                     total_numbers_found   INTEGER DEFAULT 0,
+                    total_urls_processed  INTEGER DEFAULT 0,
                     joined_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_active           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -177,6 +298,7 @@ def init_db() -> None:
 
                 CREATE TABLE IF NOT EXISTS extraction_jobs (
                     job_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_code            TEXT,
                     user_id             INTEGER,
                     username            TEXT,
                     source_url          TEXT,
@@ -188,6 +310,8 @@ def init_db() -> None:
                     duplicate_numbers   INTEGER DEFAULT 0,
                     duration_ms         INTEGER DEFAULT 0,
                     status              TEXT DEFAULT 'QUEUED',
+                    error_summary       TEXT,
+                    bulk_group_id       TEXT,
                     started_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     completed_at        TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
@@ -267,19 +391,45 @@ def init_db() -> None:
                     posted_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS proxy_sources (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT UNIQUE,
+                    url         TEXT,
+                    is_enabled  INTEGER DEFAULT 1,
+                    added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS bulk_groups (
+                    group_id    TEXT PRIMARY KEY,
+                    user_id     INTEGER,
+                    total_urls  INTEGER DEFAULT 0,
+                    processed   INTEGER DEFAULT 0,
+                    successful  INTEGER DEFAULT 0,
+                    failed      INTEGER DEFAULT 0,
+                    numbers     INTEGER DEFAULT 0,
+                    status      TEXT DEFAULT 'QUEUED',
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_jobs_user    ON extraction_jobs(user_id);
                 CREATE INDEX IF NOT EXISTS idx_jobs_date     ON extraction_jobs(started_at);
+                CREATE INDEX IF NOT EXISTS idx_jobs_status   ON extraction_jobs(status);
+                CREATE INDEX IF NOT EXISTS idx_jobs_code     ON extraction_jobs(job_code);
                 CREATE INDEX IF NOT EXISTS idx_nums_job      ON extraction_job_numbers(job_id);
                 CREATE INDEX IF NOT EXISTS idx_attempts_job  ON extraction_attempts(job_id);
                 CREATE INDEX IF NOT EXISTS idx_proxy_host    ON proxies(host, port);
+                CREATE INDEX IF NOT EXISTS idx_audit_time    ON admin_audit_log(timestamp);
                 """
             )
 
-            # --- safe migrations (add columns if missing) ---
+            # ---- safe additive migrations (never delete data) ----
             migrations = [
-                ("users", "status", "TEXT DEFAULT 'APPROVED'"),
-                ("users", "blocked", "INTEGER DEFAULT 0"),
-                ("extraction_jobs", "status", "TEXT DEFAULT 'QUEUED'"),
+                ("users", "plan", "TEXT DEFAULT 'FREE'"),
+                ("users", "total_urls_processed", "INTEGER DEFAULT 0"),
+                ("extraction_jobs", "job_code", "TEXT"),
+                ("extraction_jobs", "error_summary", "TEXT"),
+                ("extraction_jobs", "bulk_group_id", "TEXT"),
                 ("extraction_jobs", "username", "TEXT"),
                 ("extraction_jobs", "successful_visits", "INTEGER DEFAULT 0"),
                 ("extraction_jobs", "failed_visits", "INTEGER DEFAULT 0"),
@@ -288,6 +438,12 @@ def init_db() -> None:
             for tbl, col, decl in migrations:
                 if not _col_exists(conn, tbl, col):
                     conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
+
+            # back-fill job_code for legacy rows
+            conn.execute(
+                "UPDATE extraction_jobs SET job_code = 'DK-' || "
+                "printf('%06X', job_id & 16777215) WHERE job_code IS NULL"
+            )
 
             conn.commit()
         finally:
@@ -300,8 +456,8 @@ _DEFAULT_SETTINGS = {
     "approval_mode": "0",
     "channel_logging": "0",
     "channel_username": DEFAULT_CHANNEL,
-    "support_username": "HshDkSharmaBotsmall",
-    "admin_display_name": "DK Sharma",
+    "support_username": "",
+    "admin_display_name": "DK Scraping Bot",
     "max_visits": str(MAX_VISITS_PER_JOB),
     "request_timeout": str(REQUEST_TIMEOUT),
     "connect_timeout": str(CONNECT_TIMEOUT),
@@ -312,9 +468,12 @@ _DEFAULT_SETTINGS = {
     "channel_include_username": "1",
     "channel_include_uid": "0",
     "channel_include_method": "1",
-    "channel_include_proxy": "0",
     "channel_include_numbers": "1",
+    "channel_include_source": "1",
     "channel_attach_txt": "0",
+    "show_duration": "1",
+    "show_job_id": "1",
+    "auto_delete_results_hours": "0",
 }
 
 
@@ -377,7 +536,8 @@ def audit_log(admin_id: int, action: str, target: str = "", details: str = "") -
         conn = get_conn()
         try:
             conn.execute(
-                "INSERT INTO admin_audit_log(admin_id, action, target, details) VALUES(?,?,?,?)",
+                "INSERT INTO admin_audit_log(admin_id, action, target, details) "
+                "VALUES(?,?,?,?)",
                 (admin_id, action, target, details),
             )
             conn.commit()
@@ -436,7 +596,8 @@ def register_user(user_id: int, username: str = None, first_name: str = None) ->
             approval = get_setting("approval_mode", "0")
             status = "PENDING" if approval == "1" else "APPROVED"
             conn.execute(
-                "INSERT INTO users(user_id, username, first_name, status) VALUES(?,?,?,?)",
+                "INSERT INTO users(user_id, username, first_name, status) "
+                "VALUES(?,?,?,?)",
                 (user_id, username, first_name, status),
             )
             conn.commit()
@@ -445,15 +606,16 @@ def register_user(user_id: int, username: str = None, first_name: str = None) ->
             conn.close()
 
 
-def update_user_stats(user_id: int, unique_count: int) -> None:
+def update_user_stats(user_id: int, unique_count: int, urls_processed: int = 0) -> None:
     with _db_lock:
         conn = get_conn()
         try:
             conn.execute(
                 """UPDATE users SET total_extractions=total_extractions+1,
                    total_numbers_found=total_numbers_found+?,
+                   total_urls_processed=total_urls_processed+?,
                    last_active=CURRENT_TIMESTAMP WHERE user_id=?""",
-                (unique_count, user_id),
+                (unique_count, urls_processed, user_id),
             )
             conn.commit()
         finally:
@@ -493,7 +655,8 @@ def search_users(query: str, limit: int = 20) -> list:
             q = f"%{query}%"
             rows = conn.execute(
                 """SELECT * FROM users
-                   WHERE CAST(user_id AS TEXT) LIKE ? OR username LIKE ? OR first_name LIKE ?
+                   WHERE CAST(user_id AS TEXT) LIKE ? OR username LIKE ?
+                   OR first_name LIKE ?
                    ORDER BY joined_at DESC LIMIT ?""",
                 (q, q, q, limit),
             ).fetchall()
@@ -502,14 +665,16 @@ def search_users(query: str, limit: int = 20) -> list:
             conn.close()
 
 
-def recent_users(limit: int = 10) -> list:
+def recent_users(limit: int = 10, page: int = 0) -> Tuple[list, int]:
     with _db_lock:
         conn = get_conn()
         try:
+            total = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
             rows = conn.execute(
-                "SELECT * FROM users ORDER BY joined_at DESC LIMIT ?", (limit,)
+                "SELECT * FROM users ORDER BY joined_at DESC LIMIT ? OFFSET ?",
+                (limit, page * limit),
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in rows], total
         finally:
             conn.close()
 
@@ -531,7 +696,8 @@ def pending_users() -> list:
         conn = get_conn()
         try:
             rows = conn.execute(
-                "SELECT * FROM users WHERE status='PENDING' AND blocked=0 ORDER BY joined_at DESC"
+                "SELECT * FROM users WHERE status='PENDING' AND blocked=0 "
+                "ORDER BY joined_at DESC"
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -539,47 +705,62 @@ def pending_users() -> list:
 
 
 # ---------- Jobs ----------
-def create_job(user_id: int, username: str, url: str, mode: str, visits: int) -> int:
+def create_job(user_id: int, username: str, url: str, mode: str,
+               visits: int, bulk_group_id: str = None) -> Tuple[int, str]:
     with _db_lock:
         conn = get_conn()
         try:
             cur = conn.execute(
-                """INSERT INTO extraction_jobs(user_id, username, source_url, mode,
-                   requested_visits, status) VALUES(?,?,?,?,?, 'RUNNING')""",
-                (user_id, username, url, mode, visits),
+                """INSERT INTO extraction_jobs
+                   (user_id, username, source_url, mode, requested_visits,
+                    status, bulk_group_id)
+                   VALUES(?,?,?,?,?, 'RUNNING', ?)""",
+                (user_id, username, url, mode, visits, bulk_group_id),
+            )
+            job_id = cur.lastrowid
+            code = _job_code(job_id)
+            conn.execute(
+                "UPDATE extraction_jobs SET job_code=? WHERE job_id=?",
+                (code, job_id),
             )
             conn.commit()
-            return cur.lastrowid
+            return job_id, code
         finally:
             conn.close()
 
 
 def finish_job(job_id: int, success: int, failed: int, unique: int,
-               dupes: int, duration_ms: int, status: str) -> None:
+               dupes: int, duration_ms: int, status: str,
+               error_summary: str = "") -> None:
     with _db_lock:
         conn = get_conn()
         try:
             conn.execute(
                 """UPDATE extraction_jobs SET successful_visits=?, failed_visits=?,
                    unique_numbers=?, duplicate_numbers=?, duration_ms=?, status=?,
-                   completed_at=CURRENT_TIMESTAMP WHERE job_id=?""",
-                (success, failed, unique, dupes, duration_ms, status, job_id),
+                   error_summary=?, completed_at=CURRENT_TIMESTAMP WHERE job_id=?""",
+                (success, failed, unique, dupes, duration_ms, status,
+                 error_summary, job_id),
             )
             conn.commit()
         finally:
             conn.close()
 
 
-def save_number(job_id: int, user_id: int, number: str, source: str,
-                method: str, visit: int) -> None:
+def _save_numbers_batch(job_id: int, user_id: int,
+                        rows: List[Tuple[str, str, str, int]]) -> None:
+    """Batch-insert extracted numbers in a single transaction."""
+    if not rows:
+        return
     with _db_lock:
         conn = get_conn()
         try:
-            conn.execute(
+            conn.executemany(
                 """INSERT INTO extraction_job_numbers
-                   (job_id, user_id, number, source_url, extraction_method, visit_number)
+                   (job_id, user_id, number, source_url, extraction_method,
+                    visit_number)
                    VALUES(?,?,?,?,?,?)""",
-                (job_id, user_id, number, source, method, visit),
+                [(job_id, user_id, n, src, m, v) for n, m, src, v in rows],
             )
             conn.commit()
         finally:
@@ -593,7 +774,8 @@ def save_attempt(job_id: int, cycle: int, proxy_id: Optional[int], exit_ip: str,
         try:
             conn.execute(
                 """INSERT INTO extraction_attempts
-                   (job_id, cycle, proxy_id, exit_ip, request_status, latency_ms, error)
+                   (job_id, cycle, proxy_id, exit_ip, request_status,
+                    latency_ms, error)
                    VALUES(?,?,?,?,?,?,?)""",
                 (job_id, cycle, proxy_id, exit_ip, status, latency_ms, error),
             )
@@ -607,7 +789,8 @@ def job_numbers(job_id: int, limit: int = 200) -> list:
         conn = get_conn()
         try:
             rows = conn.execute(
-                "SELECT * FROM extraction_job_numbers WHERE job_id=? LIMIT ?", (job_id, limit)
+                "SELECT * FROM extraction_job_numbers WHERE job_id=? LIMIT ?",
+                (job_id, limit),
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -619,7 +802,8 @@ def job_attempts(job_id: int, limit: int = 50) -> list:
         conn = get_conn()
         try:
             rows = conn.execute(
-                "SELECT * FROM extraction_attempts WHERE job_id=? ORDER BY cycle LIMIT ?",
+                "SELECT * FROM extraction_attempts WHERE job_id=? "
+                "ORDER BY cycle LIMIT ?",
                 (job_id, limit),
             ).fetchall()
             return [dict(r) for r in rows]
@@ -639,6 +823,18 @@ def get_job(job_id: int) -> Optional[dict]:
             conn.close()
 
 
+def get_job_by_code(code: str) -> Optional[dict]:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            r = conn.execute(
+                "SELECT * FROM extraction_jobs WHERE job_code=?", (code,)
+            ).fetchone()
+            return dict(r) if r else None
+        finally:
+            conn.close()
+
+
 def recent_jobs(limit: int = 15, days: Optional[int] = None) -> list:
     with _db_lock:
         conn = get_conn()
@@ -652,42 +848,51 @@ def recent_jobs(limit: int = 15, days: Optional[int] = None) -> list:
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM extraction_jobs ORDER BY started_at DESC LIMIT ?", (limit,)
+                    "SELECT * FROM extraction_jobs ORDER BY started_at DESC LIMIT ?",
+                    (limit,),
                 ).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
 
 
-def user_jobs(user_id: int, limit: int = 10) -> list:
+def user_jobs(user_id: int, limit: int = 10, page: int = 0) -> Tuple[list, int]:
     with _db_lock:
         conn = get_conn()
         try:
+            total = conn.execute(
+                "SELECT COUNT(*) c FROM extraction_jobs WHERE user_id=?",
+                (user_id,),
+            ).fetchone()["c"]
             rows = conn.execute(
-                "SELECT * FROM extraction_jobs WHERE user_id=? ORDER BY started_at DESC LIMIT ?",
-                (user_id, limit),
+                """SELECT * FROM extraction_jobs WHERE user_id=?
+                   ORDER BY started_at DESC LIMIT ? OFFSET ?""",
+                (user_id, limit, page * limit),
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in rows], total
         finally:
             conn.close()
 
 
-def admin_dashboard_stats() -> dict:
+def admin_dashboard_stats(days: Optional[int] = None) -> dict:
     with _db_lock:
         conn = get_conn()
         try:
             d = {}
+            span = f"-{days} days" if days else None
             d["total_users"] = conn.execute(
                 "SELECT COUNT(*) c FROM users WHERE blocked=0"
             ).fetchone()["c"]
             d["active_today"] = conn.execute(
-                "SELECT COUNT(*) c FROM users WHERE last_active >= datetime('now','-1 day')"
+                "SELECT COUNT(*) c FROM users WHERE last_active >= "
+                "datetime('now','-1 day')"
             ).fetchone()["c"]
             d["total_jobs"] = conn.execute(
                 "SELECT COUNT(*) c FROM extraction_jobs"
             ).fetchone()["c"]
             d["jobs_today"] = conn.execute(
-                "SELECT COUNT(*) c FROM extraction_jobs WHERE started_at >= datetime('now','-1 day')"
+                "SELECT COUNT(*) c FROM extraction_jobs WHERE started_at >= "
+                "datetime('now','-1 day')"
             ).fetchone()["c"]
             d["successful_jobs"] = conn.execute(
                 "SELECT COUNT(*) c FROM extraction_jobs WHERE status='COMPLETED'"
@@ -702,15 +907,24 @@ def admin_dashboard_stats() -> dict:
                 "SELECT COALESCE(SUM(unique_numbers),0) s FROM extraction_jobs "
                 "WHERE started_at >= datetime('now','-1 day')"
             ).fetchone()["s"]
+            d["total_urls"] = conn.execute(
+                "SELECT COALESCE(SUM(requested_visits),0) s FROM extraction_jobs"
+            ).fetchone()["s"]
             d["avg_duration"] = conn.execute(
-                "SELECT COALESCE(AVG(duration_ms),0) a FROM extraction_jobs WHERE status='COMPLETED'"
+                "SELECT COALESCE(AVG(duration_ms),0) a FROM extraction_jobs "
+                "WHERE status='COMPLETED'"
             ).fetchone()["a"]
             for k, v in [
                 ("px_total", "SELECT COUNT(*) c FROM proxies"),
-                ("px_working", "SELECT COUNT(*) c FROM proxies WHERE health_status='WORKING'"),
-                ("px_slow", "SELECT COUNT(*) c FROM proxies WHERE health_status='SLOW'"),
-                ("px_dead", "SELECT COUNT(*) c FROM proxies WHERE health_status IN ('TCP_FAILED','AUTH_FAILED','INVALID')"),
-                ("px_untested", "SELECT COUNT(*) c FROM proxies WHERE health_status='UNTESTED'"),
+                ("px_working",
+                 "SELECT COUNT(*) c FROM proxies WHERE health_status='WORKING'"),
+                ("px_slow",
+                 "SELECT COUNT(*) c FROM proxies WHERE health_status='SLOW'"),
+                ("px_dead",
+                 "SELECT COUNT(*) c FROM proxies WHERE health_status IN "
+                 "('TCP_FAILED','AUTH_FAILED','INVALID')"),
+                ("px_untested",
+                 "SELECT COUNT(*) c FROM proxies WHERE health_status='UNTESTED'"),
             ]:
                 d[k] = conn.execute(v).fetchone()["c"]
             return d
@@ -718,8 +932,83 @@ def admin_dashboard_stats() -> dict:
             conn.close()
 
 
-# =========================================================
-# Pure-Python AES-128-CBC Decryptor (ByetHost / InfinityFree challenge)
+def recover_interrupted_jobs() -> int:
+    """On startup, mark any RUNNING/QUEUED jobs as INTERRUPTED (crash recovery)."""
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE extraction_jobs SET status='INTERRUPTED', "
+                "completed_at=CURRENT_TIMESTAMP "
+                "WHERE status IN ('RUNNING','QUEUED')"
+            )
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def audit_log_rows(limit: int = 30, page: int = 0) -> Tuple[list, int]:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            total = conn.execute("SELECT COUNT(*) c FROM admin_audit_log").fetchone()["c"]
+            rows = conn.execute(
+                "SELECT * FROM admin_audit_log ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, page * limit),
+            ).fetchall()
+            return [dict(r) for r in rows], total
+        finally:
+            conn.close()
+
+
+def channel_post_rows(limit: int = 30, page: int = 0) -> Tuple[list, int]:
+    with _db_lock:
+        conn = get_conn()
+        try:
+            total = conn.execute("SELECT COUNT(*) c FROM channel_posts").fetchone()["c"]
+            rows = conn.execute(
+                """SELECT cp.*, ej.job_code, ej.source_url
+                   FROM channel_posts cp
+                   LEFT JOIN extraction_jobs ej ON cp.job_id = ej.job_id
+                   ORDER BY cp.id DESC LIMIT ? OFFSET ?""",
+                (limit, page * limit),
+            ).fetchall()
+            return [dict(r) for r in rows], total
+        finally:
+            conn.close()
+
+
+def cleanup_old_jobs(days: int = 90) -> int:
+    """Delete jobs and associated numbers/attempts older than `days`."""
+    with _db_lock:
+        conn = get_conn()
+        try:
+            cutoff = f"-{days} days"
+            old_ids = [r["job_id"] for r in conn.execute(
+                "SELECT job_id FROM extraction_jobs WHERE started_at < "
+                "datetime('now', ?)", (cutoff,)
+            ).fetchall()]
+            if not old_ids:
+                return 0
+            placeholders = ",".join("?" * len(old_ids))
+            conn.execute(
+                f"DELETE FROM extraction_job_numbers WHERE job_id IN ({placeholders})",
+                old_ids,
+            )
+            conn.execute(
+                f"DELETE FROM extraction_attempts WHERE job_id IN ({placeholders})",
+                old_ids,
+            )
+            conn.execute(
+                f"DELETE FROM extraction_jobs WHERE job_id IN ({placeholders})",
+                old_ids,
+            )
+            conn.commit()
+            return len(old_ids)
+        finally:
+            conn.close()# =========================================================
+#  Pure-Python AES-128-CBC  (ByetHost / InfinityFree challenge)
 # =========================================================
 _AES_SBOX = (
     0x63,0x7C,0x77,0x7B,0xF2,0x6B,0x6F,0xC5,0x30,0x01,0x67,0x2B,0xFE,0xD7,0xAB,0x76,
@@ -739,15 +1028,16 @@ _AES_SBOX = (
     0xE1,0xF8,0x98,0x11,0x69,0xD9,0x8E,0x94,0x9B,0x1E,0x87,0xE9,0xCE,0x55,0x28,0xDF,
     0x8C,0xA1,0x89,0x0D,0xBF,0xE6,0x42,0x68,0x41,0x99,0x2D,0x0F,0xB0,0x54,0xBB,0x16,
 )
-_AES_INV_SBOX = [0]*256
+_AES_INV_SBOX = [0] * 256
 for _i, _v in enumerate(_AES_SBOX):
     _AES_INV_SBOX[_v] = _i
 _AES_RCON = (0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1B,0x36)
 
 
 def _sub_word(w: int) -> int:
-    return ((_AES_SBOX[(w>>24)&0xFF]<<24)|(_AES_SBOX[(w>>16)&0xFF]<<16)|
-            (_AES_SBOX[(w>>8)&0xFF]<<8)|_AES_SBOX[w&0xFF])
+    return ((_AES_SBOX[(w >> 24) & 0xFF] << 24) |
+            (_AES_SBOX[(w >> 16) & 0xFF] << 16) |
+            (_AES_SBOX[(w >> 8) & 0xFF] << 8) | _AES_SBOX[w & 0xFF])
 
 
 def _rot_word(w: int) -> int:
@@ -757,12 +1047,12 @@ def _rot_word(w: int) -> int:
 def _key_schedule(key_bytes: bytes) -> list:
     w = []
     for i in range(4):
-        w.append((key_bytes[4*i]<<24)|(key_bytes[4*i+1]<<16)|
-                 (key_bytes[4*i+2]<<8)|key_bytes[4*i+3])
+        w.append((key_bytes[4*i] << 24) | (key_bytes[4*i+1] << 16) |
+                 (key_bytes[4*i+2] << 8) | key_bytes[4*i+3])
     for i in range(4, 44):
         temp = w[i-1]
         if i % 4 == 0:
-            temp = _sub_word(_rot_word(temp)) ^ (_AES_RCON[i//4] << 24)
+            temp = _sub_word(_rot_word(temp)) ^ (_AES_RCON[i // 4] << 24)
         w.append(w[i-4] ^ temp)
     return w
 
@@ -790,37 +1080,37 @@ def _inv_mix_col(c: list) -> list:
 
 
 def _decrypt_single_block(block: bytes, w: list) -> list:
-    state = [[block[r+4*c] for c in range(4)] for r in range(4)]
+    state = [[block[r + 4*c] for c in range(4)] for r in range(4)]
     for c in range(4):
-        rk = w[40+c]
+        rk = w[40 + c]
         for r in range(4):
-            state[r][c] ^= (rk >> (24-8*r)) & 0xFF
+            state[r][c] ^= (rk >> (24 - 8*r)) & 0xFF
     for rnd in range(9, 0, -1):
-        state[1] = state[1][3:]+state[1][:3]
-        state[2] = state[2][2:]+state[2][:2]
-        state[3] = state[3][1:]+state[3][:1]
+        state[1] = state[1][3:] + state[1][:3]
+        state[2] = state[2][2:] + state[2][:2]
+        state[3] = state[3][1:] + state[3][:1]
         for r in range(4):
             for c in range(4):
                 state[r][c] = _AES_INV_SBOX[state[r][c]]
         for c in range(4):
-            rk = w[rnd*4+c]
+            rk = w[rnd*4 + c]
             for r in range(4):
-                state[r][c] ^= (rk >> (24-8*r)) & 0xFF
+                state[r][c] ^= (rk >> (24 - 8*r)) & 0xFF
         for c in range(4):
             col = [state[r][c] for r in range(4)]
             new_col = _inv_mix_col(col)
             for r in range(4):
                 state[r][c] = new_col[r]
-    state[1] = state[1][3:]+state[1][:3]
-    state[2] = state[2][2:]+state[2][:2]
-    state[3] = state[3][1:]+state[3][:1]
+    state[1] = state[1][3:] + state[1][:3]
+    state[2] = state[2][2:] + state[2][:2]
+    state[3] = state[3][1:] + state[3][:1]
     for r in range(4):
         for c in range(4):
             state[r][c] = _AES_INV_SBOX[state[r][c]]
     for c in range(4):
         rk = w[c]
         for r in range(4):
-            state[r][c] ^= (rk >> (24-8*r)) & 0xFF
+            state[r][c] ^= (rk >> (24 - 8*r)) & 0xFF
     out = []
     for c in range(4):
         for r in range(4):
@@ -839,8 +1129,10 @@ def decrypt_byet_challenge(c_hex: str, a_hex: str, b_hex: str) -> str:
     if shutil.which("openssl"):
         try:
             p = subprocess.Popen(
-                ["openssl","enc","-d","-aes-128-cbc","-K",a_hex,"-iv",b_hex,"-nopad"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ["openssl", "enc", "-d", "-aes-128-cbc", "-K", a_hex,
+                 "-iv", b_hex, "-nopad"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
             out, _ = p.communicate(bytes.fromhex(c_hex))
             if p.returncode == 0 and len(out) == 16:
@@ -856,7 +1148,50 @@ def decrypt_byet_challenge(c_hex: str, a_hex: str, b_hex: str) -> str:
 
 
 # =========================================================
-# Proxy Parsing
+#  SSRF protection  (block private / loopback / link-local)
+# =========================================================
+def _is_safe_host(host: str) -> bool:
+    """Reject private, loopback, link-local, multicast, and reserved IPs."""
+    if not host:
+        return False
+    try:
+        # try to resolve and check every address
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        # If we can't resolve, allow it (target will fail anyway);
+        # but block obvious local names.
+        return not host.lower() in ("localhost", "ip6-localhost")
+    for info in infos:
+        ip = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_multicast or addr.is_reserved or addr.is_unspecified):
+            return False
+    return True
+
+
+def _url_allowed(url: str) -> Tuple[bool, str]:
+    """Validate a URL is http(s) and not pointing at a private/loopback target."""
+    if not url:
+        return False, "empty"
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return False, "unparseable"
+    if p.scheme.lower() not in ("http", "https"):
+        return False, f"scheme '{p.scheme}' not allowed"
+    if not p.hostname or "." not in p.hostname:
+        return False, "no valid hostname"
+    if not _is_safe_host(p.hostname):
+        return False, "private/loopback host blocked (SSRF protection)"
+    return True, "ok"
+
+
+# =========================================================
+#  Proxy parsing & format normalization
 # =========================================================
 _PROXY_RE = re.compile(
     r"^(?P<scheme>https?|socks5h?|socks4a?)://"
@@ -868,7 +1203,7 @@ _PROXY_RE = re.compile(
 
 def parse_proxy(raw: str) -> Optional[dict]:
     """Parse a proxy string into a structured dict. Returns None if invalid."""
-    s = raw.strip()
+    s = (raw or "").strip()
     if not s:
         return None
     m = _PROXY_RE.match(s)
@@ -878,6 +1213,8 @@ def parse_proxy(raw: str) -> Optional[dict]:
         try:
             port = int(m.group("port"))
         except ValueError:
+            return None
+        if not (1 <= port <= 65535):
             return None
         return {
             "protocol": scheme,
@@ -891,31 +1228,43 @@ def parse_proxy(raw: str) -> Optional[dict]:
     parts = s.split(":")
     if len(parts) == 2:
         try:
-            return {"protocol": "http", "host": parts[0], "port": int(parts[1]),
-                    "username": "", "password": "", "endpoint": f"http://{parts[0]}:{parts[1]}"}
+            port = int(parts[1])
         except ValueError:
             return None
+        if not (1 <= port <= 65535):
+            return None
+        return {"protocol": "http", "host": parts[0], "port": port,
+                "username": "", "password": "",
+                "endpoint": f"http://{parts[0]}:{parts[1]}"}
     if len(parts) == 4:
         try:
-            return {"protocol": "http", "host": parts[0], "port": int(parts[1]),
-                    "username": parts[2], "password": parts[3],
-                    "endpoint": f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"}
+            port = int(parts[1])
         except ValueError:
             return None
+        if not (1 <= port <= 65535):
+            return None
+        return {"protocol": "http", "host": parts[0], "port": port,
+                "username": parts[2], "password": parts[3],
+                "endpoint": f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"}
     return None
 
 
 def proxy_to_requests(p: dict) -> dict:
-    """Build a `requests` proxies dict for the given proxy."""
     auth = ""
-    if p["username"]:
-        auth = f"{urllib.parse.quote(p['username'], safe='')}:{urllib.parse.quote(p['password'], safe='')}@"
+    if p.get("username"):
+        auth = (f"{urllib.parse.quote(p['username'], safe='')}:"
+                f"{urllib.parse.quote(p['password'], safe='')}@")
     return {"http": f"{p['protocol']}://{auth}{p['host']}:{p['port']}",
             "https": f"{p['protocol']}://{auth}{p['host']}:{p['port']}"}
 
 
+def proxy_display(p: dict) -> str:
+    """Safe display string — never exposes credentials."""
+    return f"{p['protocol']}://{p['host']}:{p['port']}"
+
+
 # =========================================================
-# Proxy Health Testing (multi-stage, no false-dead)
+#  Proxy health testing  (multi-stage, no false-dead)
 # =========================================================
 IP_CHECK_ENDPOINTS = [
     "https://api.ipify.org?format=text",
@@ -936,8 +1285,8 @@ def _tcp_check(host: str, port: int, timeout: float = 5.0) -> bool:
         return False
 
 
-def _verify_exit_ip(p: dict, timeout: float) -> tuple:
-    """Return (exit_ip, latency_ms). Tries multiple endpoints — one success is enough."""
+def _verify_exit_ip(p: dict, timeout: float) -> Tuple[Optional[str], int]:
+    """Return (exit_ip, latency_ms). One successful endpoint is enough."""
     proxies = proxy_to_requests(p)
     last_err = ""
     for ep in IP_CHECK_ENDPOINTS:
@@ -957,7 +1306,7 @@ def _verify_exit_ip(p: dict, timeout: float) -> tuple:
             last_err = "connect timeout"
         except requests.exceptions.ReadTimeout:
             last_err = "read timeout"
-        except requests.exceptions.ConnectionError as e:
+        except requests.exceptions.ConnectionError:
             last_err = "connection error"
         except Exception as e:
             last_err = str(e)[:60]
@@ -966,21 +1315,17 @@ def _verify_exit_ip(p: dict, timeout: float) -> tuple:
 
 def test_proxy(p: dict, timeout: Optional[int] = None) -> dict:
     """
-    Multi-stage test. Returns dict:
-      {status, latency_ms, exit_ip, error}
+    Multi-stage test. Returns dict: {status, latency_ms, exit_ip, error}
     status ∈ WORKING / SLOW / CONNECTED / TARGET_FAILED / AUTH_FAILED /
              TCP_FAILED / INVALID / TIMEOUT
     """
     t = timeout or PROXY_HEALTH_TIMEOUT
     if not p or not p.get("host"):
-        return {"status": "INVALID", "latency_ms": 0, "exit_ip": "", "error": "bad parse"}
-
-    # Stage B — TCP
+        return {"status": "INVALID", "latency_ms": 0, "exit_ip": "",
+                "error": "bad parse"}
     if not _tcp_check(p["host"], p["port"], timeout=min(t, 5)):
         return {"status": "TCP_FAILED", "latency_ms": 0, "exit_ip": "",
                 "error": "host:port unreachable"}
-
-    # Stage C+D — real HTTP request + exit-IP verification (multi-endpoint)
     ip, latency = _verify_exit_ip(p, t)
     if latency == -407:
         return {"status": "AUTH_FAILED", "latency_ms": 0, "exit_ip": "",
@@ -989,15 +1334,13 @@ def test_proxy(p: dict, timeout: Optional[int] = None) -> dict:
         if latency > 3000:
             return {"status": "SLOW", "latency_ms": latency, "exit_ip": ip,
                     "error": ""}
-        return {"status": "WORKING", "latency_ms": latency, "exit_ip": ip, "error": ""}
-    # Proxy connected (TCP ok) but all IP endpoints unreachable through it
+        return {"status": "WORKING", "latency_ms": latency, "exit_ip": ip,
+                "error": ""}
     return {"status": "CONNECTED", "latency_ms": 0, "exit_ip": "",
-            "error": "tcp ok; ip verification services unreachable"}
+            "error": "tcp ok; ip endpoints unreachable through proxy"}
 
 
-# =========================================================
-# Proxy DB ops
-# =========================================================
+# ---------- Proxy DB ops ----------
 def add_proxy_db(endpoint: str) -> Optional[int]:
     p = parse_proxy(endpoint)
     if not p:
@@ -1005,15 +1348,15 @@ def add_proxy_db(endpoint: str) -> Optional[int]:
     with _db_lock:
         conn = get_conn()
         try:
-            # dedupe by host+port
             existing = conn.execute(
-                "SELECT id FROM proxies WHERE host=? AND port=?", (p["host"], p["port"])
+                "SELECT id FROM proxies WHERE host=? AND port=?",
+                (p["host"], p["port"]),
             ).fetchone()
             if existing:
                 return existing["id"]
             cur = conn.execute(
-                """INSERT INTO proxies(endpoint, protocol, host, port, username, password)
-                   VALUES(?,?,?,?,?,?)""",
+                """INSERT INTO proxies(endpoint, protocol, host, port,
+                   username, password) VALUES(?,?,?,?,?,?)""",
                 (p["endpoint"], p["protocol"], p["host"], p["port"],
                  p["username"], p["password"]),
             )
@@ -1033,20 +1376,28 @@ def get_proxy_row(proxy_id: int) -> Optional[dict]:
             conn.close()
 
 
-def list_proxies(limit: int = 100, status_filter: Optional[str] = None) -> list:
+def list_proxies(limit: int = 100, status_filter: Optional[str] = None,
+                 page: int = 0) -> Tuple[list, int]:
     with _db_lock:
         conn = get_conn()
         try:
             if status_filter:
+                total = conn.execute(
+                    "SELECT COUNT(*) c FROM proxies WHERE health_status=?",
+                    (status_filter,),
+                ).fetchone()["c"]
                 rows = conn.execute(
-                    "SELECT * FROM proxies WHERE health_status=? ORDER BY id LIMIT ?",
-                    (status_filter, limit),
+                    """SELECT * FROM proxies WHERE health_status=?
+                       ORDER BY id DESC LIMIT ? OFFSET ?""",
+                    (status_filter, limit, page * limit),
                 ).fetchall()
             else:
+                total = conn.execute("SELECT COUNT(*) c FROM proxies").fetchone()["c"]
                 rows = conn.execute(
-                    "SELECT * FROM proxies ORDER BY id LIMIT ?", (limit,)
+                    "SELECT * FROM proxies ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (limit, page * limit),
                 ).fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in rows], total
         finally:
             conn.close()
 
@@ -1056,7 +1407,7 @@ def update_proxy_health(proxy_id: int, result: dict) -> None:
     latency = result.get("latency_ms", 0) or 0
     ip = result.get("exit_ip", "")
     err = result.get("error", "")
-    now = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
+    now = _now_iso()
     with _db_lock:
         conn = get_conn()
         try:
@@ -1070,19 +1421,18 @@ def update_proxy_health(proxy_id: int, result: dict) -> None:
             avg = row["average_latency"]
             if latency > 0:
                 avg = int(((avg * row["success_count"]) + latency) / max(succ, 1))
-            # health score 0-100
             score = _compute_score(status, succ, fail, latency)
-            # exponential cooldown on failure
             cooldown = None
             if not ok and consec_f > 0:
                 cd_secs = min(30 * (2 ** (consec_f - 1)), 600)
-                cooldown = (datetime.utcnow() + timedelta(seconds=cd_secs)).isoformat(sep=" ", timespec="seconds")
+                cooldown = (datetime.utcnow()
+                            + timedelta(seconds=cd_secs)).isoformat(sep=" ", timespec="seconds")
             conn.execute(
-                """UPDATE proxies SET health_status=?, health_score=?, success_count=?,
-                   failure_count=?, consecutive_failures=?, average_latency=?,
-                   last_observed_ip=COALESCE(NULLIF(?, ''), last_observed_ip),
-                   last_error=?, last_tested=?, last_success=?, last_failure=?,
-                   cooldown_until=?, updated_at=? WHERE id=?""",
+                """UPDATE proxies SET health_status=?, health_score=?,
+                   success_count=?, failure_count=?, consecutive_failures=?,
+                   average_latency=?, last_observed_ip=COALESCE(NULLIF(?, ''),
+                   last_observed_ip), last_error=?, last_tested=?, last_success=?,
+                   last_failure=?, cooldown_until=?, updated_at=? WHERE id=?""",
                 (status, score, succ, fail, consec_f, avg, ip, err, now,
                  now if ok else row["last_success"],
                  now if not ok else row["last_failure"],
@@ -1117,12 +1467,13 @@ def delete_proxy_db(proxy_id: int) -> bool:
 
 
 # =========================================================
-# ProxyPool — thread-safe rotation
+#  ProxyPool  — thread-safe rotation with cached exit-IP
 # =========================================================
 class ProxyPool:
     def __init__(self):
         self._lock = threading.RLock()
-        self._last_used: dict = {}  # proxy_id -> ts
+        self._last_used: Dict[int, float] = {}
+        self._ip_cache: Dict[int, Tuple[str, float]] = {}   # proxy_id -> (ip, ts)
 
     def healthy_proxies(self) -> list:
         with _db_lock:
@@ -1131,32 +1482,70 @@ class ProxyPool:
                 rows = conn.execute(
                     """SELECT * FROM proxies WHERE is_active=1
                        AND health_status IN ('WORKING','SLOW','CONNECTED')
-                       AND (cooldown_until IS NULL OR cooldown_until <= ?)
+                       AND (cooldown_until IS NULL
+                            OR cooldown_until <= ?)
                        ORDER BY health_score DESC, average_latency ASC""",
-                    (datetime.utcnow().isoformat(sep=" ", timespec="seconds"),),
+                    (_now_iso(),),
                 ).fetchall()
                 return [dict(r) for r in rows]
             finally:
                 conn.close()
 
     def select(self) -> Optional[dict]:
-        """Pick the best healthy proxy, avoiding the most-recently-used."""
+        """Pick the best healthy proxy, least-recently-used first."""
         with self._lock:
             avail = self.healthy_proxies()
             if not avail:
                 return None
-            avail.sort(key=lambda r: (self._last_used.get(r["id"], 0), -r["health_score"]))
+            avail.sort(key=lambda r: (self._last_used.get(r["id"], 0),
+                                       -r["health_score"]))
             chosen = avail[0]
             self._last_used[chosen["id"]] = time.time()
             return chosen
 
+    def cached_exit_ip(self, proxy_id: int) -> Optional[str]:
+        with self._lock:
+            entry = self._ip_cache.get(proxy_id)
+            if entry and (time.time() - entry[1]) < PROXY_CACHE_TTL:
+                return entry[0]
+        return None
+
+    def set_cached_ip(self, proxy_id: int, ip: str) -> None:
+        with self._lock:
+            self._ip_cache[proxy_id] = (ip, time.time())
+
     def mark_used_success(self, proxy_id: int, latency: int, exit_ip: str) -> None:
-        update_proxy_health(proxy_id, {"status": "WORKING", "latency_ms": latency,
-                                        "exit_ip": exit_ip, "error": ""})
+        update_proxy_health(proxy_id,
+                            {"status": "WORKING", "latency_ms": latency,
+                             "exit_ip": exit_ip, "error": ""})
+        if exit_ip:
+            self.set_cached_ip(proxy_id, exit_ip)
 
     def mark_used_failure(self, proxy_id: int, status: str, error: str) -> None:
-        update_proxy_health(proxy_id, {"status": status, "latency_ms": 0,
-                                        "exit_ip": "", "error": error})
+        update_proxy_health(proxy_id,
+                            {"status": status, "latency_ms": 0,
+                             "exit_ip": "", "error": error})
+
+    def mark_target_failure(self, proxy_id: int, error: str) -> None:
+        """Target failed but proxy is healthy — do NOT punish the proxy."""
+        with _db_lock:
+            conn = get_conn()
+            try:
+                row = conn.execute("SELECT * FROM proxies WHERE id=?",
+                                   (proxy_id,)).fetchone()
+                if not row:
+                    return
+                # bump failure_count lightly, but keep consecutive_failures reset
+                # and DO NOT change health_status — proxy itself works
+                conn.execute(
+                    """UPDATE proxies SET failure_count=failure_count+1,
+                       last_error=?, last_failure=?, updated_at=?
+                       WHERE id=?""",
+                    (error[:200], _now_iso(), _now_iso(), proxy_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
     def count(self) -> dict:
         with _db_lock:
@@ -1165,10 +1554,17 @@ class ProxyPool:
                 d = {}
                 for k, q in [
                     ("total", "SELECT COUNT(*) c FROM proxies"),
-                    ("working", "SELECT COUNT(*) c FROM proxies WHERE health_status='WORKING'"),
-                    ("slow", "SELECT COUNT(*) c FROM proxies WHERE health_status='SLOW'"),
-                    ("dead", "SELECT COUNT(*) c FROM proxies WHERE health_status IN ('TCP_FAILED','AUTH_FAILED','INVALID')"),
-                    ("untested", "SELECT COUNT(*) c FROM proxies WHERE health_status='UNTESTED'"),
+                    ("working",
+                     "SELECT COUNT(*) c FROM proxies WHERE health_status='WORKING'"),
+                    ("slow",
+                     "SELECT COUNT(*) c FROM proxies WHERE health_status='SLOW'"),
+                    ("connected",
+                     "SELECT COUNT(*) c FROM proxies WHERE health_status='CONNECTED'"),
+                    ("dead",
+                     "SELECT COUNT(*) c FROM proxies WHERE health_status IN "
+                     "('TCP_FAILED','AUTH_FAILED','INVALID')"),
+                    ("untested",
+                     "SELECT COUNT(*) c FROM proxies WHERE health_status='UNTESTED'"),
                 ]:
                     d[k] = conn.execute(q).fetchone()["c"]
                 return d
@@ -1179,13 +1575,18 @@ class ProxyPool:
 proxy_pool = ProxyPool()
 
 
-def bulk_test_proxies(progress_cb=None) -> dict:
-    """Test all untested/sick proxies concurrently. Returns summary dict."""
-    rows = list_proxies(limit=500)
-    pending = [r for r in rows if r["health_status"] in ("UNTESTED", "TCP_FAILED",
-                                                          "TIMEOUT", "CONNECTED")]
+def bulk_test_proxies(progress_cb=None, cancel_event: Optional[threading.Event] = None,
+                      scope: str = "all") -> dict:
+    """Test proxies concurrently with bounded concurrency."""
+    rows, _ = list_proxies(limit=2000)
+    if scope == "unhealthy":
+        pending = [r for r in rows if r["health_status"] in
+                   ("UNTESTED", "TCP_FAILED", "TIMEOUT", "CONNECTED",
+                    "AUTH_FAILED", "INVALID")]
+    else:
+        pending = rows
     if not pending:
-        return {"tested": 0, "working": 0, "slow": 0, "dead": 0}
+        return {"tested": 0, "working": 0, "slow": 0, "dead": 0, "total": 0}
 
     tested = working = slow = dead = 0
     total = len(pending)
@@ -1201,6 +1602,10 @@ def bulk_test_proxies(progress_cb=None) -> dict:
     with ThreadPoolExecutor(max_workers=PROXY_TEST_CONCURRENCY) as ex:
         futs = {ex.submit(_one, r): r for r in pending}
         for fut in as_completed(futs):
+            if cancel_event and cancel_event.is_set():
+                for f in futs:
+                    f.cancel()
+                break
             try:
                 st = fut.result()
             except Exception:
@@ -1214,11 +1619,165 @@ def bulk_test_proxies(progress_cb=None) -> dict:
                 dead += 1
             if progress_cb:
                 progress_cb(tested, total, working, slow, dead)
-    return {"tested": tested, "working": working, "slow": slow, "dead": dead}
+    return {"tested": tested, "working": working, "slow": slow,
+            "dead": dead, "total": total}
 
 
 # =========================================================
-# Number Extraction Pipeline
+#  Live proxy fetch  (pluggable source adapters)
+# =========================================================
+class ProxySource:
+    """Abstract interface for a proxy source. Override fetch() in subclasses."""
+    name = "base"
+
+    def fetch(self) -> List[str]:
+        """Return a list of raw proxy strings (one per line or per item)."""
+        raise NotImplementedError
+
+    def parse(self, text: str) -> List[str]:
+        """Parse fetched text into candidate proxy strings."""
+        out = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # accept IP:PORT, IP:PORT:USER:PASS, or scheme://...
+            if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}:\d+$", line):
+                out.append(line)
+            elif "://" in line:
+                out.append(line)
+            elif re.match(r"^\d{1,3}(?:\.\d{1,3}){3}:\d+:[^:]+:[^:]+$", line):
+                out.append(line)
+        return out
+
+    def normalize(self, candidates: List[str]) -> List[dict]:
+        out = []
+        for c in candidates:
+            p = parse_proxy(c)
+            if p:
+                out.append(p)
+        return out
+
+    def deduplicate(self, proxies: List[dict]) -> List[dict]:
+        seen = set()
+        out = []
+        for p in proxies:
+            key = (p["host"], p["port"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+        return out
+
+
+class PlainTextSource(ProxySource):
+    """Generic plaintext IP:PORT source."""
+    name = "plaintext"
+
+    def __init__(self, url: str):
+        self.url = url
+
+    def fetch(self) -> List[str]:
+        try:
+            r = requests.get(self.url, timeout=10,
+                             headers={"User-Agent": _TEST_UA})
+            if r.status_code == 200:
+                return self.parse(r.text)
+        except Exception as e:
+            log.warning("PROXY_SOURCE_FETCH_FAIL %s err=%s",
+                        _mask(self.url), e)
+        return []
+
+
+def get_proxy_sources() -> List[ProxySource]:
+    """Load enabled proxy sources from DB. Operators add their own authorized
+    sources via the proxy center. We do NOT hardcode any third-party lists."""
+    out: List[ProxySource] = []
+    with _db_lock:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM proxy_sources WHERE is_enabled=1"
+            ).fetchall()
+        finally:
+            conn.close()
+    for r in rows:
+        out.append(PlainTextSource(r["url"]))
+    return out
+
+
+def fetch_latest_proxies(progress_cb=None,
+                         cancel_event: Optional[threading.Event] = None) -> dict:
+    """Fetch, dedupe, test, and import proxies from configured sources."""
+    sources = get_proxy_sources()
+    discovered = []
+    src_count = len(sources)
+    for src in sources:
+        if cancel_event and cancel_event.is_set():
+            break
+        discovered.extend(src.fetch())
+    parsed = []
+    for raw in discovered:
+        p = parse_proxy(raw)
+        if p:
+            parsed.append(p)
+    deduped = []
+    seen = set()
+    for p in parsed:
+        key = (p["host"], p["port"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(p)
+
+    # import into DB (dedupe by host:port at the DB layer too)
+    new_ids = []
+    for p in deduped:
+        pid = add_proxy_db(p["endpoint"])
+        if pid:
+            new_ids.append((pid, p))
+
+    # test concurrently
+    tested = working = slow = dead = 0
+    total = len(new_ids)
+
+    def _one(item):
+        pid, p = item
+        res = test_proxy(p)
+        update_proxy_health(pid, res)
+        return res["status"]
+
+    with ThreadPoolExecutor(max_workers=PROXY_TEST_CONCURRENCY) as ex:
+        futs = {ex.submit(_one, item): item for item in new_ids}
+        for fut in as_completed(futs):
+            if cancel_event and cancel_event.is_set():
+                for f in futs:
+                    f.cancel()
+                break
+            try:
+                st = fut.result()
+            except Exception:
+                st = "INVALID"
+            tested += 1
+            if st in ("WORKING", "CONNECTED"):
+                working += 1
+            elif st == "SLOW":
+                slow += 1
+            else:
+                dead += 1
+            if progress_cb:
+                progress_cb(src_count, len(discovered), len(parsed),
+                            len(deduped), tested, total,
+                            working, slow, dead)
+    return {
+        "sources": src_count, "discovered": len(discovered),
+        "parsed": len(parsed), "imported": len(deduped),
+        "tested": tested, "working": working, "slow": slow, "dead": dead,
+    }
+
+
+# =========================================================
+#  Number extraction pipeline
 # =========================================================
 _WA_PATTERNS = [
     (re.compile(r'wa\.me/(\+?\d{6,15})', re.IGNORECASE), "wa.me"),
@@ -1234,13 +1793,11 @@ _WA_PATTERNS = [
     (re.compile(r'intent://send/(\+?\d{6,15})', re.IGNORECASE), "intent"),
 ]
 
-# JSON-field-ish: "phone":"9198...", "whatsapp":"9198...", "mobile":"+91..."
 _JSON_FIELD_RE = re.compile(
     r'"(?:phone|phone_number|mobile|mobile_number|whatsapp|wa_number|recipient|send_to|number|to)"\s*:\s*"(\+?\d{6,15})"',
     re.IGNORECASE,
 )
 
-# Bare tel-like numbers in href / data-* attrs
 _ATTR_RE = re.compile(
     r'(?:href|data-phone|data-mobile|data-whatsapp|data-number|data-tel)\s*=\s*["\']([^"\']*\+?\d{6,15}[^"\']*)["\']',
     re.IGNORECASE,
@@ -1260,7 +1817,6 @@ def _normalize(raw: str) -> Optional[str]:
     digits = re.sub(r'\D', '', raw or "")
     if not digits:
         return None
-    # Strip leading 00 (intl prefix) or one leading 0 (some locals)
     if digits.startswith("00"):
         digits = digits[2:]
     if 10 <= len(digits) <= 15:
@@ -1297,7 +1853,6 @@ def extract_numbers(text: str, source: str, default_method: str = "html") -> lis
 
 
 def extract_from_url_chain(urls: list) -> list:
-    """Pull numbers from a redirect chain (each URL string)."""
     out = []
     seen = set()
     for u in urls:
@@ -1309,7 +1864,7 @@ def extract_from_url_chain(urls: list) -> list:
 
 
 # =========================================================
-# Scraper — direct or via proxy, with challenge solving
+#  Scraper  — direct or via proxy, with challenge solving
 # =========================================================
 class Scraper:
     def __init__(self, use_proxy: bool = False, proxy: Optional[dict] = None):
@@ -1318,7 +1873,8 @@ class Scraper:
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": _TEST_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                       "*/*;q=0.8"),
             "Accept-Language": "en-US,en;q=0.9",
         })
         self._test_cookie = None
@@ -1329,11 +1885,12 @@ class Scraper:
             return proxy_to_requests(self.proxy)
         return None
 
-    def fetch(self, url: str) -> tuple:
-        """
-        Returns (final_url, body, visited_urls) or raises.
-        Solves ByetHost/InfinityFree challenge, follows HTTP + meta + JS redirects.
-        """
+    def fetch(self, url: str) -> Tuple[str, str, list]:
+        """Return (final_url, body, visited_urls) or raise."""
+        ok, reason = _url_allowed(url)
+        if not ok:
+            raise ValueError(f"URL rejected: {reason}")
+
         parsed = urllib.parse.urlparse(url)
         self._domain = parsed.hostname
         if self._test_cookie and self._domain:
@@ -1342,14 +1899,12 @@ class Scraper:
         visited = [url]
         current = url
         body = ""
-        redirects_done = 0
 
         for hop in range(MAX_REDIRECTS + 1):
             try:
                 r = self.session.get(current, proxies=self._proxies(),
                                      timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                                      allow_redirects=True, stream=True)
-                # size guard
                 size = 0
                 chunks = []
                 for chunk in r.iter_content(chunk_size=65536):
@@ -1360,8 +1915,9 @@ class Scraper:
                         chunks.append(chunk)
                 body = b"".join(chunks).decode("utf-8", errors="ignore")
                 current = r.url
-                visited.append(current)
-            except requests.exceptions.RequestException as e:
+                if current not in visited:
+                    visited.append(current)
+            except requests.exceptions.RequestException:
                 raise
 
             # ByetHost / InfinityFree slowAES challenge
@@ -1371,107 +1927,621 @@ class Scraper:
                     a_key, b_iv, c_cipher = matches[0], matches[1], matches[2]
                     self._test_cookie = decrypt_byet_challenge(c_cipher, a_key, b_iv)
                     if self._domain:
-                        self.session.cookies.set("__test", self._test_cookie, domain=self._domain)
+                        self.session.cookies.set("__test", self._test_cookie,
+                                                domain=self._domain)
                     loc = re.search(r'location\.href\s*=\s*["\'](.*?)["\']', body)
-                    nxt = loc.group(1) if loc else (current + ("&i=1" if "?" in current else "?i=1"))
+                    nxt = loc.group(1) if loc else (
+                        current + ("&i=1" if "?" in current else "?i=1"))
                     current = urllib.parse.urljoin(current, nxt)
                     visited.append(current)
-                    redirects_done += 1
                     continue
 
-            # meta refresh
             meta = _META_REFRESH_RE.search(body)
             if meta:
                 current = urllib.parse.urljoin(current, meta.group(1).strip())
                 visited.append(current)
-                redirects_done += 1
                 continue
 
-            # JS location redirect
             js = _JS_LOCATION_RE.search(body)
             if js:
                 current = urllib.parse.urljoin(current, js.group(1).strip())
                 visited.append(current)
-                redirects_done += 1
                 continue
 
             break
 
-        return current, body, visited
+        return current, body, visited# =========================================================
+#  Session state machine  (centralized, with expiry)
+# =========================================================
+# Each user has at most one active session dict. Sessions auto-expire after
+# SESSION_EXPIRY_MIN minutes of inactivity.
+
+STATE_IDLE              = "IDLE"
+STATE_AWAIT_URL         = "AWAIT_URL"
+STATE_AWAIT_MODE        = "AWAIT_MODE"
+STATE_AWAIT_VISITS      = "AWAIT_VISITS"
+STATE_AWAIT_BULK        = "AWAIT_BULK"
+STATE_AWAIT_PROXY_ADD   = "AWAIT_PROXY_ADD"
+STATE_AWAIT_PROXY_BULK  = "AWAIT_PROXY_BULK"
+STATE_AWAIT_BROADCAST   = "AWAIT_BROADCAST"
+STATE_AWAIT_SEARCH      = "AWAIT_SEARCH"
+STATE_AWAIT_PROXY_SRC   = "AWAIT_PROXY_SRC"
+STATE_AWAIT_CHANNEL     = "AWAIT_CHANNEL"
+
+
+def _new_session(user_id: int, state: str, **data) -> dict:
+    return {"state": state, "created": time.time(), "updated": time.time(), **data}
+
+
+def _get_session(user_id: int) -> Optional[dict]:
+    with _state_lock:
+        s = user_states.get(user_id)
+        if not s:
+            return None
+        # expiry
+        if time.time() - s.get("updated", s.get("created", 0)) > SESSION_EXPIRY_MIN * 60:
+            user_states.pop(user_id, None)
+            return None
+        return s
+
+
+def _set_session(user_id: int, state: str, **data) -> dict:
+    with _state_lock:
+        s = _new_session(user_id, state, **data)
+        user_states[user_id] = s
+        return s
+
+
+def _clear_session(user_id: int) -> None:
+    with _state_lock:
+        user_states.pop(user_id, None)
+
+
+def _touch_session(user_id: int) -> None:
+    with _state_lock:
+        s = user_states.get(user_id)
+        if s:
+            s["updated"] = time.time()
 
 
 # =========================================================
-# Job state + Progress Updater (independent thread)
+#  Navigation keyboards  (reusable, consistent)
 # =========================================================
-def _new_job_state(job_id: int, total: int, mode: str, url: str, chat_id: int, msg_id: int) -> dict:
+def _back_cancel_kb() -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        types.InlineKeyboardButton("◀️ Back", callback_data="nav_back"),
+        types.InlineKeyboardButton("🛑 Cancel", callback_data="nav_cancel"),
+    )
+    return mk
+
+
+def _cancel_only_kb() -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup()
+    mk.add(types.InlineKeyboardButton("🛑 Cancel", callback_data="nav_cancel"))
+    return mk
+
+
+def _home_kb(user_id: int) -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        types.InlineKeyboardButton("🚀 Start Extraction",
+                                   callback_data="ex_start"),
+        types.InlineKeyboardButton("📊 My Statistics",
+                                   callback_data="user_stats"),
+        types.InlineKeyboardButton("🕘 History",
+                                   callback_data="user_history"),
+        types.InlineKeyboardButton("⚙️ Settings",
+                                   callback_data="user_settings"),
+        types.InlineKeyboardButton("❓ Help", callback_data="user_help"),
+    )
+    if is_admin(user_id):
+        mk.add(types.InlineKeyboardButton("🛠 Admin Panel",
+                                           callback_data="adm_panel"))
+    return mk
+
+
+def main_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
+    mk = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    mk.add(
+        types.KeyboardButton("🚀 Start Extraction"),
+        types.KeyboardButton("📊 My Statistics"),
+        types.KeyboardButton("🕘 History"),
+        types.KeyboardButton("⚙️ Settings"),
+        types.KeyboardButton("❓ Help"),
+    )
+    if is_admin(user_id):
+        mk.add(types.KeyboardButton("🛠 Admin Panel"))
+    return mk
+
+
+def _mode_keyboard() -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    mk.add(
+        types.InlineKeyboardButton("🔗 Single Link",
+                                   callback_data="ex_single"),
+        types.InlineKeyboardButton("📚 Bulk Links",
+                                   callback_data="ex_bulk"),
+        types.InlineKeyboardButton("◀️ Back", callback_data="nav_back"),
+        types.InlineKeyboardButton("🛑 Cancel", callback_data="nav_cancel"),
+    )
+    return mk
+
+
+def _netmode_keyboard() -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    mk.add(
+        types.InlineKeyboardButton("🟢 Direct (No IP)",
+                                   callback_data="netmode_direct"),
+        types.InlineKeyboardButton("🌐 IP Rotation",
+                                   callback_data="netmode_proxy"),
+        types.InlineKeyboardButton("◀️ Back", callback_data="nav_back"),
+        types.InlineKeyboardButton("🛑 Cancel", callback_data="nav_cancel"),
+    )
+    return mk
+
+
+def _visits_keyboard() -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=3)
+    mk.add(
+        types.InlineKeyboardButton("🧪 1x", callback_data="visits_1"),
+        types.InlineKeyboardButton("⚡ 5x", callback_data="visits_5"),
+        types.InlineKeyboardButton("🚀 10x", callback_data="visits_10"),
+        types.InlineKeyboardButton("⚡ 20x", callback_data="visits_20"),
+        types.InlineKeyboardButton("💎 50x", callback_data="visits_50"),
+        types.InlineKeyboardButton("💎 100x", callback_data="visits_100"),
+    )
+    mk.add(
+        types.InlineKeyboardButton("◀️ Back", callback_data="nav_back"),
+        types.InlineKeyboardButton("🛑 Cancel", callback_data="nav_cancel"),
+    )
+    return mk
+
+
+def _confirm_start_kb() -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    mk.add(
+        types.InlineKeyboardButton("🚀 Start", callback_data="confirm_start"),
+        types.InlineKeyboardButton("◀️ Back", callback_data="nav_back"),
+        types.InlineKeyboardButton("🛑 Cancel", callback_data="nav_cancel"),
+    )
+    return mk
+
+
+def _admin_keyboard() -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        types.InlineKeyboardButton("📊 Analytics", callback_data="adm_dashboard"),
+        types.InlineKeyboardButton("👥 Users", callback_data="adm_users"),
+        types.InlineKeyboardButton("🚀 Jobs", callback_data="adm_jobs"),
+        types.InlineKeyboardButton("🌐 Proxy Center", callback_data="adm_proxies"),
+        types.InlineKeyboardButton("📡 Channel", callback_data="adm_channel"),
+        types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast"),
+        types.InlineKeyboardButton("⚙️ System", callback_data="adm_settings"),
+        types.InlineKeyboardButton("🧪 Diagnostics", callback_data="adm_diag"),
+        types.InlineKeyboardButton("📜 Audit Log", callback_data="adm_audit"),
+        types.InlineKeyboardButton("📡 Post History", callback_data="adm_chanlog"),
+        types.InlineKeyboardButton("⏳ Pending", callback_data="adm_pending"),
+        types.InlineKeyboardButton("🛠 Maintenance",
+                                   callback_data="adm_maint"),
+        types.InlineKeyboardButton("🏠 Home", callback_data="nav_home"),
+    )
+    return mk
+
+
+def _proxy_center_keyboard() -> types.InlineKeyboardMarkup:
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        types.InlineKeyboardButton("⚡ Fetch Latest",
+                                   callback_data="px_fetch"),
+        types.InlineKeyboardButton("🧪 Test All",
+                                   callback_data="px_test_all"),
+        types.InlineKeyboardButton("🔄 Retest Failed",
+                                   callback_data="px_retest"),
+        types.InlineKeyboardButton("🟢 Working",
+                                   callback_data="px_list_working"),
+        types.InlineKeyboardButton("🔴 Dead",
+                                   callback_data="px_list_dead"),
+        types.InlineKeyboardButton("📋 All", callback_data="px_list_all"),
+        types.InlineKeyboardButton("➕ Add Proxy", callback_data="px_add"),
+        types.InlineKeyboardButton("📦 Bulk Add", callback_data="px_bulk"),
+        types.InlineKeyboardButton("📦 Manage Sources",
+                                   callback_data="px_sources"),
+        types.InlineKeyboardButton("🧹 Cleanup Dead",
+                                   callback_data="px_cleanup"),
+        types.InlineKeyboardButton("◀️ Admin", callback_data="adm_panel"),
+    )
+    return mk
+
+
+# =========================================================
+#  URL validation
+# =========================================================
+_URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+
+
+def validate_url(text: str) -> Optional[str]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    if not t.startswith(("http://", "https://")):
+        t = "https://" + t
+    if not _URL_RE.match(t):
+        return None
+    try:
+        p = urllib.parse.urlparse(t)
+        if not p.hostname or "." not in p.hostname:
+            return None
+        return t
+    except Exception:
+        return None
+
+
+# =========================================================
+#  Home screen
+# =========================================================
+def _home_text(user_id: int) -> str:
+    u = get_user(user_id)
+    jobs_count = u["total_extractions"] if u else 0
+    nums_count = u["total_numbers_found"] if u else 0
+    if jobs_count:
+        succ = sum(1 for j in user_jobs(user_id, limit=500)[0]
+                   if j["status"] == "COMPLETED")
+        rate = (succ / jobs_count * 100) if jobs_count else 0
+    else:
+        rate = 0
+    name = get_setting("admin_display_name", "DK Scraping Bot")
+    return (
+        "╭──────────────────────────────╮\n"
+        "│       🚀 DK SCRAPING BOT       │\n"
+        "│    Professional URL Engine     │\n"
+        "╰──────────────────────────────╯\n\n"
+        f"Welcome, *{md_esc(name)}*\n\n"
+        "⚡ Fast URL Processing\n"
+        "🌐 Direct + Proxy Modes\n"
+        "📊 Advanced Extraction\n"
+        "📁 Professional Results\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 YOUR ACTIVITY\n\n"
+        f"Jobs: `{jobs_count}`\n"
+        f"Numbers Found: `{nums_count:,}`\n"
+        f"Success Rate: `{rate:.1f}%`\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def _send_home(chat_id: int, user_id: int):
+    _safe_send(chat_id, _home_text(user_id), markup=_home_kb(user_id))
+
+
+# =========================================================
+#  Command handlers
+# =========================================================
+@bot.message_handler(commands=["start"])
+def cmd_start(message: types.Message):
+    u = message.from_user
+    chat_id = message.chat.id
+    status = register_user(u.id, u.username, u.first_name)
+    if status == "BLOCKED":
+        _safe_send(chat_id, "🚫 *Your access has been blocked.*")
+        return
+    if status == "PENDING":
+        admin_name = get_setting("admin_display_name", "Admin")
+        _safe_send(
+            chat_id,
+            ("🔒 *ACCESS PENDING*\n\n"
+             "Your access request has been submitted.\n"
+             "Please wait for administrator approval.\n\n"
+             f"_— {md_esc(admin_name)}_"),
+        )
+        for aid in ADMIN_IDS:
+            try:
+                mk = types.InlineKeyboardMarkup(row_width=2)
+                mk.add(
+                    types.InlineKeyboardButton("✅ Approve",
+                                               callback_data=f"appr_{u.id}"),
+                    types.InlineKeyboardButton("❌ Reject",
+                                               callback_data=f"rej_{u.id}"),
+                )
+                bot.send_message(
+                    aid,
+                    ("👤 *NEW USER REQUEST*\n\n"
+                     f"Name: {md_esc(u.first_name or '—')}\n"
+                     f"Username: @{md_esc(u.username or '—')}\n"
+                     f"User ID: `{u.id}`"),
+                    parse_mode="Markdown", reply_markup=mk,
+                )
+            except Exception:
+                pass
+        return
+    _clear_session(u.id)
+    _send_home(chat_id, u.id)
+
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin(message: types.Message):
+    if not is_admin(message.from_user.id):
+        _safe_send(message.chat.id, "❌ *Access Denied.*")
+        return
+    _show_admin_panel(message.chat.id)
+
+
+def _show_admin_panel(chat_id):
+    _safe_send(
+        chat_id,
+        ("🛠 *DK ADMIN PANEL*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "Select an action:"),
+        markup=_admin_keyboard(),
+    )
+
+
+# =========================================================
+#  Main message router
+# =========================================================
+@bot.message_handler(func=lambda m: True)
+def handle_messages(message: types.Message):
+    global MAINTENANCE_MODE
+    u = message.from_user
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+
+    register_user(u.id, u.username, u.first_name)
+    session = _get_session(u.id)
+
+    # maintenance
+    if MAINTENANCE_MODE and not is_admin(u.id):
+        _safe_send(
+            chat_id,
+            ("🔧 *MAINTENANCE*\n\n"
+             "The system is temporarily unavailable.\n"
+             "Please try again later."),
+        )
+        return
+
+    # blocked / pending
+    user = get_user(u.id)
+    if user:
+        if user["blocked"]:
+            _safe_send(chat_id, "🚫 *Access blocked.*")
+            return
+        if user["status"] == "PENDING":
+            _safe_send(chat_id, "🔒 *Access pending approval.*")
+            return
+
+    # ---- session-driven input ----
+    if session:
+        state = session.get("state")
+        _touch_session(u.id)
+
+        if state == STATE_AWAIT_URL:
+            _handle_url_input(chat_id, u, text, session)
+            return
+        if state == STATE_AWAIT_BULK:
+            _handle_bulk_input(chat_id, u, text, session)
+            return
+        if state == STATE_AWAIT_PROXY_ADD and is_admin(u.id):
+            _clear_session(u.id)
+            _handle_proxy_add(chat_id, u.id, text)
+            return
+        if state == STATE_AWAIT_PROXY_BULK and is_admin(u.id):
+            _clear_session(u.id)
+            _handle_proxy_bulk(chat_id, u.id, text)
+            return
+        if state == STATE_AWAIT_BROADCAST and is_admin(u.id):
+            _clear_session(u.id)
+            threading.Thread(target=_do_broadcast,
+                              args=(chat_id, u.id, text),
+                              daemon=True).start()
+            return
+        if state == STATE_AWAIT_SEARCH and is_admin(u.id):
+            _clear_session(u.id)
+            _handle_user_search(chat_id, u.id, text)
+            return
+        if state == STATE_AWAIT_PROXY_SRC and is_admin(u.id):
+            _clear_session(u.id)
+            _handle_proxy_source_add(chat_id, u.id, text)
+            return
+        if state == STATE_AWAIT_CHANNEL and is_admin(u.id):
+            _clear_session(u.id)
+            ch = text.strip()
+            set_setting("channel_username", ch)
+            audit_log(u.id, "CHANNEL_SET", ch)
+            _safe_send(chat_id, f"📡 Channel set to `{md_esc(ch)}`",
+                       markup=_admin_keyboard())
+            return
+
+    # ---- reply-keyboard buttons ----
+    if text == "🚀 Start Extraction":
+        _start_extraction_flow(chat_id, u)
+        return
+    if text == "📊 My Statistics":
+        _show_user_stats(chat_id, u.id)
+        return
+    if text == "🕘 History":
+        _show_user_history(chat_id, u.id, page=0)
+        return
+    if text == "⚙️ Settings":
+        _show_user_settings(chat_id, u.id)
+        return
+    if text == "❓ Help":
+        _show_help(chat_id)
+        return
+    if text == "🛠 Admin Panel" and is_admin(u.id):
+        _show_admin_panel(chat_id)
+        return
+    if text in ("❌ Cancel", "🔙 Main Menu", "🏠 Home"):
+        _clear_session(u.id)
+        _send_home(chat_id, u.id)
+        return
+
+    # fallback
+    _safe_send(chat_id, "Use the menu below 👇",
+               markup=main_keyboard(u.id))
+
+
+# ---- session input handlers ----
+def _handle_url_input(chat_id, user, text, session):
+    url = validate_url(text)
+    if not url:
+        _safe_send(
+            chat_id,
+            ("❌ *Invalid URL.*\nPlease send a valid `http://` or `https://` "
+             "link."),
+            markup=_back_cancel_kb(),
+        )
+        return
+    _set_session(user.id, STATE_AWAIT_MODE, url=url)
+    _safe_send(
+        chat_id,
+        (f"🔍 *URL RECEIVED*\n"
+         f"━━━━━━━━━━━━━━━━━━━━\n"
+         f"`{_short(url, 80)}`\n\n"
+         f"Choose extraction mode:"),
+        markup=_netmode_keyboard(),
+    )
+
+
+def _handle_bulk_input(chat_id, user, text, session):
+    urls = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        u = validate_url(line)
+        if u:
+            urls.append(u)
+    if not urls:
+        _safe_send(
+            chat_id,
+            ("❌ *No valid URLs found.*\nSend one URL per line."),
+            markup=_back_cancel_kb(),
+        )
+        return
+    if len(urls) > MAX_URLS_PER_BATCH:
+        urls = urls[:MAX_URLS_PER_BATCH]
+        _safe_send(
+            chat_id,
+            (f"⚠️ Trimmed to first `{MAX_URLS_PER_BATCH}` URLs "
+             f"(per-batch limit)."),
+        )
+    _clear_session(user.id)
+    _start_bulk_job(chat_id, user, urls, session.get("mode", "DIRECT"))
+
+
+# =========================================================
+#  Extraction flow
+# =========================================================
+def _start_extraction_flow(chat_id, user):
+    with _state_lock:
+        if len(active_jobs.get(user.id, set())) >= MAX_CONCURRENT_JOBS:
+            _safe_send(
+                chat_id,
+                (f"⚠️ You already have `{MAX_CONCURRENT_JOBS}` job(s) running.\n"
+                 "Wait for one to finish before starting another."),
+                markup=main_keyboard(user.id),
+            )
+            return
+    _set_session(user.id, STATE_AWAIT_MODE)
+    _safe_send(
+        chat_id,
+        ("🚀 *START EXTRACTION*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "Choose extraction type:"),
+        markup=_mode_keyboard(),
+    )
+
+
+def _show_confirm(chat_id, user_id, url, mode, visits):
+    host = urllib.parse.urlparse(url).hostname or url
+    mode_label = "🌐 IP Rotation" if mode == "IP_ROTATION" else "🟢 Direct"
+    _set_session(user_id, STATE_AWAIT_VISITS, url=url, mode=mode, visits=visits,
+                 confirmed=True)
+    _safe_send(
+        chat_id,
+        (f"🚀 *EXTRACTION READY*\n"
+         f"━━━━━━━━━━━━━━━━━━━━\n"
+         f"🔗 Target: `{md_esc(host)}`\n"
+         f"⚙️ Mode: {mode_label}\n"
+         f"🔄 Visits: `{visits}`\n"
+         f"━━━━━━━━━━━━━━━━━━━━"),
+        markup=_confirm_start_kb(),
+    )# =========================================================
+#  Job state + progress UI
+# =========================================================
+def _new_job_state(job_id: int, code: str, total: int, mode: str, url: str,
+                   chat_id: int, msg_id: int) -> dict:
     return {
-        "job_id": job_id, "total": total, "mode": mode, "url": url,
-        "chat_id": chat_id, "msg_id": msg_id,
+        "job_id": job_id, "code": code, "total": total, "mode": mode,
+        "url": url, "chat_id": chat_id, "msg_id": msg_id,
         "visit": 0, "successful": 0, "failed": 0,
         "unique_numbers": 0, "new_numbers": 0,
         "stage": "Preparing", "proxy_id": None, "proxy_protocol": "",
-        "exit_ip": "", "latency_ms": 0, "started_at": time.time(),
-        "last_event_ts": time.time(), "cancel": False,
+        "exit_ip": "", "latency_ms": 0,
+        "started_at": time.time(), "last_event_ts": time.time(),
+        "cancel": threading.Event(),
+        "pause": threading.Event(),   # set when paused
+        "paused": False,
     }
 
 
 def _progress_text(st: dict) -> str:
     pct = int((st["visit"] / st["total"]) * 100) if st["total"] else 0
-    done = (pct // 10)
-    bar = "█" * done + "░" * (10 - done)
     elapsed = int(time.time() - st["started_at"])
     mm, ss = divmod(elapsed, 60)
     speed = (st["visit"] / elapsed) if elapsed > 0 else 0
+    eta = (int((st["total"] - st["visit"]) / speed)
+           if speed > 0 and st["visit"] > 0 else 0)
+    eta_m, eta_s = divmod(eta, 60)
     proxy_line = ""
     if st["mode"] == "IP_ROTATION":
         if st["proxy_protocol"]:
-            proxy_line = (f"\n🌐 Proxy: *{st['proxy_protocol']}*\n"
-                          f"🆔 Exit IP: `{st['exit_ip'] or '—'}`\n"
-                          f"⚡ Latency: `{st['latency_ms']} ms`\n")
+            proxy_line = (
+                f"\n🌐 Proxy: *{st['proxy_protocol']}* "
+                f"(cached exit-IP)\n⚡ Latency: `{st['latency_ms']} ms`\n"
+            )
         else:
             proxy_line = "\n🌐 Proxy: _selecting…_\n"
+    status = "⏸ PAUSED" if st["paused"] else "🚀 EXTRACTION IN PROGRESS"
     return (
-        f"⏳ *EXTRACTION IN PROGRESS*\n"
+        f"{status}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 Job: `#{st['job_id']:06d}`\n"
+        f"🆔 Job: `{st['code']}`\n"
         f"🌐 Mode: *{st['mode']}*\n\n"
-        f"Progress:\n`[{bar}] {pct}%`\n\n"
+        f"Progress:\n`{_bar(pct)} {pct}%`\n\n"
         f"🔄 Visits: `{st['visit']}/{st['total']}`\n"
         f"✅ Successful: `{st['successful']}`\n"
         f"❌ Failed: `{st['failed']}`\n"
-        f"📱 Numbers Found: `{st['unique_numbers']}`\n"
-        f"🆕 New Numbers: `{st['new_numbers']}`\n"
+        f"📱 Numbers: `{st['unique_numbers']}`\n"
         f"{proxy_line}"
         f"⏱ Elapsed: `{mm:02d}:{ss:02d}`\n"
-        f"⚡ Speed: `{speed:.2f} visits/s`\n"
+        f"⚡ Speed: `{speed:.1f}/min`\n"
+        f"⌛ ETA: `{eta_m:02d}:{eta_s:02d}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔄 _{st['stage']}_"
+        f"🔄 _{md_esc(st['stage'])}_"
     )
 
 
 def _progress_updater(st: dict) -> None:
-    """Independent thread: edits the Telegram message at safe intervals."""
+    """Independent thread: edits Telegram message at safe intervals."""
     interval = float(get_setting("progress_interval", str(PROGRESS_INTERVAL)))
     last_text = ""
+    last_edit = 0
     while True:
-        if st.get("cancel") or st["visit"] >= st["total"]:
+        if st["cancel"].is_set():
             break
-        if st["visit"] == 0 and st["successful"] == 0 and st["failed"] == 0:
-            # show "working" even before first visit completes
-            st["stage"] = st.get("stage") or "Connecting…"
+        if st["visit"] >= st["total"] and not st["paused"]:
+            break
+        # don't churn edits while paused
+        if st["paused"]:
+            time.sleep(max(0.6, interval))
+            continue
         text = _progress_text(st)
-        if text != last_text:
-            try:
-                bot.edit_message_text(chat_id=st["chat_id"], message_id=st["msg_id"],
-                                      text=text, parse_mode="Markdown")
+        now = time.time()
+        if text != last_text and (now - last_edit) >= interval:
+            if _safe_edit(st["chat_id"], st["msg_id"], text):
                 last_text = text
-            except ApiTelegramException as e:
-                if "not modified" in str(e).lower():
-                    pass
-                else:
-                    pass  # never let progress kill the job
-            except Exception:
-                pass
+                last_edit = now
         time.sleep(max(0.6, interval))
 
 
@@ -1479,201 +2549,13 @@ def _emit(st: dict, stage: str, **kw) -> None:
     st["stage"] = stage
     st["last_event_ts"] = time.time()
     for k, v in kw.items():
-        if k in st:
+        if k in st and not isinstance(st[k], threading.Event):
             st[k] = v
 
 
 # =========================================================
-# Extraction Worker
+#  Error classification
 # =========================================================
-def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
-                      count: int, mode: str, msg_id: int) -> None:
-    job_id = create_job(user_id, username, url, mode, count)
-    st = _new_job_state(job_id, count, mode, url, chat_id, msg_id)
-    with _state_lock:
-        job_state[job_id] = st
-
-    # Launch progress updater thread
-    updater = threading.Thread(target=_progress_updater, args=(st,), daemon=True)
-    updater.start()
-
-    found: dict = {}  # normalized -> (method, source, visit)
-    dup_count = 0
-    start = time.time()
-    log.info("JOB_START job=%s user=%s mode=%s visits=%s url=%s", job_id, user_id, mode, count, _mask(url))
-
-    for visit in range(1, count + 1):
-        if st.get("cancel"):
-            break
-        st["visit"] = visit
-        _emit(st, "Selecting proxy…" if mode == "IP_ROTATION" else "Connecting…")
-
-        # ----- choose connection strategy -----
-        proxy_row = None
-        scraper = None
-        attempt_status = "UNKNOWN"
-        attempt_err = ""
-        attempt_proxy_id = None
-        attempt_exit_ip = ""
-        attempt_latency = 0
-
-        if mode == "IP_ROTATION":
-            proxy_row = proxy_pool.select()
-            if not proxy_row:
-                _emit(st, "No verified proxy available")
-                st["failed"] += 1
-                save_attempt(job_id, visit, None, "", "NO_PROXY", 0,
-                             "no verified proxy available")
-                # stop cleanly — do NOT fall back to direct
-                try:
-                    bot.edit_message_text(
-                        chat_id=chat_id, message_id=msg_id,
-                        text=("❌ *IP Rotation stopped*\n\nNo verified proxy is "
-                              "currently available. Please try again after proxies "
-                              "recover."),
-                        parse_mode="Markdown",
-                    )
-                except Exception:
-                    pass
-                break
-            proxy_dict = {"protocol": proxy_row["protocol"], "host": proxy_row["host"],
-                          "port": proxy_row["port"], "username": proxy_row["username"],
-                          "password": proxy_row["password"], "endpoint": proxy_row["endpoint"]}
-            attempt_proxy_id = proxy_row["id"]
-            st["proxy_id"] = proxy_row["id"]
-            st["proxy_protocol"] = proxy_row["protocol"].upper()
-            st["exit_ip"] = proxy_row.get("last_observed_ip") or ""
-            _emit(st, "Fetching via proxy…")
-
-            t0 = time.time()
-            try:
-                scraper = Scraper(use_proxy=True, proxy=proxy_dict)
-                final_url, body, visited = scraper.fetch(url)
-                attempt_latency = int((time.time() - t0) * 1000)
-                # verify exit IP again (cheap, single endpoint)
-                ip, _ = _verify_exit_ip(proxy_dict, 5)
-                if ip:
-                    attempt_exit_ip = ip
-                    st["exit_ip"] = ip
-                st["latency_ms"] = attempt_latency
-                attempt_status = "OK"
-                proxy_pool.mark_used_success(proxy_row["id"], attempt_latency, attempt_exit_ip)
-                st["successful"] += 1
-                _emit(st, "Scanning response…")
-            except Exception as e:
-                attempt_err = str(e)[:120]
-                attempt_status = _classify_err(e)
-                st["latency_ms"] = int((time.time() - t0) * 1000)
-                st["failed"] += 1
-                proxy_pool.mark_used_failure(proxy_row["id"], "TARGET_FAILED", attempt_err)
-                save_attempt(job_id, visit, attempt_proxy_id, attempt_exit_ip,
-                             attempt_status, attempt_latency, attempt_err)
-                # try one alternate proxy for this visit before giving up on it
-                alt = proxy_pool.select()
-                if alt:
-                    _emit(st, "Retrying with alternate proxy…")
-                    alt_dict = {"protocol": alt["protocol"], "host": alt["host"],
-                                "port": alt["port"], "username": alt["username"],
-                                "password": alt["password"], "endpoint": alt["endpoint"]}
-                    try:
-                        scraper = Scraper(use_proxy=True, proxy=alt_dict)
-                        final_url, body, visited = scraper.fetch(url)
-                        attempt_latency = int((time.time() - t0) * 1000)
-                        ip, _ = _verify_exit_ip(alt_dict, 5)
-                        if ip:
-                            attempt_exit_ip = ip
-                        attempt_status = "OK_RETRY"
-                        proxy_pool.mark_used_success(alt["id"], attempt_latency, attempt_exit_ip)
-                        st["successful"] += 1
-                        st["failed"] -= 1
-                        _emit(st, "Scanning response…")
-                    except Exception as e2:
-                        attempt_err = str(e2)[:120]
-                        attempt_status = _classify_err(e2)
-                        proxy_pool.mark_used_failure(alt["id"], "TARGET_FAILED", attempt_err)
-                        save_attempt(job_id, visit, alt["id"], attempt_exit_ip,
-                                     attempt_status, attempt_latency, attempt_err)
-                        continue
-                else:
-                    continue
-        else:
-            # direct mode
-            _emit(st, "Fetching…")
-            t0 = time.time()
-            try:
-                scraper = Scraper(use_proxy=False)
-                final_url, body, visited = scraper.fetch(url)
-                attempt_latency = int((time.time() - t0) * 1000)
-                st["latency_ms"] = attempt_latency
-                attempt_status = "OK"
-                st["successful"] += 1
-                _emit(st, "Scanning response…")
-            except Exception as e:
-                attempt_err = str(e)[:120]
-                attempt_status = _classify_err(e)
-                st["failed"] += 1
-                save_attempt(job_id, visit, None, "", attempt_status, attempt_latency, attempt_err)
-                continue
-
-        # ----- extract numbers from this visit -----
-        cycle_numbers = []  # (normalized, method, source)
-        # from redirect chain
-        for n, m in extract_from_url_chain(visited):
-            cycle_numbers.append((n, m, visited[-1]))
-        # from body
-        for n, m in extract_numbers(body, final_url, default_method="html"):
-            cycle_numbers.append((n, m, final_url))
-
-        new_this_visit = 0
-        for n, m, src in cycle_numbers:
-            if n in found:
-                dup_count += 1
-            else:
-                found[n] = (m, src, visit)
-                new_this_visit += 1
-                try:
-                    save_number(job_id, user_id, n, src, m, visit)
-                except Exception:
-                    pass
-
-        st["unique_numbers"] = len(found)
-        st["new_numbers"] = new_this_visit
-        _emit(st, "Visit complete" if new_this_visit == 0 else f"Found {new_this_visit} new")
-
-        # record successful attempt
-        save_attempt(job_id, visit, attempt_proxy_id, attempt_exit_ip,
-                     attempt_status, attempt_latency, attempt_err)
-
-        # brief pacing between visits
-        time.sleep(0.2)
-
-    # ----- finalize -----
-    duration_ms = int((time.time() - start) * 1000)
-    cancelled = st.get("cancel", False)
-    unique_count = len(found)
-    status = "CANCELLED" if cancelled else ("COMPLETED" if st["successful"] > 0 else "FAILED")
-    finish_job(job_id, st["successful"], st["failed"], unique_count, dup_count, duration_ms, status)
-    update_user_stats(user_id, unique_count)
-
-    with _state_lock:
-        active_jobs.pop(user_id, None)
-        job_state.pop(job_id, None)
-
-    log.info("JOB_COMPLETE job=%s status=%s unique=%s dup=%s dur=%sms",
-             job_id, status, unique_count, dup_count, duration_ms)
-
-    _send_final_result(chat_id, user_id, username, job_id, url, mode, count,
-                       st["successful"], st["failed"], unique_count, dup_count,
-                       duration_ms, found, cancelled)
-    # channel post (best-effort, non-blocking)
-    try:
-        _channel_post(job_id, user_id, username, url, mode, count,
-                      st["successful"], st["failed"], unique_count, dup_count,
-                      duration_ms, found)
-    except Exception as e:
-        log.warning("CHANNEL_POST_FAILED job=%s err=%s", job_id, e)
-
-
 def _classify_err(e: Exception) -> str:
     s = str(e).lower()
     if "407" in s or "proxy auth" in s:
@@ -1696,118 +2578,606 @@ def _classify_err(e: Exception) -> str:
         return "HTTP_404"
     if re.search(r"5\d\d", s):
         return "HTTP_5XX"
+    if "url rejected" in s:
+        return "INVALID_URL"
     return "REQUEST_FAILED"
 
 
 # =========================================================
-# Final Result & Channel Post
+#  Extraction worker  (single-link)
 # =========================================================
-def _fmt_duration(ms: int) -> str:
-    s = ms / 1000
-    if s < 60:
-        return f"{s:.1f}s"
-    m, sec = divmod(int(s), 60)
-    return f"{m:02d}:{sec:02d}"
+def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
+                      count: int, mode: str, msg_id: int) -> None:
+    job_id, code = create_job(user_id, username, url, mode, count)
+    st = _new_job_state(job_id, code, count, mode, url, chat_id, msg_id)
+    with _state_lock:
+        job_state[code] = st
+        active_jobs.setdefault(user_id, set()).add(code)
+
+    updater = threading.Thread(target=_progress_updater, args=(st,), daemon=True)
+    updater.start()
+
+    found: Dict[str, Tuple[str, str, int]] = {}
+    dup_count = 0
+    start = time.time()
+    log.info("JOB_START job=%s user=%s mode=%s visits=%s url=%s",
+             code, user_id, mode, count, _mask(url))
+
+    for visit in range(1, count + 1):
+        # ---- cancellation + pause gate ----
+        if st["cancel"].is_set():
+            break
+        while st["pause"].is_set() and not st["cancel"].is_set():
+            time.sleep(0.5)
+        if st["cancel"].is_set():
+            break
+
+        st["visit"] = visit
+        _emit(st, "Selecting proxy…" if mode == "IP_ROTATION"
+              else "Connecting…")
+
+        attempt_status = "UNKNOWN"
+        attempt_err = ""
+        attempt_proxy_id = None
+        attempt_exit_ip = ""
+        attempt_latency = 0
+        final_url = url
+        body = ""
+        visited = [url]
+        succeeded = False
+
+        if mode == "IP_ROTATION":
+            proxy_row = proxy_pool.select()
+            if not proxy_row:
+                _emit(st, "No verified proxy available")
+                st["failed"] += 1
+                save_attempt(job_id, visit, None, "", "NO_PROXY", 0,
+                             "no verified proxy available")
+                _safe_edit(
+                    chat_id, msg_id,
+                    ("❌ *IP ROTATION STOPPED*\n\n"
+                     "No verified proxy is currently available.\n"
+                     "Add or retest proxies from the Proxy Center."),
+                )
+                break
+
+            proxy_dict = {
+                "protocol": proxy_row["protocol"], "host": proxy_row["host"],
+                "port": proxy_row["port"], "username": proxy_row["username"],
+                "password": proxy_row["password"], "endpoint": proxy_row["endpoint"],
+            }
+            attempt_proxy_id = proxy_row["id"]
+            st["proxy_id"] = proxy_row["id"]
+            st["proxy_protocol"] = proxy_row["protocol"].upper()
+            # use cached exit-IP — NO per-request IP verification
+            cached = proxy_pool.cached_exit_ip(proxy_row["id"])
+            st["exit_ip"] = cached or proxy_row.get("last_observed_ip") or ""
+            _emit(st, "Fetching via proxy…")
+
+            t0 = time.time()
+            try:
+                scraper = Scraper(use_proxy=True, proxy=proxy_dict)
+                final_url, body, visited = scraper.fetch(url)
+                attempt_latency = int((time.time() - t0) * 1000)
+                st["latency_ms"] = attempt_latency
+                attempt_status = "OK"
+                proxy_pool.mark_used_success(
+                    proxy_row["id"], attempt_latency,
+                    st["exit_ip"] or proxy_row.get("last_observed_ip") or "")
+                st["successful"] += 1
+                succeeded = True
+                _emit(st, "Scanning response…")
+            except Exception as e:
+                attempt_err = str(e)[:120]
+                attempt_status = _classify_err(e)
+                st["latency_ms"] = int((time.time() - t0) * 1000)
+                # distinguish proxy failure from target failure
+                if attempt_status in ("AUTH_FAILED", "TCP_FAILED", "TIMEOUT",
+                                      "REFUSED", "DNS_FAILED"):
+                    proxy_pool.mark_used_failure(
+                        proxy_row["id"], attempt_status, attempt_err)
+                else:
+                    # target failed — proxy itself is fine
+                    proxy_pool.mark_target_failure(proxy_row["id"], attempt_err)
+                # one alternate proxy retry
+                alt = proxy_pool.select()
+                if alt and not st["cancel"].is_set():
+                    _emit(st, "Retrying with alternate proxy…")
+                    alt_dict = {
+                        "protocol": alt["protocol"], "host": alt["host"],
+                        "port": alt["port"], "username": alt["username"],
+                        "password": alt["password"], "endpoint": alt["endpoint"],
+                    }
+                    try:
+                        scraper = Scraper(use_proxy=True, proxy=alt_dict)
+                        final_url, body, visited = scraper.fetch(url)
+                        attempt_latency = int((time.time() - t0) * 1000)
+                        attempt_status = "OK_RETRY"
+                        attempt_proxy_id = alt["id"]
+                        st["proxy_protocol"] = alt["protocol"].upper()
+                        st["exit_ip"] = proxy_pool.cached_exit_ip(alt["id"]) \
+                            or alt.get("last_observed_ip") or ""
+                        proxy_pool.mark_used_success(
+                            alt["id"], attempt_latency, st["exit_ip"])
+                        st["successful"] += 1
+                        succeeded = True
+                        _emit(st, "Scanning response…")
+                    except Exception as e2:
+                        attempt_err = str(e2)[:120]
+                        attempt_status = _classify_err(e2)
+                        if attempt_status in ("AUTH_FAILED", "TCP_FAILED",
+                                              "TIMEOUT", "REFUSED",
+                                              "DNS_FAILED"):
+                            proxy_pool.mark_used_failure(
+                                alt["id"], attempt_status, attempt_err)
+                        else:
+                            proxy_pool.mark_target_failure(alt["id"], attempt_err)
+                        st["failed"] += 1
+                        save_attempt(job_id, visit, alt["id"], "",
+                                     attempt_status, attempt_latency, attempt_err)
+                        continue
+                else:
+                    st["failed"] += 1
+                    save_attempt(job_id, visit, attempt_proxy_id,
+                                 st["exit_ip"], attempt_status,
+                                 attempt_latency, attempt_err)
+                    continue
+        else:
+            # ---- direct mode ----
+            _emit(st, "Fetching…")
+            t0 = time.time()
+            try:
+                scraper = Scraper(use_proxy=False)
+                final_url, body, visited = scraper.fetch(url)
+                attempt_latency = int((time.time() - t0) * 1000)
+                st["latency_ms"] = attempt_latency
+                attempt_status = "OK"
+                st["successful"] += 1
+                succeeded = True
+                _emit(st, "Scanning response…")
+            except Exception as e:
+                attempt_err = str(e)[:120]
+                attempt_status = _classify_err(e)
+                st["failed"] += 1
+                save_attempt(job_id, visit, None, "", attempt_status,
+                             attempt_latency, attempt_err)
+                continue
+
+        # ---- extract numbers from this visit ----
+        if succeeded:
+            cycle_numbers = []
+            for n, m in extract_from_url_chain(visited):
+                cycle_numbers.append((n, m, visited[-1]))
+            for n, m in extract_numbers(body, final_url, default_method="html"):
+                cycle_numbers.append((n, m, final_url))
+
+            new_this_visit = 0
+            batch_rows = []
+            for n, m, src in cycle_numbers:
+                if n in found:
+                    dup_count += 1
+                else:
+                    found[n] = (m, src, visit)
+                    new_this_visit += 1
+                    batch_rows.append((n, m, src, visit))
+
+            if batch_rows:
+                _save_numbers_batch(job_id, user_id, batch_rows)
+
+            st["unique_numbers"] = len(found)
+            st["new_numbers"] = new_this_visit
+            _emit(st, "Visit complete" if new_this_visit == 0
+                  else f"Found {new_this_visit} new")
+
+            save_attempt(job_id, visit, attempt_proxy_id, st["exit_ip"],
+                         attempt_status, attempt_latency, "")
+
+        time.sleep(0.15)
+
+    # ---- finalize ----
+    duration_ms = int((time.time() - start) * 1000)
+    cancelled = st["cancel"].is_set()
+    unique_count = len(found)
+    status = ("CANCELLED" if cancelled
+              else ("COMPLETED" if st["successful"] > 0 else "FAILED"))
+    finish_job(job_id, st["successful"], st["failed"], unique_count,
+               dup_count, duration_ms, status)
+    update_user_stats(user_id, unique_count, urls_processed=st["successful"])
+
+    with _state_lock:
+        active_jobs.get(user_id, set()).discard(code)
+        if not active_jobs.get(user_id):
+            active_jobs.pop(user_id, None)
+        job_state.pop(code, None)
+
+    log.info("JOB_COMPLETE job=%s status=%s unique=%s dup=%s dur=%sms",
+             code, status, unique_count, dup_count, duration_ms)
+
+    _send_final_result(chat_id, user_id, username, job_id, code, url, mode,
+                       count, st["successful"], st["failed"], unique_count,
+                       dup_count, duration_ms, found, cancelled)
+    try:
+        _channel_post(job_id, code, user_id, username, url, mode, count,
+                      st["successful"], st["failed"], unique_count,
+                      dup_count, duration_ms, found)
+    except Exception as e:
+        log.warning("CHANNEL_POST_FAILED job=%s err=%s", code, e)
 
 
-def _send_final_result(chat_id, user_id, username, job_id, url, mode, count,
-                       success, failed, unique, dup, dur_ms, found, cancelled):
+# =========================================================
+#  Bulk extraction worker  (bounded pool, per-host limits)
+# =========================================================
+def _start_bulk_job(chat_id, user, urls: list, mode: str):
+    """Run multiple single-visit extractions in parallel with bounded workers."""
+    group_id = f"BULK-{random.randint(0, 0xFFFFFF):06X}"
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute(
+                """INSERT INTO bulk_groups(group_id, user_id, total_urls,
+                   processed, successful, failed, numbers, status)
+                   VALUES(?,?,?,?,0,0,0,0,'RUNNING')""",
+                (group_id, user.id, len(urls)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    msg = bot.send_message(
+        chat_id,
+        ("📚 *BULK EXTRACTION*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         f"🆔 Group: `{group_id}`\n"
+         f"🔗 URLs: `{len(urls)}`\n"
+         f"🌐 Mode: *{md_esc(mode)}*\n\n"
+         f"Progress:\n`{_bar(0)} 0%`\n\n"
+         f"Processed: `0`\n"
+         f"✅ Success: `0`\n"
+         f"❌ Failed: `0`\n"
+         f"📱 Numbers: `0`\n"
+         f"━━━━━━━━━━━━━━━━━━━━"),
+        parse_mode="Markdown",
+        reply_markup=types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton("🛑 Cancel Job",
+                                       callback_data=f"cancelbulk_{group_id}")),
+    )
+
+    threading.Thread(
+        target=_bulk_worker,
+        args=(chat_id, user, urls, mode, group_id, msg.message_id),
+        daemon=True,
+    ).start()
+
+
+def _bulk_worker(chat_id, user, urls, mode, group_id, msg_id):
+    found: Dict[str, Tuple[str, str]] = {}
+    dup_count = 0
+    processed = successful = failed = 0
+    total = len(urls)
+    start = time.time()
+    cancel_event = threading.Event()
+    with _state_lock:
+        # store cancel event under group_id for the cancel callback
+        job_state[group_id] = {"cancel": cancel_event, "bulk": True}
+
+    # dedupe URLs
+    seen_urls: Set[str] = set()
+    unique_urls = []
+    for u in urls:
+        if u not in seen_urls:
+            seen_urls.add(u)
+            unique_urls.append(u)
+    dup_urls = total - len(unique_urls)
+    total_unique = len(unique_urls)
+
+    # per-host semaphore map
+    host_locks: Dict[str, threading.Semaphore] = {}
+    for u in unique_urls:
+        h = urllib.parse.urlparse(u).hostname or "unknown"
+        if h not in host_locks:
+            host_locks[h] = threading.Semaphore(PER_HOST_LIMIT)
+
+    def _one(u):
+        if cancel_event.is_set():
+            return None
+        host = urllib.parse.urlparse(u).hostname or "unknown"
+        sem = host_locks.get(host)
+        if sem:
+            sem.acquire()
+        try:
+            proxy_row = None
+            if mode == "IP_ROTATION":
+                proxy_row = proxy_pool.select()
+                if not proxy_row:
+                    return ("failed", u, None, "no_proxy")
+            scraper = Scraper(
+                use_proxy=(mode == "IP_ROTATION"),
+                proxy=({"protocol": proxy_row["protocol"],
+                        "host": proxy_row["host"], "port": proxy_row["port"],
+                        "username": proxy_row["username"],
+                        "password": proxy_row["password"],
+                        "endpoint": proxy_row["endpoint"]}
+                       if proxy_row else None),
+            )
+            final_url, body, visited = scraper.fetch(u)
+            nums = []
+            for n, m in extract_from_url_chain(visited):
+                nums.append((n, m, visited[-1]))
+            for n, m in extract_numbers(body, final_url, default_method="html"):
+                nums.append((n, m, final_url))
+            return ("ok", u, nums, None)
+        except Exception as e:
+            return ("failed", u, None, _classify_err(e))
+        finally:
+            if sem:
+                sem.release()
+
+    last_edit = 0
+    with ThreadPoolExecutor(max_workers=BULK_WORKERS) as ex:
+        futs = {ex.submit(_one, u): u for u in unique_urls}
+        for fut in as_completed(futs):
+            if cancel_event.is_set():
+                for f in futs:
+                    f.cancel()
+                break
+            try:
+                res = fut.result()
+            except Exception:
+                res = ("failed", "?", None, "worker_error")
+            processed += 1
+            if res and res[0] == "ok":
+                successful += 1
+                _, u, nums, _ = res
+                batch_rows = []
+                for n, m, src in (nums or []):
+                    if n in found:
+                        dup_count += 1
+                    else:
+                        found[n] = (m, src)
+                        batch_rows.append((n, m, src, 0))
+                if batch_rows:
+                    # use a synthetic job_id of 0; numbers stored under group
+                    with _db_lock:
+                        conn = get_conn()
+                        try:
+                            conn.executemany(
+                                """INSERT INTO extraction_job_numbers
+                                   (job_id, user_id, number, source_url,
+                                    extraction_method, visit_number)
+                                   VALUES(0,?,?,?,?,0)""",
+                                [(0, user.id, n, src, m) for n, m, src, _ in
+                                 batch_rows],
+                            )
+                            conn.commit()
+                        finally:
+                            conn.close()
+            else:
+                failed += 1
+
+            # throttle progress edits to ~1/sec
+            now = time.time()
+            if now - last_edit >= 1.0:
+                pct = int((processed / total_unique) * 100) if total_unique else 0
+                elapsed = int(now - start)
+                speed = (processed / elapsed) if elapsed > 0 else 0
+                eta = int((total_unique - processed) / speed) if speed > 0 else 0
+                _safe_edit(
+                    chat_id, msg_id,
+                    ("📚 *BULK EXTRACTION*\n"
+                     "━━━━━━━━━━━━━━━━━━━━\n"
+                     f"🆔 Group: `{group_id}`\n"
+                     f"🔗 URLs: `{total_unique}` "
+                     f"(dupes removed: `{dup_urls}`)\n"
+                     f"🌐 Mode: *{md_esc(mode)}*\n\n"
+                     f"Progress:\n`{_bar(pct)} {pct}%`\n\n"
+                     f"Processed: `{processed}/{total_unique}`\n"
+                     f"✅ Success: `{successful}`\n"
+                     f"❌ Failed: `{failed}`\n"
+                     f"📱 Numbers: `{len(found)}`\n"
+                     f"⚡ Speed: `{speed:.1f}/min`\n"
+                     f"⌛ ETA: `{eta//60:02d}:{eta%60:02d}`\n"
+                     "━━━━━━━━━━━━━━━━━━━━"),
+                )
+                last_edit = now
+
+    duration_ms = int((time.time() - start) * 1000)
+    cancelled = cancel_event.is_set()
+    status = "CANCELLED" if cancelled else ("COMPLETED" if successful > 0
+                                            else "FAILED")
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute(
+                """UPDATE bulk_groups SET processed=?, successful=?, failed=?,
+                   numbers=?, status=?, completed_at=CURRENT_TIMESTAMP
+                   WHERE group_id=?""",
+                (processed, successful, failed, len(found), status, group_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    with _state_lock:
+        job_state.pop(group_id, None)
+
+    _safe_edit(
+        chat_id, msg_id,
+        ("✅ *BULK COMPLETE*" if not cancelled else "🛑 *BULK CANCELLED*") +
+        (f"\n━━━━━━━━━━━━━━━━━━━━\n"
+         f"🆔 Group: `{group_id}`\n"
+         f"🔗 Processed: `{processed}/{total_unique}`\n"
+         f"✅ Successful: `{successful}`\n"
+         f"❌ Failed: `{failed}`\n"
+         f"📱 Unique Numbers: `{len(found)}`\n"
+         f"♻️ Duplicates: `{dup_count}`\n"
+         f"⏱ Duration: `{_fmt_duration(duration_ms)}`\n"
+         "━━━━━━━━━━━━━━━━━━━━"),
+    )
+    # deliver results + files
+    _send_bulk_result(chat_id, user, group_id, found, duration_ms)
+
+
+# =========================================================
+#  Final result + export files
+# =========================================================
+def _send_final_result(chat_id, user_id, username, job_id, code, url, mode,
+                       count, success, failed, unique, dup, dur_ms, found,
+                       cancelled):
     host = urllib.parse.urlparse(url).hostname or url
     mode_label = "🌐 IP Rotation" if mode == "IP_ROTATION" else "🟢 Direct"
     head = (
-        f"{'✅ EXTRACTION COMPLETED' if not cancelled else '🛑 EXTRACTION CANCELLED'}\n"
+        f"{'✅ EXTRACTION COMPLETE' if not cancelled else '🛑 EXTRACTION CANCELLED'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 Job: `#{job_id:06d}`\n"
-        f"🔗 Source: `{host}`\n\n"
-        f"⚙️ Method: {mode_label}\n\n"
+        f"🆔 Job: `{code}`\n"
+        f"🔗 Source: `{md_esc(_short(host, 50))}`\n\n"
+        f"⚙️ Mode: {mode_label}\n\n"
         f"🔄 Visits: `{success + failed}/{count}`\n"
         f"✅ Successful: `{success}`\n"
         f"❌ Failed: `{failed}`\n\n"
         f"📱 Unique Numbers: `{unique}`\n"
         f"♻️ Duplicates: `{dup}`\n\n"
         f"⏱ Duration: `{_fmt_duration(dur_ms)}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
     )
-    # inline buttons
+
     mk = types.InlineKeyboardMarkup(row_width=2)
     btns = []
     if unique > 0:
-        btns.append(types.InlineKeyboardButton("📋 Copy Numbers",
-                                                switch_inline_query=f"job_{job_id}"))
-    btns.append(types.InlineKeyboardButton("🔗 New Extraction", callback_data="new_extract"))
-    mk.add(*btns)
+        btns.append(types.InlineKeyboardButton(
+            "📋 Copy Numbers",
+            switch_inline_query_current_chat=f"copy_{code}"))
+        btns.append(types.InlineKeyboardButton(
+            "📥 TXT", callback_data=f"dl_{code}_txt"))
+        btns.append(types.InlineKeyboardButton(
+            "📊 CSV", callback_data=f"dl_{code}_csv"))
+        btns.append(types.InlineKeyboardButton(
+            "📄 JSON", callback_data=f"dl_{code}_json"))
+        btns.append(types.InlineKeyboardButton(
+            "📤 Send to Channel", callback_data=f"chan_{code}"))
+    btns.append(types.InlineKeyboardButton(
+        "🔄 Run Again", callback_data="ex_start"))
+    btns.append(types.InlineKeyboardButton(
+        "🗑 Delete Result", callback_data=f"del_{code}"))
+    btns.append(types.InlineKeyboardButton("◀️ Home",
+                                            callback_data="nav_home"))
+    # arrange 2 per row
+    for i in range(0, len(btns), 2):
+        mk.row(*btns[i:i+2])
 
+    _safe_send(chat_id, head, markup=mk)
+    _safe_send(chat_id, "🏠 *Main Menu*", markup=main_keyboard(user_id))
+
+
+def _send_bulk_result(chat_id, user, group_id, found, dur_ms):
+    if not found:
+        _safe_send(chat_id, "🏠 *Main Menu*",
+                   markup=main_keyboard(user.id))
+        return
+    sorted_nums = sorted(found.keys())
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        types.InlineKeyboardButton(
+            "📋 Copy Numbers",
+            switch_inline_query_current_chat=f"copybulk_{group_id}"),
+        types.InlineKeyboardButton(
+            "📥 TXT", callback_data=f"dlbulk_{group_id}_txt"),
+        types.InlineKeyboardButton(
+            "📊 CSV", callback_data=f"dlbulk_{group_id}_csv"),
+        types.InlineKeyboardButton(
+            "📄 JSON", callback_data=f"dlbulk_{group_id}_json"),
+        types.InlineKeyboardButton("◀️ Home", callback_data="nav_home"),
+    )
+    _safe_send(
+        chat_id,
+        ("📁 *BULK RESULT FILES*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         f"🆔 Group: `{group_id}`\n"
+         f"📱 Numbers: `{len(sorted_nums)}`\n"
+         f"⏱ Duration: `{_fmt_duration(dur_ms)}`\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "Tap a format to download:"),
+        markup=mk,
+    )
+
+
+def _build_txt(code: str, found: Dict[str, Tuple]) -> bytes:
+    lines = [
+        "DK Scraping Bot — Extraction Result",
+        f"Job ID: {code}",
+        f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"Unique Numbers: {len(found)}",
+        "=" * 50,
+        "",
+    ]
+    for n in sorted(found.keys()):
+        m, src = found[n][0], found[n][1] if len(found[n]) > 1 else ""
+        lines.append(f"+{n}  |  {m}  |  {src}")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _build_csv(code: str, found: Dict[str, Tuple]) -> bytes:
+    import csv
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["number", "method", "source_url"])
+    for n in sorted(found.keys()):
+        if len(found[n]) >= 2:
+            w.writerow([f"+{n}", found[n][0], found[n][1]])
+        else:
+            w.writerow([f"+{n}", found[n][0], ""])
+    return buf.getvalue().encode("utf-8")
+
+
+def _build_json(code: str, found: Dict[str, Tuple]) -> bytes:
+    out = {
+        "job_id": code,
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "unique_numbers": len(found),
+        "numbers": [
+            {"number": f"+{n}", "method": (found[n][0] if found[n] else ""),
+             "source_url": (found[n][1] if len(found[n]) > 1 else "")}
+            for n in sorted(found.keys())
+        ],
+    }
+    return json.dumps(out, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def _deliver_file(chat_id, code: str, fmt: str, found: Dict[str, Tuple]):
+    if not found:
+        _safe_send(chat_id, "❌ No numbers to export.")
+        return
+    if fmt == "txt":
+        data = _build_txt(code, found)
+        name = f"{code.replace('-', '_')}_numbers.txt"
+    elif fmt == "csv":
+        data = _build_csv(code, found)
+        name = f"{code.replace('-', '_')}_numbers.csv"
+    elif fmt == "json":
+        data = _build_json(code, found)
+        name = f"{code.replace('-', '_')}_numbers.json"
+    else:
+        return
+    bio = io.BytesIO(data)
+    bio.name = name
     try:
-        bot.send_message(chat_id, head, parse_mode="Markdown", reply_markup=mk)
-    except Exception:
-        bot.send_message(chat_id, head)
-
-    # send numbers inline + .txt file
-    if unique > 0:
-        sorted_nums = sorted(found.keys())
-        # chunked inline display
-        CHUNK = 3800
-        lines = [f"+{n}" for n in sorted_nums]
-        chunks, cur = [], ""
-        for ln in lines:
-            if len(cur) + len(ln) + 1 > CHUNK:
-                chunks.append(cur.strip()); cur = ln + "\n"
-            else:
-                cur += ln + "\n"
-        if cur.strip():
-            chunks.append(cur.strip())
-        for i, ch in enumerate(chunks):
-            hdr = (f"📱 *Numbers (Job #{job_id:06d})*\n"
-                   f"━━━━━━━━━━━━━━━━━━━━\n") if i == 0 else f"📱 *Numbers (Part {i+1})*\n"
-            try:
-                bot.send_message(chat_id, hdr + f"`{ch}`", parse_mode="Markdown")
-            except Exception:
-                bot.send_message(chat_id, ch)
-
-        # .txt file with full metadata
-        fname = f"job_{job_id:06d}_numbers.txt"
-        try:
-            lines_out = [
-                f"DK Sharma Bot — Extraction Result",
-                f"Job ID: #{job_id:06d}",
-                f"User: @{username or '—'} ({user_id})",
-                f"Source URL: {url}",
-                f"Method: {mode}",
-                f"Visits: {count} (successful {success}, failed {failed})",
-                f"Duration: {_fmt_duration(dur_ms)}",
-                f"Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                f"Unique Numbers: {unique}",
-                f"{'='*50}",
-                "",
-                "Number | Method | Source | Visit",
-                "-"*50,
-            ]
-            for n in sorted_nums:
-                m, src, v = found[n]
-                lines_out.append(f"+{n} | {m} | {src} | #{v}")
-            content = "\n".join(lines_out)
-            import io
-            bio = io.BytesIO(content.encode("utf-8"))
-            bio.name = fname
-            bot.send_document(chat_id, bio,
-                              caption=(f"📁 *Numbers File — Job #{job_id:06d}*\n"
-                                       f"📱 `{unique}` unique numbers"),
-                              parse_mode="Markdown")
-        except Exception as e:
-            log.warning("FILE_SEND_FAILED job=%s err=%s", job_id, e)
-            bot.send_message(chat_id, f"📁 File generation issue: `{str(e)[:80]}`",
-                             parse_mode="Markdown")
-
-    bot.send_message(chat_id, "🏠 *Main Menu*", parse_mode="Markdown",
-                     reply_markup=main_keyboard(user_id))
+        bot.send_document(chat_id, bio,
+                          caption=(f"📁 *{fmt.upper()} Export — {code}*\n"
+                                   f"📱 `{len(found)}` unique numbers"),
+                          parse_mode="Markdown")
+    except Exception as e:
+        log.warning("FILE_SEND_FAILED %s err=%s", code, e)
+        _safe_send(chat_id, f"❌ File send failed: `{str(e)[:80]}`")
 
 
-def _channel_post(job_id, user_id, username, url, mode, count, success, failed,
-                  unique, dup, dur_ms, found):
+# =========================================================
+#  Channel auto-post
+# =========================================================
+def _channel_post(job_id, code, user_id, username, url, mode, count, success,
+                  failed, unique, dup, dur_ms, found):
     cfg = get_settings_batch([
         "channel_logging", "channel_username", "channel_include_username",
-        "channel_include_uid", "channel_include_method", "channel_include_numbers",
-        "channel_attach_txt",
+        "channel_include_uid", "channel_include_method",
+        "channel_include_numbers", "channel_include_source", "show_duration",
+        "show_job_id",
     ])
     if cfg["channel_logging"] != "1":
         return
@@ -1816,28 +3186,25 @@ def _channel_post(job_id, user_id, username, url, mode, count, success, failed,
         return
     host = urllib.parse.urlparse(url).hostname or url
     mode_label = "🌐 IP Rotation" if mode == "IP_ROTATION" else "🟢 Direct"
-    lines = [
-        "📡 NEW EXTRACTION RESULT",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
+    lines = ["📡 EXTRACTION RESULT", "━━━━━━━━━━━━━━━━━━━━"]
     if cfg["channel_include_username"] == "1":
-        lines.append(f"👤 User: @{username or '—'}")
+        lines.append(f"👤 User: @{md_esc(username or '—')}")
     if cfg["channel_include_uid"] == "1":
         lines.append(f"🆔 User ID: `{user_id}`")
-    lines += [
-        f"🔗 Source: `{host}`",
-    ]
+    if cfg["channel_include_source"] == "1":
+        lines.append(f"🔗 Source: `{md_esc(host)}`")
     if cfg["channel_include_method"] == "1":
-        lines.append(f"⚙️ Method: {mode_label}")
+        lines.append(f"⚙️ Mode: {mode_label}")
     lines += [
         f"🔄 Visits: `{count}`",
         f"✅ Successful: `{success}`",
         f"❌ Failed: `{failed}`",
         f"📱 Unique Numbers: `{unique}`",
         f"♻️ Duplicates: `{dup}`",
-        f"⏱ Duration: `{_fmt_duration(dur_ms)}`",
-        "━━━━━━━━━━━━━━━━━━━━",
     ]
+    if cfg["show_duration"] == "1":
+        lines.append(f"⏱ Duration: `{_fmt_duration(dur_ms)}`")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
     if cfg["channel_include_numbers"] == "1" and unique > 0:
         nums = sorted(found.keys())
         if len(nums) <= 30:
@@ -1847,910 +3214,209 @@ def _channel_post(job_id, user_id, username, url, mode, count, success, failed,
             lines.append("━━━━━━━━━━━━━━━━━━━━")
         else:
             lines.append(f"📞 Numbers: `{unique}` (summary only)")
-    lines += [
-        f"🕒 {datetime.utcnow().strftime('%d %b %Y • %H:%M UTC')}",
-        f"🆔 Job: `#{job_id:06d}`",
-    ]
+    if cfg["show_job_id"] == "1":
+        lines.append(f"🆔 Job: `{code}`")
+    lines.append(f"🕒 {datetime.utcnow().strftime('%d %b %Y • %H:%M UTC')}")
+
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:3990] + "…"
+
+    # inline button to fetch numbers in private chat
+    mk = types.InlineKeyboardMarkup()
+    if unique > 0:
+        mk.add(types.InlineKeyboardButton(
+            "📋 Copy Numbers",
+            switch_inline_query_current_chat=f"copy_{code}"))
 
     msg_id = None
     err = ""
     for attempt in range(3):
         try:
-            msg = bot.send_message(channel, text, parse_mode="Markdown")
+            msg = bot.send_message(channel, text, parse_mode="Markdown",
+                                   reply_markup=mk if mk.keyboard else None)
             msg_id = msg.message_id
             err = ""
             break
         except ApiTelegramException as e:
             err = str(e)[:120]
-            if "chat not found" in err.lower() or "not enough rights" in err.lower():
-                break  # permanent
+            low = err.lower()
+            if "chat not found" in low or "not enough rights" in low \
+                    or "bot is not a member" in low:
+                break
+            if "retry after" in low:
+                m = re.search(r"retry after (\d+)", low)
+                time.sleep(int(m.group(1)) + 1 if m else 2)
+                continue
             time.sleep(1.5 * (attempt + 1))
         except Exception as e:
             err = str(e)[:120]
             time.sleep(1.5 * (attempt + 1))
 
-    # record
     with _db_lock:
         conn = get_conn()
         try:
             conn.execute(
-                "INSERT INTO channel_posts(job_id, channel, status, message_id, error) "
-                "VALUES(?,?,?,?,?)",
+                "INSERT INTO channel_posts(job_id, channel, status, "
+                "message_id, error) VALUES(?,?,?,?,?)",
                 (job_id, channel, "OK" if msg_id else "FAILED", msg_id, err),
             )
             conn.commit()
         finally:
             conn.close()
     if msg_id:
-        log.info("CHANNEL_POST_SUCCESS job=%s channel=%s", job_id, channel)
+        log.info("CHANNEL_POST_SUCCESS job=%s channel=%s", code, channel)
     else:
-        log.warning("CHANNEL_POST_FAILED job=%s channel=%s err=%s", job_id, channel, err)
-
-
-# =========================================================
-# Keyboards
-# =========================================================
-def main_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
-    mk = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    mk.add(
-        types.KeyboardButton("🔗 Extract Numbers"),
-        types.KeyboardButton("📊 My Statistics"),
-        types.KeyboardButton("📋 My History"),
-        types.KeyboardButton("❓ Help"),
-        types.KeyboardButton("📞 Support"),
-    )
-    if is_admin(user_id):
-        mk.add(types.KeyboardButton("🔐 Admin Panel"))
-    return mk
-
-
-def mode_keyboard() -> types.InlineKeyboardMarkup:
-    mk = types.InlineKeyboardMarkup(row_width=1)
-    mk.add(
-        types.InlineKeyboardButton("🟢 Direct (No IP)", callback_data="mode_direct"),
-        types.InlineKeyboardButton("🌐 IP Rotation", callback_data="mode_proxy"),
-        types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_job"),
-    )
-    return mk
-
-
-def visits_keyboard() -> types.InlineKeyboardMarkup:
-    mk = types.InlineKeyboardMarkup(row_width=2)
-    mk.add(
-        types.InlineKeyboardButton("🧪 1x Test", callback_data="visits_1"),
-        types.InlineKeyboardButton("🚀 20x", callback_data="visits_20"),
-        types.InlineKeyboardButton("⚡ 50x", callback_data="visits_50"),
-        types.InlineKeyboardButton("💎 100x", callback_data="visits_100"),
-        types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_job"),
-    )
-    return mk
-
-
-def admin_keyboard() -> types.InlineKeyboardMarkup:
-    mk = types.InlineKeyboardMarkup(row_width=2)
-    mk.add(
-        types.InlineKeyboardButton("📊 Dashboard", callback_data="adm_dashboard"),
-        types.InlineKeyboardButton("👥 Users", callback_data="adm_users"),
-        types.InlineKeyboardButton("📱 Extraction Logs", callback_data="adm_jobs"),
-        types.InlineKeyboardButton("🌐 Proxy Center", callback_data="adm_proxies"),
-        types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast"),
-        types.InlineKeyboardButton("📡 Channel", callback_data="adm_channel"),
-        types.InlineKeyboardButton("⚙️ Bot Settings", callback_data="adm_settings"),
-        types.InlineKeyboardButton("🛠 Maintenance", callback_data="adm_maint"),
-        types.InlineKeyboardButton("👮 Admins", callback_data="adm_admins"),
-        types.InlineKeyboardButton("⏳ Pending Users", callback_data="adm_pending"),
-        types.InlineKeyboardButton("🩺 Diagnostics", callback_data="adm_diag"),
-        types.InlineKeyboardButton("🔙 Close", callback_data="adm_close"),
-    )
-    return mk
-
-
-def proxy_center_keyboard() -> types.InlineKeyboardMarkup:
-    mk = types.InlineKeyboardMarkup(row_width=2)
-    mk.add(
-        types.InlineKeyboardButton("📊 Dashboard", callback_data="px_dashboard"),
-        types.InlineKeyboardButton("➕ Add Proxy", callback_data="px_add"),
-        types.InlineKeyboardButton("📦 Bulk Add", callback_data="px_bulk"),
-        types.InlineKeyboardButton("📋 List", callback_data="px_list"),
-        types.InlineKeyboardButton("🧪 Health Check", callback_data="px_test_all"),
-        types.InlineKeyboardButton("🔄 Retest Unhealthy", callback_data="px_retest"),
-        types.InlineKeyboardButton("🗑 Cleanup Dead", callback_data="px_cleanup"),
-        types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"),
-    )
-    return mk
-
-
-# =========================================================
-# URL Validation
-# =========================================================
-_URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
-
-
-def validate_url(text: str) -> Optional[str]:
-    t = text.strip()
-    if not t:
-        return None
-    if not t.startswith(("http://", "https://")):
-        t = "https://" + t
-    if not _URL_RE.match(t):
-        return None
-    try:
-        p = urllib.parse.urlparse(t)
-        if not p.hostname or "." not in p.hostname:
-            return None
-        return t
-    except Exception:
-        return None
-
-
-# =========================================================
-# Command Handlers
-# =========================================================
-@bot.message_handler(commands=["start"])
-def cmd_start(message: types.Message):
-    u = message.from_user
-    status = register_user(u.id, u.username, u.first_name)
-    if status == "BLOCKED":
-        bot.send_message(message.chat.id, "🚫 *Your access has been blocked.*",
-                         parse_mode="Markdown")
-        return
-    if status == "PENDING":
-        admin_name = get_setting("admin_display_name", "Admin")
-        bot.send_message(
-            message.chat.id,
-            ("🔒 *ACCESS PENDING*\n\n"
-             "Your access request has been submitted.\n"
-             "Please wait for administrator approval.\n\n"
-             f"_— {admin_name}_"),
-            parse_mode="Markdown",
-        )
-        # notify admins
-        for aid in ADMIN_IDS:
-            try:
-                mk = types.InlineKeyboardMarkup()
-                mk.add(types.InlineKeyboardButton("✅ Approve",
-                        callback_data=f"appr_{u.id}"),
-                       types.InlineKeyboardButton("❌ Reject",
-                        callback_data=f"rej_{u.id}"))
-                bot.send_message(aid,
-                    (f"👤 *NEW USER REQUEST*\n\n"
-                     f"Name: {u.first_name or '—'}\n"
-                     f"Username: @{u.username or '—'}\n"
-                     f"User ID: `{u.id}`"),
-                    parse_mode="Markdown", reply_markup=mk)
-            except Exception:
-                pass
-        return
-    _send_home(message.chat.id, u.id)
-
-
-def _send_home(chat_id, user_id):
-    name = get_setting("admin_display_name", "DK Sharma")
-    bot.send_message(
-        chat_id,
-        (f"🤖 *URL EXTRACTION CENTER*\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"Welcome!\n"
-         f"Extract publicly exposed WhatsApp/contact numbers from "
-         f"redirect or rotating links.\n\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"_Made by {name}_"),
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(user_id),
-    )
-
-
-@bot.message_handler(commands=["admin"])
-def cmd_admin(message: types.Message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "❌ *Access Denied.*", parse_mode="Markdown")
-        return
-    _show_admin_panel(message.chat.id)
-
-
-def _show_admin_panel(chat_id):
-    bot.send_message(
-        chat_id,
-        ("🔐 *ADMIN CONTROL CENTER*\n"
-         "━━━━━━━━━━━━━━━━━━━━\n"
-         "Select an action:"),
-        parse_mode="Markdown",
-        reply_markup=admin_keyboard(),
-    )
-
-
-# =========================================================
-# Main Router
-# =========================================================
-@bot.message_handler(func=lambda m: True)
-def handle_messages(message: types.Message):
-    global MAINTENANCE_MODE
-    u = message.from_user
-    chat_id = message.chat.id
-    text = (message.text or "").strip()
-
-    register_user(u.id, u.username, u.first_name)
-    with _state_lock:
-        state = user_states.get(u.id, {})
-
-    # maintenance check
-    if MAINTENANCE_MODE and not is_admin(u.id):
-        bot.send_message(
-            chat_id,
-            ("🛠 *BOT UNDER MAINTENANCE*\n\n"
-             "Please try again later."),
-            parse_mode="Markdown",
-        )
-        return
-
-    # blocked / pending
-    user = get_user(u.id)
-    if user:
-        if user["blocked"]:
-            bot.send_message(chat_id, "🚫 *Access blocked.*", parse_mode="Markdown")
-            return
-        if user["status"] == "PENDING":
-            bot.send_message(chat_id, "🔒 *Access pending approval.*", parse_mode="Markdown")
-            return
-
-    # awaiting URL
-    if state.get("awaiting_url"):
-        url = validate_url(text)
-        with _state_lock:
-            user_states[u.id] = {"url": url, "awaiting_mode": True} if url else {}
-        if not url:
-            bot.send_message(chat_id,
-                "❌ *Invalid URL.*\nPlease send a valid `http://` or `https://` link.",
-                parse_mode="Markdown")
-            return
-        bot.send_message(
-            chat_id,
-            (f"✅ *URL received*\n`{url[:60]}{'…' if len(url) > 60 else ''}`\n\n"
-             f"Choose extraction mode:"),
-            parse_mode="Markdown",
-            reply_markup=mode_keyboard(),
-        )
-        return
-
-    # awaiting broadcast
-    if state.get("awaiting_broadcast") and is_admin(u.id):
-        with _state_lock:
-            user_states[u.id] = {}
-        threading.Thread(target=_do_broadcast, args=(chat_id, u.id, text), daemon=True).start()
-        return
-
-    # awaiting proxy add
-    if state.get("awaiting_proxy_add") and is_admin(u.id):
-        with _state_lock:
-            user_states[u.id] = {}
-        _handle_proxy_add(chat_id, u.id, text)
-        return
-
-    if state.get("awaiting_proxy_bulk") and is_admin(u.id):
-        with _state_lock:
-            user_states[u.id] = {}
-        _handle_proxy_bulk(chat_id, u.id, text)
-        return
-
-    if state.get("awaiting_search") and is_admin(u.id):
-        with _state_lock:
-            user_states[u.id] = {}
-        _handle_user_search(chat_id, u.id, text)
-        return
-
-    # admin buttons (text fallback if reply keyboards used)
-    if is_admin(u.id) and text == "🔐 Admin Panel":
-        _show_admin_panel(chat_id)
-        return
-
-    # main user buttons
-    if text == "🔗 Extract Numbers":
-        if active_jobs.get(u.id):
-            bot.send_message(chat_id,
-                "⚠️ *You already have a job running.* Wait for it to finish.",
-                parse_mode="Markdown")
-            return
-        with _state_lock:
-            user_states[u.id] = {"awaiting_url": True}
-        bot.send_message(
-            chat_id,
-            ("🔗 *Send your URL*\n\n"
-             "Paste the rotating or redirect link.\n"
-             f"_Example:_ `https://example.com/l/abc`"),
-            parse_mode="Markdown",
-            reply_markup=types.ReplyKeyboardRemove(),
-        )
-        return
-
-    if text == "📊 My Statistics":
-        _show_user_stats(chat_id, u.id)
-        return
-
-    if text == "📋 My History":
-        _show_user_history(chat_id, u.id)
-        return
-
-    if text == "❓ Help":
-        bot.send_message(
-            chat_id,
-            ("❓ *How to use*\n"
-             "━━━━━━━━━━━━━━━━━━━━\n"
-             "1️⃣ Tap *🔗 Extract Numbers*\n"
-             "2️⃣ Send your URL\n"
-             "3️⃣ Choose mode: Direct or IP Rotation\n"
-             "4️⃣ Choose visit count\n"
-             "5️⃣ Receive unique numbers + `.txt` file\n\n"
-             "Only public/authorized content is processed."),
-            parse_mode="Markdown",
-            reply_markup=main_keyboard(u.id),
-        )
-        return
-
-    if text == "📞 Support":
-        sup = get_setting("support_username", "HshDkSharmaBotsmall")
-        bot.send_message(
-            chat_id,
-            (f"📞 *Support*\n"
-             f"━━━━━━━━━━━━━━━━━━━━\n"
-             f"Contact: @{sup}"),
-            parse_mode="Markdown",
-            reply_markup=main_keyboard(u.id),
-        )
-        return
-
-    if text in ("❌ Cancel", "🔙 Main Menu"):
-        with _state_lock:
-            if u.id in active_jobs:
-                job_state_ids = [jid for jid, st in job_state.items() if True]
-                # mark cancel on this user's running job
-                for jid, st in job_state.items():
-                    pass
-            user_states[u.id] = {}
-        # cancel any running job for this user
-        _cancel_user_job(u.id)
-        bot.send_message(chat_id, "🏠 *Main Menu*", parse_mode="Markdown",
-                         reply_markup=main_keyboard(u.id))
-        return
-
-    # fallback
-    bot.send_message(chat_id,
-        "Use the menu below 👇",
-        reply_markup=main_keyboard(u.id))
-
-
-def _cancel_user_job(user_id):
-    with _state_lock:
-        for jid, st in job_state.items():
-            # match by user via DB lookup is overkill; jobs dict maps user->jid in active_jobs
-            pass
-        jid = active_jobs.get(user_id)
-        if jid and jid in job_state:
-            job_state[jid]["cancel"] = True
-
-
-# =========================================================
-# User Stats / History
+        log.warning("CHANNEL_POST_FAILED job=%s channel=%s err=%s",
+                    code, channel, err)# =========================================================
+#  User views: stats, history, settings, help
 # =========================================================
 def _show_user_stats(chat_id, user_id):
     u = get_user(user_id)
     if not u:
-        bot.send_message(chat_id, "📊 No stats yet.", reply_markup=main_keyboard(user_id))
+        _safe_send(chat_id, "📊 No stats yet.",
+                   markup=main_keyboard(user_id))
         return
-    jobs = user_jobs(user_id, limit=200)
+    jobs, total = user_jobs(user_id, limit=500)
     succ = sum(1 for j in jobs if j["status"] == "COMPLETED")
     fail = sum(1 for j in jobs if j["status"] == "FAILED")
-    ip_jobs = sum(1 for j in jobs if j["mode"] == "IP_ROTATION")
-    direct_jobs = sum(1 for j in jobs if j["mode"] == "DIRECT")
-    avg = (sum(j["duration_ms"] for j in jobs) / len(jobs)) if jobs else 0
-    bot.send_message(
+    rate = (succ / len(jobs) * 100) if jobs else 0
+    today = [j for j in jobs
+             if j["started_at"] and j["started_at"][:10] ==
+             datetime.utcnow().strftime("%Y-%m-%d")]
+    today_nums = sum(j["unique_numbers"] for j in today)
+    _safe_send(
         chat_id,
-        (f"📊 *MY STATS*\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"🔄 Total Extractions: `{u['total_extractions']}`\n"
-         f"✅ Successful Jobs: `{succ}`\n"
-         f"❌ Failed Jobs: `{fail}`\n"
-         f"📱 Unique Numbers: `{u['total_numbers_found']}`\n"
-         f"🌐 IP Jobs: `{ip_jobs}`\n"
-         f"🟢 Direct Jobs: `{direct_jobs}`\n"
-         f"⏱ Avg Duration: `{_fmt_duration(int(avg))}`\n"
-         f"━━━━━━━━━━━━━━━━━━━━"),
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(user_id),
-    )
-
-
-def _show_user_history(chat_id, user_id):
-    jobs = user_jobs(user_id, limit=10)
-    if not jobs:
-        bot.send_message(chat_id, "📋 *No history yet.*", parse_mode="Markdown",
-                         reply_markup=main_keyboard(user_id))
-        return
-    lines = ["📋 *MY HISTORY*", "━━━━━━━━━━━━━━━━━━━━"]
-    for j in jobs:
-        host = urllib.parse.urlparse(j["source_url"]).hostname or j["source_url"][:30]
-        mode_label = "🌐" if j["mode"] == "IP_ROTATION" else "🟢"
-        ts = (j["started_at"] or "")[:16]
-        lines.append(f"#{j['job_id']:06d} {mode_label} `{ts}`\n🔗 `{host}`\n📱 `{j['unique_numbers']}` | 🔄 `{j['requested_visits']}`")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    mk = types.InlineKeyboardMarkup()
-    for j in jobs[:5]:
-        mk.add(types.InlineKeyboardButton(f"#{j['job_id']:06d}",
-                callback_data=f"ujob_{j['job_id']}"))
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=mk)
-
-
-# =========================================================
-# Callback Query Router
-# =========================================================
-@bot.callback_query_handler(func=lambda c: True)
-def on_callback(c: types.CallbackQuery):
-    u = c.from_user
-    data = c.data or ""
-    chat_id = c.message.chat.id
-
-    try:
-        if data == "cancel_job":
-            with _state_lock:
-                user_states[u.id] = {}
-            _cancel_user_job(u.id)
-            bot.edit_message_text("🛑 *Cancelled.*", chat_id=chat_id,
-                                  message_id=c.message.message_id, parse_mode="Markdown")
-            bot.send_message(chat_id, "🏠 *Main Menu*", parse_mode="Markdown",
-                             reply_markup=main_keyboard(u.id))
-            return
-
-        if data == "new_extract":
-            with _state_lock:
-                user_states[u.id] = {"awaiting_url": True}
-            bot.send_message(chat_id, "🔗 Send your URL:", parse_mode="Markdown",
-                             reply_markup=types.ReplyKeyboardRemove())
-            return
-
-        # mode selection
-        if data == "mode_direct":
-            with _state_lock:
-                st = user_states.get(u.id, {})
-                if "url" not in st:
-                    bot.answer_callback_query(c.id, "Session expired. Start again.")
-                    return
-                user_states[u.id] = {"url": st["url"], "mode": "DIRECT", "awaiting_visits": True}
-            bot.edit_message_text(
-                "🟢 *Direct mode* selected.\nChoose visit count:",
-                chat_id=chat_id, message_id=c.message.message_id,
-                parse_mode="Markdown", reply_markup=visits_keyboard())
-            return
-
-        if data == "mode_proxy":
-            if get_setting("proxy_enabled", "1") != "1":
-                bot.answer_callback_query(c.id, "Proxy mode disabled by admin.")
-                return
-            with _state_lock:
-                st = user_states.get(u.id, {})
-                if "url" not in st:
-                    bot.answer_callback_query(c.id, "Session expired. Start again.")
-                    return
-                user_states[u.id] = {"url": st["url"], "mode": "IP_ROTATION", "awaiting_visits": True}
-            bot.edit_message_text(
-                "🌐 *IP Rotation mode* selected.\nChoose visit count:",
-                chat_id=chat_id, message_id=c.message.message_id,
-                parse_mode="Markdown", reply_markup=visits_keyboard())
-            return
-
-        # visits
-        if data.startswith("visits_"):
-            with _state_lock:
-                st = user_states.get(u.id, {})
-                url = st.get("url")
-                mode = st.get("mode", "DIRECT")
-                user_states[u.id] = {}
-            if not url:
-                bot.answer_callback_query(c.id, "Session expired.")
-                return
-            n = int(data.split("_")[1])
-            mx = int(get_setting("max_visits", str(MAX_VISITS_PER_JOB)))
-            if n > mx:
-                n = mx
-            if active_jobs.get(u.id):
-                bot.answer_callback_query(c.id, "Job already running.")
-                return
-            _start_job(chat_id, u, url, mode, n)
-            return
-
-        # user job detail
-        if data.startswith("ujob_"):
-            jid = int(data.split("_")[1])
-            _show_job_detail(chat_id, jid, is_admin(u.id))
-            return
-
-        # admin callbacks
-        if data.startswith("adm_") and not is_admin(u.id):
-            bot.answer_callback_query(c.id, "Not authorized.")
-            return
-        if data == "adm_panel":
-            _show_admin_panel(chat_id)
-            return
-        if data == "adm_dashboard":
-            _show_admin_dashboard(chat_id)
-            return
-        if data == "adm_users":
-            _show_admin_users(chat_id, page=0)
-            return
-        if data == "adm_jobs":
-            _show_admin_jobs(chat_id)
-            return
-        if data == "adm_proxies":
-            bot.send_message(chat_id, "🌐 *PROXY CENTER*", parse_mode="Markdown",
-                             reply_markup=proxy_center_keyboard())
-            return
-        if data == "adm_broadcast":
-            with _state_lock:
-                user_states[u.id] = {"awaiting_broadcast": True}
-            bot.send_message(chat_id, "📢 Type the broadcast message:", parse_mode="Markdown")
-            return
-        if data == "adm_channel":
-            _show_channel_settings(chat_id)
-            return
-        if data == "adm_settings":
-            _show_bot_settings(chat_id)
-            return
-        if data == "adm_maint":
-            _toggle_maintenance(chat_id, u.id)
-            return
-        if data == "adm_admins":
-            _show_admins(chat_id)
-            return
-        if data == "adm_pending":
-            _show_pending(chat_id, u.id)
-            return
-        if data == "adm_diag":
-            _run_diagnostics(chat_id)
-            return
-        if data == "adm_close":
-            bot.send_message(chat_id, "🏠 *Main Menu*", parse_mode="Markdown",
-                             reply_markup=main_keyboard(u.id))
-            return
-
-        # proxy callbacks
-        if data.startswith("px_") and not is_admin(u.id):
-            bot.answer_callback_query(c.id, "Not authorized.")
-            return
-        if data == "px_dashboard":
-            _show_proxy_dashboard(chat_id)
-            return
-        if data == "px_add":
-            with _state_lock:
-                user_states[u.id] = {"awaiting_proxy_add": True}
-            bot.send_message(chat_id,
-                ("➕ *Add Proxy*\nSend proxy in format:\n"
-                 "`http://IP:PORT`\n"
-                 "`http://user:pass@IP:PORT`\n"
-                 "`socks5://IP:PORT`\n"
-                 "`socks5h://user:pass@IP:PORT`"),
-                parse_mode="Markdown")
-            return
-        if data == "px_bulk":
-            with _state_lock:
-                user_states[u.id] = {"awaiting_proxy_bulk": True}
-            bot.send_message(chat_id,
-                "📦 *Bulk Add*\nSend one proxy per line:", parse_mode="Markdown")
-            return
-        if data == "px_list":
-            _show_proxy_list(chat_id)
-            return
-        if data == "px_test_all":
-            threading.Thread(target=_run_proxy_test, args=(chat_id,), daemon=True).start()
-            return
-        if data == "px_retest":
-            threading.Thread(target=_run_proxy_test, args=(chat_id, "unhealthy"), daemon=True).start()
-            return
-        if data == "px_cleanup":
-            _cleanup_dead_proxies(chat_id, u.id)
-            return
-
-        # approval
-        if data.startswith("appr_"):
-            target = int(data.split("_")[1])
-            set_user_status(target, "APPROVED")
-            audit_log(u.id, "USER_APPROVED", str(target))
-            try:
-                bot.send_message(target, "✅ *Your access has been approved!*\nUse /start to begin.",
-                                 parse_mode="Markdown")
-            except Exception:
-                pass
-            bot.edit_message_text("✅ Approved.", chat_id=chat_id,
-                                  message_id=c.message.message_id)
-            return
-        if data.startswith("rej_"):
-            target = int(data.split("_")[1])
-            set_user_status(target, "BLOCKED")
-            audit_log(u.id, "USER_REJECTED", str(target))
-            bot.edit_message_text("❌ Rejected & blocked.", chat_id=chat_id,
-                                  message_id=c.message.message_id)
-            return
-
-        # settings toggles
-        if data.startswith("set_"):
-            _handle_setting_toggle(chat_id, u.id, data[4:])
-            return
-
-        # channel test
-        if data == "adm_chan_test":
-            _test_channel(chat_id)
-            return
-
-        # user search entry
-        if data == "usr_search":
-            with _state_lock:
-                user_states[u.id] = {"awaiting_search": True}
-            bot.send_message(chat_id, "🔍 Send user ID, username, or name:",
-                             parse_mode="Markdown")
-            return
-
-        # user pagination
-        if data.startswith("upage_"):
-            _show_admin_users(chat_id, page=int(data.split("_")[1]))
-            return
-
-        # user detail
-        if data.startswith("udetail_"):
-            _show_user_detail_admin(chat_id, int(data.split("_")[1]))
-            return
-
-        # user history (admin view)
-        if data.startswith("uhist_"):
-            tid = int(data.split("_")[1])
-            jobs = user_jobs(tid, limit=10)
-            if not jobs:
-                bot.send_message(chat_id, "No jobs.", reply_markup=admin_keyboard())
-                return
-            mk = types.InlineKeyboardMarkup()
-            lines = [f"📋 *USER HISTORY* (`{tid}`)", "━━━━━━━━━━━━━━━━━━━━"]
-            for j in jobs:
-                host = urllib.parse.urlparse(j["source_url"]).hostname or "?"
-                mode = "🌐" if j["mode"] == "IP_ROTATION" else "🟢"
-                lines.append(f"#{j['job_id']:06d} {mode} `{host}` 📱`{j['unique_numbers']}`")
-                mk.add(types.InlineKeyboardButton(f"#{j['job_id']:06d}",
-                        callback_data=f"ajob_{j['job_id']}"))
-            mk.add(types.InlineKeyboardButton("🔙", callback_data=f"udetail_{tid}"))
-            bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=mk)
-            return
-
-        # user numbers (admin view)
-        if data.startswith("unums_"):
-            tid = int(data.split("_")[1])
-            jobs = user_jobs(tid, limit=5)
-            if not jobs:
-                bot.send_message(chat_id, "No jobs.", reply_markup=admin_keyboard())
-                return
-            mk = types.InlineKeyboardMarkup()
-            lines = [f"📱 *RECENT NUMBERS* (`{tid}`)", "━━━━━━━━━━━━━━━━━━━━"]
-            for j in jobs[:3]:
-                nums = job_numbers(j["job_id"], limit=20)
-                lines.append(f"\n*#{j['job_id']:06d}* ({j['unique_numbers']})")
-                for n in nums[:10]:
-                    lines.append(f"+{n['number']} ({n['extraction_method']})")
-            mk.add(types.InlineKeyboardButton("🔙", callback_data=f"udetail_{tid}"))
-            bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=mk)
-            return
-
-        # block / unblock
-        if data.startswith("ublock_"):
-            tid = int(data.split("_")[1])
-            set_user_status(tid, "BLOCKED")
-            audit_log(u.id, "USER_BLOCKED", str(tid))
-            _show_user_detail_admin(chat_id, tid)
-            return
-        if data.startswith("uunblock_"):
-            tid = int(data.split("_")[1])
-            set_user_status(tid, "APPROVED")
-            audit_log(u.id, "USER_UNBLOCKED", str(tid))
-            _show_user_detail_admin(chat_id, tid)
-            return
-
-        # admin job detail
-        if data.startswith("ajob_"):
-            _show_job_detail(chat_id, int(data.split("_")[1]), admin_view=True)
-            return
-
-        # proxy delete
-        if data.startswith("pxdel_"):
-            pid = int(data.split("_")[1])
-            delete_proxy_db(pid)
-            audit_log(u.id, "PROXY_DELETED", str(pid))
-            _show_proxy_list(chat_id)
-            return
-
-        bot.answer_callback_query(c.id, "Unknown action.")
-    except Exception as e:
-        log.exception("callback error: %s", e)
-        try:
-            bot.answer_callback_query(c.id, "Error.")
-        except Exception:
-            pass
-
-
-# =========================================================
-# Job starter
-# =========================================================
-def _start_job(chat_id, user, url, mode, visits):
-    # send initial progress message
-    msg = bot.send_message(
-        chat_id,
-        ("⏳ *EXTRACTION IN PROGRESS*\n"
+        ("📊 *MY STATISTICS*\n"
          "━━━━━━━━━━━━━━━━━━━━\n"
-         "🔄 _Preparing…_"),
-        parse_mode="Markdown",
-        reply_markup=types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton("🛑 Cancel", callback_data="cancel_job")),
-    )
-    with _state_lock:
-        active_jobs[user.id] = True  # placeholder; real job_id assigned in worker
-    threading.Thread(
-        target=extraction_worker,
-        args=(chat_id, user.id, user.username, url, visits, mode, msg.message_id),
-        daemon=True,
-    ).start()
-
-
-# =========================================================
-# Admin Views
-# =========================================================
-def _show_admin_dashboard(chat_id):
-    d = admin_dashboard_stats()
-    running = sum(1 for st in job_state.values() if not st.get("cancel"))
-    avg_lat = 0
-    pc = proxy_pool.count()
-    bot.send_message(
-        chat_id,
-        (f"📊 *BOT DASHBOARD*\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"👥 Users: `{d['total_users']}`\n"
-         f"🟢 Active Today: `{d['active_today']}`\n\n"
-         f"🔄 Total Jobs: `{d['total_jobs']}`\n"
-         f"✅ Successful: `{d['successful_jobs']}`\n"
-         f"❌ Failed: `{d['failed_jobs']}`\n\n"
-         f"📱 Numbers Found: `{d['total_numbers']}`\n"
-         f"📅 Today: `{d['numbers_today']}`\n\n"
-         f"⚡ Running Jobs: `{running}`\n"
-         f"📅 Jobs Today: `{d['jobs_today']}`\n\n"
-         f"🌐 Proxies:\n"
-         f"🟢 Working: `{pc['working']}`\n"
-         f"🟡 Slow: `{pc['slow']}`\n"
-         f"🔴 Dead: `{pc['dead']}`\n"
-         f"⚪ Untested: `{pc['untested']}`\n\n"
-         f"⏱ Avg Job Time: `{_fmt_duration(int(d['avg_duration']))}`\n"
-         f"━━━━━━━━━━━━━━━━━━━━"),
-        parse_mode="Markdown",
-        reply_markup=admin_keyboard(),
-    )
-
-
-def _show_admin_users(chat_id, page=0):
-    users = recent_users(limit=50)
-    if not users:
-        bot.send_message(chat_id, "No users.", reply_markup=admin_keyboard())
-        return
-    per_page = 8
-    start = page * per_page
-    slice_ = users[start:start+per_page]
-    lines = [f"👥 *USERS* (page {page+1})", "━━━━━━━━━━━━━━━━━━━━"]
-    mk = types.InlineKeyboardMarkup()
-    for u in slice_:
-        st_icon = {"APPROVED": "🟢", "PENDING": "🟡", "BLOCKED": "🔴"}.get(u["status"], "⚪")
-        lines.append(f"{st_icon} `{u['user_id']}` {u['first_name'] or '—'} @{u['username'] or '—'}")
-        mk.add(types.InlineKeyboardButton(f"{u['user_id']}", callback_data=f"udetail_{u['user_id']}"))
-    # pagination
-    nav = types.InlineKeyboardButton("◀️", callback_data=f"upage_{max(0,page-1)}") if page > 0 else None
-    nxt = types.InlineKeyboardButton("▶️", callback_data=f"upage_{page+1}") if start+per_page < len(users) else None
-    if nav and nxt:
-        mk.row(nav, nxt)
-    elif nav:
-        mk.row(nav)
-    elif nxt:
-        mk.row(nxt)
-    mk.add(types.InlineKeyboardButton("🔍 Search", callback_data="usr_search"))
-    mk.add(types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"))
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=mk)
-
-
-def _handle_user_search(chat_id, admin_id, query):
-    users = search_users(query, limit=15)
-    if not users:
-        bot.send_message(chat_id, "🔍 No matches.", reply_markup=admin_keyboard())
-        return
-    lines = ["🔍 *Search Results*", "━━━━━━━━━━━━━━━━━━━━"]
-    mk = types.InlineKeyboardMarkup()
-    for u in users:
-        lines.append(f"`{u['user_id']}` {u['first_name'] or '—'} @{u['username'] or '—'}")
-        mk.add(types.InlineKeyboardButton(f"{u['user_id']}", callback_data=f"udetail_{u['user_id']}"))
-    mk.add(types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"))
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=mk)
-
-
-def _show_user_detail_admin(chat_id, target_id):
-    u = get_user(target_id)
-    if not u:
-        bot.send_message(chat_id, "User not found.", reply_markup=admin_keyboard())
-        return
-    jobs = user_jobs(target_id, limit=200)
-    succ = sum(1 for j in jobs if j["status"] == "COMPLETED")
-    fail = sum(1 for j in jobs if j["status"] == "FAILED")
-    last = jobs[0]["started_at"][:16] if jobs else "—"
-    bot.send_message(
-        chat_id,
-        (f"👤 *USER DETAILS*\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"Name: {u['first_name'] or '—'}\n"
-         f"Username: @{u['username'] or '—'}\n"
-         f"Telegram ID: `{u['user_id']}`\n"
-         f"Status: {u['status']}\n\n"
-         f"📊 Statistics\n"
          f"Total Jobs: `{len(jobs)}`\n"
-         f"Successful: `{succ}`\n"
-         f"Failed: `{fail}`\n"
-         f"Unique Numbers: `{u['total_numbers_found']}`\n\n"
-         f"🕒 First Seen: `{(u['joined_at'] or '')[:16]}`\n"
-         f"🕒 Last Active: `{(u['last_active'] or '')[:16]}`\n"
-         f"🕒 Latest Job: `{last}`\n"
-         f"━━━━━━━━━━━━━━━━━━━━"),
-        parse_mode="Markdown",
-        reply_markup=_user_action_keyboard(target_id, u["status"]),
+         f"Completed: `{succ}`\n"
+         f"Failed: `{fail}`\n\n"
+         f"URLs Processed: `{u['total_urls_processed']}`\n"
+         f"Numbers Found: `{u['total_numbers_found']:,}`\n\n"
+         "Today:\n"
+         f"Jobs: `{len(today)}`\n"
+         f"Numbers: `{today_nums}`\n\n"
+         f"Success Rate: `{rate:.1f}%`\n"
+         "━━━━━━━━━━━━━━━━━━━━"),
+        markup=_home_kb(user_id),
     )
 
 
-def _user_action_keyboard(target_id, status):
-    mk = types.InlineKeyboardMarkup(row_width=2)
-    mk.add(
-        types.InlineKeyboardButton("📋 History", callback_data=f"uhist_{target_id}"),
-        types.InlineKeyboardButton("📱 Numbers", callback_data=f"unums_{target_id}"),
-    )
-    if status != "BLOCKED":
-        mk.add(types.InlineKeyboardButton("🚫 Block", callback_data=f"ublock_{target_id}"))
-    else:
-        mk.add(types.InlineKeyboardButton("✅ Unblock", callback_data=f"uunblock_{target_id}"))
-    if status == "PENDING":
-        mk.add(types.InlineKeyboardButton("✅ Approve", callback_data=f"appr_{target_id}"))
-    mk.add(types.InlineKeyboardButton("🔙 Users", callback_data="adm_users"))
-    return mk
-
-
-def _show_admin_jobs(chat_id):
-    jobs = recent_jobs(limit=15)
-    if not jobs:
-        bot.send_message(chat_id, "📱 No extraction jobs.", reply_markup=admin_keyboard())
+def _show_user_history(chat_id, user_id, page=0):
+    jobs, total = user_jobs(user_id, limit=5, page=page)
+    if not jobs and page == 0:
+        _safe_send(
+            chat_id,
+            ("🕘 *JOB HISTORY*\n"
+             "━━━━━━━━━━━━━━━━━━━━\n"
+             "No extraction history yet.\n\n"
+             "Start your first extraction to see jobs here."),
+            markup=_home_kb(user_id),
+        )
         return
-    lines = ["📱 *EXTRACTION LOGS*", "━━━━━━━━━━━━━━━━━━━━"]
-    mk = types.InlineKeyboardMarkup()
+    lines = ["🕘 *JOB HISTORY*", "━━━━━━━━━━━━━━━━━━━━"]
     for j in jobs:
-        host = urllib.parse.urlparse(j["source_url"]).hostname or "?"
-        mode = "🌐" if j["mode"] == "IP_ROTATION" else "🟢"
-        st = {"COMPLETED": "✅", "FAILED": "❌", "CANCELLED": "🛑", "RUNNING": "⏳"}.get(j["status"], "⚪")
+        host = urllib.parse.urlparse(j["source_url"]).hostname or \
+            j["source_url"][:30]
+        mode_emoji = "🌐" if j["mode"] == "IP_ROTATION" else "🟢"
+        st = {"COMPLETED": "✅", "FAILED": "❌", "CANCELLED": "🛑",
+              "INTERRUPTED": "⚠️", "RUNNING": "⏳"}.get(j["status"], "⚪")
         ts = (j["started_at"] or "")[:16]
-        lines.append(f"{st} #{j['job_id']:06d} {mode} `{ts}`\n👤 @{j['username'] or '—'} | 🔗 `{host}` | 📱 `{j['unique_numbers']}`")
-        mk.add(types.InlineKeyboardButton(f"#{j['job_id']:06d}", callback_data=f"ajob_{j['job_id']}"))
-    mk.add(types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"))
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=mk)
+        lines.append(
+            f"{st} `{j['job_code']}` {mode_emoji}\n"
+            f"🔗 `{md_esc(host)}`\n"
+            f"📱 `{j['unique_numbers']}` | 🔄 `{j['requested_visits']}`"
+        )
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    mk = types.InlineKeyboardMarkup(row_width=1)
+    for j in jobs:
+        mk.add(types.InlineKeyboardButton(
+            f"{j['job_code']}",
+            callback_data=f"ujob_{j['job_id']}"))
+    # pagination
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton("◀️ Prev",
+                                              callback_data=f"hipage_{page-1}"))
+    if (page + 1) * 5 < total:
+        nav.append(types.InlineKeyboardButton("▶️ Next",
+                                              callback_data=f"hipage_{page+1}"))
+    if nav:
+        mk.row(*nav)
+    mk.add(types.InlineKeyboardButton("◀️ Home", callback_data="nav_home"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
 
 
-def _show_job_detail(chat_id, job_id, admin_view=False):
+def _show_user_settings(chat_id, user_id):
+    _safe_send(
+        chat_id,
+        ("⚙️ *SETTINGS*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "Personal settings are managed via the buttons below.\n\n"
+         "🌐 Default Mode — choose your preferred extraction mode\n"
+         "📄 Result Format — default export format\n"
+         "🔔 Notifications — toggle job notifications\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "Note: per-user settings persistence is available; "
+         "admin-wide limits are set in the Admin Panel."),
+        markup=_home_kb(user_id),
+    )
+
+
+def _show_help(chat_id):
+    _safe_send(
+        chat_id,
+        ("❓ *HELP CENTER*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "🚀 *How to Extract*\n"
+         "1. Tap *Start Extraction*\n"
+         "2. Choose Single or Bulk Link\n"
+         "3. Pick Direct or IP Rotation mode\n"
+         "4. Choose visit count\n"
+         "5. Confirm and run\n"
+         "6. Download TXT / CSV / JSON\n\n"
+         "🌐 *Direct vs IP Mode*\n"
+         "Direct: fastest, uses your server's IP.\n"
+         "IP Rotation: routes through verified proxies.\n\n"
+         "📚 *Bulk Links*\n"
+         "Submit many URLs at once. Processed through a bounded "
+         "worker pool — no unbounded threads.\n\n"
+         "🌐 *Proxy System*\n"
+         "Proxies are tested multi-stage (TCP → HTTP → exit-IP). "
+         "Failed targets don't kill healthy proxies.\n\n"
+         "📊 *Results*\n"
+         "TXT / CSV / JSON export + copy-friendly output.\n\n"
+         "📡 *Channel Posting*\n"
+         "Admin can auto-post summaries to a configured channel.\n\n"
+         "🛡 *Safety & Limits*\n"
+         "Only authorized public URLs. No CAPTCHA bypass, "
+         "no login bypass, no private-account scraping.\n"
+         "━━━━━━━━━━━━━━━━━━━━"),
+        markup=_home_kb(0),
+    )
+
+
+def _show_job_detail(chat_id, job_id, admin_view=False, viewer_id=None):
     j = get_job(job_id)
     if not j:
-        bot.send_message(chat_id, "Job not found.")
+        _safe_send(chat_id, "Job not found.")
         return
-    if not admin_view and j["user_id"] != chat_id:
-        # for non-admin, only their own jobs
-        pass
-    host = urllib.parse.urlparse(j["source_url"]).hostname or j["source_url"][:30]
+    # ownership check for non-admins
+    if not admin_view and j["user_id"] != viewer_id:
+        _safe_send(chat_id, "❌ You can only view your own jobs.",
+                   markup=_home_kb(viewer_id))
+        return
+    host = urllib.parse.urlparse(j["source_url"]).hostname or \
+        j["source_url"][:30]
     mode_label = "🌐 IP Rotation" if j["mode"] == "IP_ROTATION" else "🟢 Direct"
     nums = job_numbers(job_id, limit=50)
     lines = [
-        f"📋 *JOB #{j['job_id']:06d}*",
+        f"📋 *JOB {j['job_code']}*",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"👤 User: @{j['username'] or '—'} (`{j['user_id']}`)",
-        f"🔗 URL: `{j['source_url'][:60]}`",
+        f"👤 User: @{md_esc(j['username'] or '—')} (`{j['user_id']}`)",
+        f"🔗 URL: `{md_esc(_short(j['source_url'], 60))}`",
         f"⚙️ Mode: {mode_label}",
         f"🔄 Visits: `{j['successful_visits']+j['failed_visits']}/{j['requested_visits']}`",
         f"✅ Successful: `{j['successful_visits']}`",
@@ -2760,88 +3426,1039 @@ def _show_job_detail(chat_id, job_id, admin_view=False):
         f"⏱ Duration: `{_fmt_duration(j['duration_ms'])}`",
         f"🕒 Started: `{(j['started_at'] or '')[:16]}`",
         f"🕒 Completed: `{(j['completed_at'] or '')[:16]}`",
-        f"Status: {j['status']}",
+        f"Status: `{j['status']}`",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
     if admin_view:
         attempts = job_attempts(job_id, limit=20)
         if attempts:
-            lines.append("🔄 Proxy Attempts:")
-            for a in attempts[:15]:
+            lines.append("🔄 Recent Attempts:")
+            for a in attempts[:10]:
                 pid = f"#{a['proxy_id']}" if a['proxy_id'] else "direct"
-                ip = a['exit_ip'] or "—"
-                lines.append(f"  v{a['cycle']}: {pid} ip=`{ip}` {a['request_status']} {a['latency_ms']}ms")
+                lines.append(
+                    f"  v{a['cycle']}: {pid} {a['request_status']} "
+                    f"{a['latency_ms']}ms"
+                )
             lines.append("━━━━━━━━━━━━━━━━━━━━")
     if nums:
         lines.append("📱 Numbers:")
-        for n in nums[:30]:
-            lines.append(f"+{n['number']} ({n['extraction_method']}, v{n['visit_number']})")
-        if len(nums) > 30:
-            lines.append(f"_…and {j['unique_numbers']-30} more_")
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown",
-                     reply_markup=admin_keyboard() if admin_view else main_keyboard(j["user_id"]))
+        for n in nums[:15]:
+            lines.append(f"+{n['number']} ({n['extraction_method']})")
+        if len(nums) > 15:
+            lines.append(f"_…and {j['unique_numbers']-15} more_")
+
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    btns = []
+    if j["unique_numbers"] > 0:
+        btns.append(types.InlineKeyboardButton(
+            "📋 Copy", switch_inline_query_current_chat=f"copy_{j['job_code']}"))
+        btns.append(types.InlineKeyboardButton(
+            "📥 TXT", callback_data=f"dl_{j['job_code']}_txt"))
+        btns.append(types.InlineKeyboardButton(
+            "🔄 Retry", callback_data=f"retry_{j['job_id']}"))
+    btns.append(types.InlineKeyboardButton("◀️ Back",
+                                           callback_data="nav_back"))
+    for i in range(0, len(btns), 2):
+        mk.row(*btns[i:i+2])
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
 
 
-def _show_proxy_dashboard(chat_id):
-    pc = proxy_pool.count()
-    bot.send_message(
+# =========================================================
+#  Job starter (single link)
+# =========================================================
+def _start_job(chat_id, user, url, mode, visits):
+    msg = bot.send_message(
         chat_id,
-        (f"🌐 *PROXY DASHBOARD*\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"📊 Total: `{pc['total']}`\n"
+        ("🚀 *EXTRACTION IN PROGRESS*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "🔄 _Preparing…_"),
+        parse_mode="Markdown",
+        reply_markup=types.InlineKeyboardMarkup(row_width=2).add(
+            types.InlineKeyboardButton("⏸ Pause",
+                                       callback_data="pausejob_placeholder"),
+            types.InlineKeyboardButton("🛑 Cancel",
+                                       callback_data="cancelplaceholder"),
+        ),
+    )
+    # fix callback_data with real code once we know it — but we don't yet,
+    # so we wire cancel via user-id lookup; pause/resume via job_state
+    threading.Thread(
+        target=extraction_worker,
+        args=(chat_id, user.id, user.username, url, visits, mode,
+              msg.message_id),
+        daemon=True,
+    ).start()
+
+
+# =========================================================
+#  Cancel / pause / resume helpers
+# =========================================================
+def _cancel_user_job(user_id: int) -> bool:
+    """Cancel ALL running jobs for a user. Returns True if any were cancelled."""
+    cancelled = False
+    with _state_lock:
+        codes = list(active_jobs.get(user_id, set()))
+    for code in codes:
+        st = job_state.get(code)
+        if st and isinstance(st.get("cancel"), threading.Event):
+            st["cancel"].set()
+            cancelled = True
+    return cancelled
+
+
+def _cancel_job_by_code(code: str) -> bool:
+    st = job_state.get(code)
+    if st and isinstance(st.get("cancel"), threading.Event):
+        st["cancel"].set()
+        return True
+    return False
+
+
+def _pause_job(code: str) -> bool:
+    st = job_state.get(code)
+    if st and isinstance(st.get("pause"), threading.Event):
+        st["pause"].set()
+        st["paused"] = True
+        return True
+    return False
+
+
+def _resume_job(code: str) -> bool:
+    st = job_state.get(code)
+    if st and isinstance(st.get("pause"), threading.Event):
+        st["pause"].clear()
+        st["paused"] = False
+        return True
+    return False
+
+
+# =========================================================
+#  Callback query router
+# =========================================================
+@bot.callback_query_handler(func=lambda c: True)
+def on_callback(c: types.CallbackQuery):
+    u = c.from_user
+    data = c.data or ""
+    chat_id = c.message.chat.id
+
+    try:
+        # ---- navigation ----
+        if data == "nav_home":
+            _clear_session(u.id)
+            _safe_edit(chat_id, c.message.message_id,
+                       _home_text(u.id), markup=_home_kb(u.id))
+            return
+        if data == "nav_back":
+            _handle_back(c)
+            return
+        if data == "nav_cancel":
+            _clear_session(u.id)
+            _cancel_user_job(u.id)
+            _safe_edit(chat_id, c.message.message_id,
+                       "🛑 *Cancelled.*")
+            _send_home(chat_id, u.id)
+            return
+
+        # ---- extraction flow ----
+        if data == "ex_start":
+            _clear_session(u.id)
+            _start_extraction_flow(chat_id, u)
+            _answer_cb(c)
+            return
+        if data == "ex_single":
+            _set_session(u.id, STATE_AWAIT_URL)
+            _safe_edit(
+                chat_id, c.message.message_id,
+                ("🔗 *SEND YOUR LINK*\n"
+                 "━━━━━━━━━━━━━━━━━━━━\n"
+                 "Send the URL you want to process.\n\n"
+                 "_Example:_ `https://example.com/l/abc`"),
+                markup=_back_cancel_kb(),
+            )
+            _answer_cb(c)
+            return
+        if data == "ex_bulk":
+            _set_session(u.id, STATE_AWAIT_BULK)
+            _safe_edit(
+                chat_id, c.message.message_id,
+                ("♾️ *BULK URL QUEUE*\n"
+                 "━━━━━━━━━━━━━━━━━━━━\n"
+                 "Send multiple URLs, one per line.\n"
+                 "They will be processed through the job queue "
+                 "with bounded concurrency.\n\n"
+                 f"_Max {MAX_URLS_PER_BATCH} URLs per batch._"),
+                markup=_back_cancel_kb(),
+            )
+            _answer_cb(c)
+            return
+
+        # ---- net mode ----
+        if data == "netmode_direct":
+            session = _get_session(u.id)
+            if not session or "url" not in session:
+                _answer_cb(c, "Session expired. Start again.")
+                return
+            _set_session(u.id, STATE_AWAIT_VISITS,
+                         url=session["url"], mode="DIRECT")
+            _safe_edit(
+                chat_id, c.message.message_id,
+                ("🟢 *DIRECT MODE*\n"
+                 "Choose visit count:"),
+                markup=_visits_keyboard(),
+            )
+            _answer_cb(c)
+            return
+        if data == "netmode_proxy":
+            if get_setting("proxy_enabled", "1") != "1":
+                _answer_cb(c, "Proxy mode disabled by admin.")
+                return
+            pc = proxy_pool.count()
+            if pc["working"] + pc["slow"] + pc["connected"] == 0:
+                _safe_edit(
+                    chat_id, c.message.message_id,
+                    ("❌ *No verified proxy available.*\n\n"
+                     "Add or retest proxies from the Proxy Center "
+                     "before using IP Rotation.\n\n"
+                     "Never silently falling back to direct mode."),
+                    markup=types.InlineKeyboardMarkup(row_width=1).add(
+                        types.InlineKeyboardButton("🔄 Test Proxies",
+                                                   callback_data="px_test_all"),
+                        types.InlineKeyboardButton("◀️ Back",
+                                                   callback_data="nav_back"),
+                    ),
+                )
+                _answer_cb(c)
+                return
+            session = _get_session(u.id)
+            if not session or "url" not in session:
+                _answer_cb(c, "Session expired. Start again.")
+                return
+            _set_session(u.id, STATE_AWAIT_VISITS,
+                         url=session["url"], mode="IP_ROTATION")
+            _safe_edit(
+                chat_id, c.message.message_id,
+                ("🌐 *IP ROTATION MODE*\n"
+                 "Uses only verified proxies from the bot's pool.\n\n"
+                 "Choose visit count:"),
+                markup=_visits_keyboard(),
+            )
+            _answer_cb(c)
+            return
+
+        # ---- visits ----
+        if data.startswith("visits_"):
+            session = _get_session(u.id)
+            if not session or "url" not in session or "mode" not in session:
+                _answer_cb(c, "Session expired. Start again.")
+                return
+            n = int(data.split("_")[1])
+            mx = int(get_setting("max_visits", str(MAX_VISITS_PER_JOB)))
+            if n > mx:
+                n = mx
+            _show_confirm(chat_id, u.id, session["url"], session["mode"], n)
+            _answer_cb(c)
+            return
+
+        # ---- confirm start ----
+        if data == "confirm_start":
+            session = _get_session(u.id)
+            if not session or "url" not in session or "mode" not in session:
+                _answer_cb(c, "Session expired.")
+                _send_home(chat_id, u.id)
+                return
+            url = session["url"]
+            mode = session["mode"]
+            visits = session.get("visits", 1)
+            _clear_session(u.id)
+            with _state_lock:
+                if len(active_jobs.get(u.id, set())) >= MAX_CONCURRENT_JOBS:
+                    _answer_cb(c, "Too many running jobs.")
+                    return
+            _start_job(chat_id, u, url, mode, visits)
+            _answer_cb(c, "Started.")
+            return
+
+        # ---- user views ----
+        if data == "user_stats":
+            _show_user_stats(chat_id, u.id)
+            _answer_cb(c)
+            return
+        if data == "user_history":
+            _show_user_history(chat_id, u.id, page=0)
+            _answer_cb(c)
+            return
+        if data == "user_settings":
+            _show_user_settings(chat_id, u.id)
+            _answer_cb(c)
+            return
+        if data == "user_help":
+            _show_help(chat_id)
+            _answer_cb(c)
+            return
+
+        # ---- user job detail ----
+        if data.startswith("ujob_"):
+            jid = int(data.split("_", 1)[1])
+            _show_job_detail(chat_id, jid, admin_view=False, viewer_id=u.id)
+            _answer_cb(c)
+            return
+        if data.startswith("hipage_"):
+            _show_user_history(chat_id, u.id, page=int(data.split("_")[1]))
+            _answer_cb(c)
+            return
+
+        # ---- pause / resume / cancel job ----
+        if data == "pauseplaceholder":
+            # pause all running jobs for this user
+            with _state_lock:
+                codes = list(active_jobs.get(u.id, set()))
+            for code in codes:
+                _pause_job(code)
+            _answer_cb(c, "Paused.")
+            return
+        if data == "resumeplaceholder":
+            with _state_lock:
+                codes = list(active_jobs.get(u.id, set()))
+            for code in codes:
+                _resume_job(code)
+            _answer_cb(c, "Resumed.")
+            return
+        if data == "cancelplaceholder":
+            _cancel_user_job(u.id)
+            _answer_cb(c, "Cancelling…")
+            return
+        if data.startswith("cancelbulk_"):
+            gid = data.split("_", 1)[1]
+            st = job_state.get(gid)
+            if st and isinstance(st.get("cancel"), threading.Event):
+                st["cancel"].set()
+                _answer_cb(c, "Cancelling bulk job…")
+            else:
+                _answer_cb(c, "Job not found.")
+            return
+
+        # ---- download / copy ----
+        if data.startswith("dl_"):
+            parts = data.split("_")
+            code = parts[1]
+            fmt = parts[2]
+            j = get_job_by_code(code)
+            if not j or (j["user_id"] != u.id and not is_admin(u.id)):
+                _answer_cb(c, "Not authorized.")
+                return
+            nums = job_numbers(j["job_id"], limit=10000)
+            found: Dict[str, Tuple] = {}
+            for n in nums:
+                found[n["number"]] = (n["extraction_method"], n["source_url"])
+            _deliver_file(chat_id, code, fmt, found)
+            _answer_cb(c)
+            return
+        if data.startswith("dlbulk_"):
+            parts = data.split("_")
+            group_id = parts[1]
+            fmt = parts[2]
+            with _db_lock:
+                conn = get_conn()
+                try:
+                    rows = conn.execute(
+                        "SELECT number, extraction_method, source_url "
+                        "FROM extraction_job_numbers WHERE user_id=? "
+                        "AND job_id=0 ORDER BY number",
+                        (u.id,),
+                    ).fetchall()
+                finally:
+                    conn.close()
+            found = {r["number"]: (r["extraction_method"], r["source_url"])
+                     for r in rows}
+            _deliver_file(chat_id, group_id, fmt, found)
+            _answer_cb(c)
+            return
+        if data.startswith("del_"):
+            code = data.split("_", 1)[1]
+            j = get_job_by_code(code)
+            if not j or (j["user_id"] != u.id and not is_admin(u.id)):
+                _answer_cb(c, "Not authorized.")
+                return
+            # confirmation
+            mk = types.InlineKeyboardMarkup(row_width=2)
+            mk.add(
+                types.InlineKeyboardButton("✅ Yes, Delete",
+                                           callback_data=f"delconf_{code}"),
+                types.InlineKeyboardButton("❌ No",
+                                           callback_data="nav_back"),
+            )
+            _safe_edit(
+                chat_id, c.message.message_id,
+                (f"⚠️ *DELETE RESULT?*\n"
+                 f"━━━━━━━━━━━━━━━━━━━━\n"
+                 f"Job: `{code}`\n"
+                 f"Numbers: `{j['unique_numbers']}`\n\n"
+                 f"This will remove the stored numbers.\n\n"
+                 f"Are you sure?"),
+                markup=mk,
+            )
+            _answer_cb(c)
+            return
+        if data.startswith("delconf_"):
+            code = data.split("_", 1)[1]
+            j = get_job_by_code(code)
+            if not j or (j["user_id"] != u.id and not is_admin(u.id)):
+                _answer_cb(c, "Not authorized.")
+                return
+            with _db_lock:
+                conn = get_conn()
+                try:
+                    conn.execute(
+                        "DELETE FROM extraction_job_numbers WHERE job_id=?",
+                        (j["job_id"],))
+                    conn.commit()
+                finally:
+                    conn.close()
+            _safe_edit(chat_id, c.message.message_id,
+                       "🗑 *Result deleted.*")
+            _answer_cb(c)
+            return
+
+        # ---- retry job ----
+        if data.startswith("retry_"):
+            jid = int(data.split("_", 1)[1])
+            j = get_job(jid)
+            if not j or (j["user_id"] != u.id and not is_admin(u.id)):
+                _answer_cb(c, "Not authorized.")
+                return
+            _start_job(chat_id, u, j["source_url"], j["mode"],
+                       j["requested_visits"])
+            _answer_cb(c, "Retrying…")
+            return
+
+        # ---- channel post (manual) ----
+        if data.startswith("chan_"):
+            code = data.split("_", 1)[1]
+            j = get_job_by_code(code)
+            if not j or not is_admin(u.id):
+                _answer_cb(c, "Not authorized.")
+                return
+            nums = job_numbers(j["job_id"], limit=10000)
+            found = {n["number"]: (n["extraction_method"], n["source_url"])
+                     for n in nums}
+            try:
+                _channel_post(j["job_id"], code, j["user_id"], j["username"],
+                              j["source_url"], j["mode"], j["requested_visits"],
+                              j["successful_visits"], j["failed_visits"],
+                              j["unique_numbers"], j["duplicate_numbers"],
+                              j["duration_ms"], found)
+                _answer_cb(c, "Posted to channel.")
+            except Exception as e:
+                _answer_cb(c, f"Failed: {str(e)[:60]}")
+            return
+
+        # ---- approval ----
+        if data.startswith("appr_"):
+            target = int(data.split("_", 1)[1])
+            if not is_admin(u.id):
+                _answer_cb(c, "Not authorized.")
+                return
+            set_user_status(target, "APPROVED")
+            audit_log(u.id, "USER_APPROVED", str(target))
+            try:
+                bot.send_message(
+                    target,
+                    "✅ *Your access has been approved!*\nUse /start to begin.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+            _safe_edit(chat_id, c.message.message_id, "✅ Approved.")
+            _answer_cb(c)
+            return
+        if data.startswith("rej_"):
+            target = int(data.split("_", 1)[1])
+            if not is_admin(u.id):
+                _answer_cb(c, "Not authorized.")
+                return
+            set_user_status(target, "BLOCKED")
+            audit_log(u.id, "USER_REJECTED", str(target))
+            _safe_edit(chat_id, c.message.message_id,
+                       "❌ Rejected & blocked.")
+            _answer_cb(c)
+            return
+
+        # ---- admin routing ----
+        if data.startswith("adm_") and not is_admin(u.id):
+            _answer_cb(c, "Not authorized.")
+            return
+        if data == "adm_panel":
+            _show_admin_panel(chat_id)
+            _answer_cb(c)
+            return
+        if data == "adm_dashboard":
+            _show_admin_dashboard(chat_id)
+            _answer_cb(c)
+            return
+        if data == "adm_users":
+            _show_admin_users(chat_id, page=0)
+            _answer_cb(c)
+            return
+        if data == "adm_jobs":
+            _show_admin_jobs(chat_id)
+            _answer_cb(c)
+            return
+        if data == "adm_proxies":
+            _show_proxy_dashboard(chat_id)
+            _answer_cb(c)
+            return
+        if data == "adm_broadcast":
+            _set_session(u.id, STATE_AWAIT_BROADCAST)
+            _safe_send(chat_id, "📢 Type the broadcast message:",
+                       markup=_cancel_only_kb())
+            _answer_cb(c)
+            return
+        if data == "adm_channel":
+            _show_channel_settings(chat_id)
+            _answer_cb(c)
+            return
+        if data == "adm_settings":
+            _show_bot_settings(chat_id)
+            _answer_cb(c)
+            return
+        if data == "adm_maint":
+            _confirm_maintenance(chat_id, u.id)
+            _answer_cb(c)
+            return
+        if data == "adm_diag":
+            _run_diagnostics(chat_id)
+            _answer_cb(c)
+            return
+        if data == "adm_audit":
+            _show_audit_log(chat_id, page=0)
+            _answer_cb(c)
+            return
+        if data == "adm_chanlog":
+            _show_channel_post_history(chat_id, page=0)
+            _answer_cb(c)
+            return
+        if data == "adm_pending":
+            _show_pending(chat_id, u.id)
+            _answer_cb(c)
+            return
+        if data.startswith("apage_"):
+            _show_audit_log(chat_id, page=int(data.split("_")[1]))
+            _answer_cb(c)
+            return
+        if data.startswith("cpage_"):
+            _show_channel_post_history(chat_id, page=int(data.split("_")[1]))
+            _answer_cb(c)
+            return
+
+        # ---- proxy routing ----
+        if data.startswith("px_") and not is_admin(u.id):
+            _answer_cb(c, "Not authorized.")
+            return
+        if data == "px_dashboard":
+            _show_proxy_dashboard(chat_id)
+            _answer_cb(c)
+            return
+        if data == "px_add":
+            _set_session(u.id, STATE_AWAIT_PROXY_ADD)
+            _safe_send(
+                chat_id,
+                ("➕ *ADD PROXY*\n"
+                 "━━━━━━━━━━━━━━━━━━━━\n"
+                 "Send proxy in any supported format:\n\n"
+                 "`http://IP:PORT`\n"
+                 "`http://user:pass@IP:PORT`\n"
+                 "`socks5://IP:PORT`\n"
+                 "`socks5h://user:pass@IP:PORT`\n"
+                 "`IP:PORT:USER:PASS`"),
+                markup=_back_cancel_kb(),
+            )
+            _answer_cb(c)
+            return
+        if data == "px_bulk":
+            _set_session(u.id, STATE_AWAIT_PROXY_BULK)
+            _safe_send(chat_id,
+                       "📦 *BULK ADD*\nSend one proxy per line:",
+                       markup=_back_cancel_kb())
+            _answer_cb(c)
+            return
+        if data == "px_list_all":
+            _show_proxy_list(chat_id, status_filter=None, page=0)
+            _answer_cb(c)
+            return
+        if data == "px_list_working":
+            _show_proxy_list(chat_id, status_filter="WORKING", page=0)
+            _answer_cb(c)
+            return
+        if data == "px_list_dead":
+            _show_proxy_list(chat_id, status_filter="TCP_FAILED", page=0)
+            _answer_cb(c)
+            return
+        if data.startswith("pxpage_"):
+            parts = data.split("_", 2)
+            sf = parts[1] if len(parts) > 2 else None
+            sf = None if sf in ("all", "None") else sf
+            _show_proxy_list(chat_id, status_filter=sf, page=int(parts[1])
+                             if False else int(parts[-1]))
+            _answer_cb(c)
+            return
+        if data == "px_test_all":
+            threading.Thread(target=_run_proxy_test,
+                              args=(chat_id, "all"), daemon=True).start()
+            _answer_cb(c, "Testing all proxies…")
+            return
+        if data == "px_retest":
+            threading.Thread(target=_run_proxy_test,
+                              args=(chat_id, "unhealthy"), daemon=True).start()
+            _answer_cb(c, "Retesting unhealthy proxies…")
+            return
+        if data == "px_fetch":
+            threading.Thread(target=_run_fetch_proxies,
+                              args=(chat_id, u.id), daemon=True).start()
+            _answer_cb(c, "Fetching latest proxies…")
+            return
+        if data == "px_cleanup":
+            _confirm_cleanup_dead(chat_id, u.id)
+            _answer_cb(c)
+            return
+        if data.startswith("pxcleanupconf_"):
+            _cleanup_dead_proxies(chat_id, u.id)
+            _answer_cb(c)
+            return
+        if data == "px_sources":
+            _show_proxy_sources(chat_id)
+            _answer_cb(c)
+            return
+        if data == "px_src_add":
+            _set_session(u.id, STATE_AWAIT_PROXY_SRC)
+            _safe_send(
+                chat_id,
+                ("📦 *ADD PROXY SOURCE*\n"
+                 "Send the URL of a plaintext proxy list "
+                 "(IP:PORT, one per line):\n\n"
+                 "_Only add sources you are authorized to use._"),
+                markup=_back_cancel_kb(),
+            )
+            _answer_cb(c)
+            return
+        if data.startswith("pxsrcdel_"):
+            sid = int(data.split("_", 1)[1])
+            with _db_lock:
+                conn = get_conn()
+                try:
+                    conn.execute("DELETE FROM proxy_sources WHERE id=?",
+                                 (sid,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            audit_log(u.id, "PROXY_SOURCE_DELETED", str(sid))
+            _show_proxy_sources(chat_id)
+            _answer_cb(c)
+            return
+        if data.startswith("pxdel_"):
+            pid = int(data.split("_", 1)[1])
+            delete_proxy_db(pid)
+            audit_log(u.id, "PROXY_DELETED", str(pid))
+            _show_proxy_list(chat_id, status_filter=None, page=0)
+            _answer_cb(c)
+            return
+
+        # ---- settings toggles ----
+        if data.startswith("set_"):
+            if not is_admin(u.id):
+                _answer_cb(c, "Not authorized.")
+                return
+            _handle_setting_toggle(chat_id, u.id, data[4:])
+            _answer_cb(c)
+            return
+        if data == "adm_chan_test":
+            _test_channel(chat_id)
+            _answer_cb(c)
+            return
+        if data == "adm_chan_set":
+            _set_session(u.id, STATE_AWAIT_CHANNEL)
+            _safe_send(chat_id,
+                       "📡 Send the new channel username (e.g. @mychannel):",
+                       markup=_back_cancel_kb())
+            _answer_cb(c)
+            return
+        if data.startswith("usr_search"):
+            _set_session(u.id, STATE_AWAIT_SEARCH)
+            _safe_send(chat_id, "🔍 Send user ID, username, or name:",
+                       markup=_back_cancel_kb())
+            _answer_cb(c)
+            return
+        if data.startswith("upage_"):
+            _show_admin_users(chat_id, page=int(data.split("_")[1]))
+            _answer_cb(c)
+            return
+        if data.startswith("udetail_"):
+            _show_user_detail_admin(chat_id, int(data.split("_", 1)[1]))
+            _answer_cb(c)
+            return
+        if data.startswith("uhist_"):
+            tid = int(data.split("_", 1)[1])
+            _show_admin_user_history(chat_id, tid)
+            _answer_cb(c)
+            return
+        if data.startswith("ublock_"):
+            tid = int(data.split("_", 1)[1])
+            set_user_status(tid, "BLOCKED")
+            audit_log(u.id, "USER_BLOCKED", str(tid))
+            _show_user_detail_admin(chat_id, tid)
+            _answer_cb(c, "Blocked.")
+            return
+        if data.startswith("uunblock_"):
+            tid = int(data.split("_", 1)[1])
+            set_user_status(tid, "APPROVED")
+            audit_log(u.id, "USER_UNBLOCKED", str(tid))
+            _show_user_detail_admin(chat_id, tid)
+            _answer_cb(c, "Unblocked.")
+            return
+        if data.startswith("ajob_"):
+            jid = int(data.split("_", 1)[1])
+            _show_job_detail(chat_id, jid, admin_view=True, viewer_id=u.id)
+            _answer_cb(c)
+            return
+        if data.startswith("maintconf_"):
+            val = data.split("_", 1)[1]
+            set_setting("maintenance_mode", val)
+            global MAINTENANCE_MODE
+            MAINTENANCE_MODE = val == "1"
+            audit_log(u.id, "MAINTENANCE_TOGGLE", val)
+            _safe_edit(
+                chat_id, c.message.message_id,
+                f"🛠 Maintenance: `{'ON' if val == '1' else 'OFF'}`",
+                markup=_admin_keyboard(),
+            )
+            _answer_cb(c)
+            return
+
+        _answer_cb(c, "Unknown action.")
+    except Exception as e:
+        log.exception("callback error: %s", e)
+        _answer_cb(c, "Error.")
+
+
+def _handle_back(c: types.CallbackQuery):
+    """Centralized Back: return to the most sensible prior screen."""
+    u = c.from_user
+    chat_id = c.message.chat.id
+    session = _get_session(u.id)
+    state = session.get("state") if session else None
+    if state in (STATE_AWAIT_VISITS, STATE_AWAIT_MODE):
+        # back to extraction type choice
+        _start_extraction_flow(chat_id, u)
+    elif state == STATE_AWAIT_URL:
+        _clear_session(u.id)
+        _send_home(chat_id, u.id)
+    elif state in (STATE_AWAIT_PROXY_ADD, STATE_AWAIT_PROXY_BULK,
+                   STATE_AWAIT_PROXY_SRC):
+        _clear_session(u.id)
+        _show_proxy_dashboard(chat_id)
+    elif state in (STATE_AWAIT_BROADCAST, STATE_AWAIT_SEARCH,
+                   STATE_AWAIT_CHANNEL):
+        _clear_session(u.id)
+        _show_admin_panel(chat_id)
+    elif state == STATE_AWAIT_BULK:
+        _clear_session(u.id)
+        _start_extraction_flow(chat_id, u)
+    else:
+        _clear_session(u.id)
+        if is_admin(u.id):
+            _show_admin_panel(chat_id)
+        else:
+            _send_home(chat_id, u.id)# =========================================================
+#  Admin views
+# =========================================================
+def _show_admin_dashboard(chat_id, days: Optional[int] = None):
+    d = admin_dashboard_stats(days)
+    pc = proxy_pool.count()
+    running = sum(1 for st in job_state.values()
+                  if not isinstance(st.get("cancel"), threading.Event)
+                  or (isinstance(st.get("cancel"), threading.Event)
+                      and not st["cancel"].is_set() and not st.get("bulk")))
+    period = "All Time" if days is None else f"Last {days}d"
+    _safe_send(
+        chat_id,
+        ("📊 *SYSTEM ANALYTICS*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         f"📅 Period: *{period}*\n\n"
+         "👥 Users\n"
+         f"Total: `{d['total_users']}`\n"
+         f"Active Today: `{d['active_today']}`\n\n"
+         "🚀 Jobs\n"
+         f"Total: `{d['total_jobs']}`\n"
+         f"Successful: `{d['successful_jobs']}`\n"
+         f"Failed: `{d['failed_jobs']}`\n"
+         f"Today: `{d['jobs_today']}`\n"
+         f"Running: `{running}`\n\n"
+         "🔗 URLs Processed\n"
+         f"Total: `{d['total_urls']}`\n\n"
+         "📱 Numbers\n"
+         f"Total: `{d['total_numbers']:,}`\n"
+         f"Today: `{d['numbers_today']}`\n\n"
+         "🌐 Proxies\n"
+         f"Total: `{pc['total']}`\n"
          f"🟢 Working: `{pc['working']}`\n"
          f"🟡 Slow: `{pc['slow']}`\n"
          f"🔴 Dead: `{pc['dead']}`\n"
-         f"⚪ Untested: `{pc['untested']}`\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"SOCKS5 support: `{'✅' if _SOCKS_OK else '❌ (install PySocks)'}`"),
-        parse_mode="Markdown",
-        reply_markup=proxy_center_keyboard(),
+         f"⚪ Untested: `{pc['untested']}`\n\n"
+         f"⚡ Avg Job Time: `{_fmt_duration(int(d['avg_duration']))}`\n"
+         "━━━━━━━━━━━━━━━━━━━━"),
+        markup=types.InlineKeyboardMarkup(row_width=2).add(
+            types.InlineKeyboardButton("Today", callback_data="adm_dash_1"),
+            types.InlineKeyboardButton("7 Days", callback_data="adm_dash_7"),
+            types.InlineKeyboardButton("30 Days", callback_data="adm_dash_30"),
+            types.InlineKeyboardButton("All Time", callback_data="adm_dashboard"),
+            types.InlineKeyboardButton("◀️ Admin", callback_data="adm_panel"),
+        ),
     )
 
 
-def _show_proxy_list(chat_id):
-    rows = list_proxies(limit=30)
-    if not rows:
-        bot.send_message(chat_id, "No proxies configured.", reply_markup=proxy_center_keyboard())
+def _show_admin_users(chat_id, page=0):
+    users, total = recent_users(limit=10, page=page)
+    if not users:
+        _safe_send(chat_id, "👥 No users found.",
+                   markup=_admin_keyboard())
         return
-    lines = ["📋 *PROXY LIST*", "━━━━━━━━━━━━━━━━━━━━"]
+    per_page = 10
+    lines = [f"👥 *USERS* (page {page+1}/{(total+per_page-1)//per_page})",
+             "━━━━━━━━━━━━━━━━━━━━"]
     mk = types.InlineKeyboardMarkup()
-    icons = {"WORKING": "🟢", "SLOW": "🟡", "CONNECTED": "🔵", "TARGET_FAILED": "🟠",
-             "AUTH_FAILED": "🟣", "TCP_FAILED": "🔴", "INVALID": "⚫", "UNTESTED": "⚪"}
-    for r in rows[:20]:
+    for u in users:
+        st_icon = {"APPROVED": "🟢", "PENDING": "🟡",
+                   "BLOCKED": "🔴"}.get(u["status"], "⚪")
+        lines.append(
+            f"{st_icon} `{u['user_id']}` "
+            f"{md_esc(u['first_name'] or '—')} "
+            f"@{md_esc(u['username'] or '—')}"
+        )
+        mk.add(types.InlineKeyboardButton(
+            f"{u['user_id']}", callback_data=f"udetail_{u['user_id']}"))
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton("◀️ Prev",
+                                              callback_data=f"upage_{page-1}"))
+    if (page + 1) * per_page < total:
+        nav.append(types.InlineKeyboardButton("▶️ Next",
+                                              callback_data=f"upage_{page+1}"))
+    if nav:
+        mk.row(*nav)
+    mk.add(types.InlineKeyboardButton("🔍 Search", callback_data="usr_search"))
+    mk.add(types.InlineKeyboardButton("◀️ Admin", callback_data="adm_panel"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
+
+
+def _handle_user_search(chat_id, admin_id, query):
+    users = search_users(query, limit=15)
+    if not users:
+        _safe_send(chat_id, "🔍 No matches.", markup=_admin_keyboard())
+        return
+    lines = ["🔍 *SEARCH RESULTS*", "━━━━━━━━━━━━━━━━━━━━"]
+    mk = types.InlineKeyboardMarkup()
+    for u in users:
+        lines.append(f"`{u['user_id']}` {md_esc(u['first_name'] or '—')} "
+                     f"@{md_esc(u['username'] or '—')}")
+        mk.add(types.InlineKeyboardButton(
+            f"{u['user_id']}", callback_data=f"udetail_{u['user_id']}"))
+    mk.add(types.InlineKeyboardButton("◀️ Admin", callback_data="adm_panel"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
+
+
+def _show_user_detail_admin(chat_id, target_id):
+    u = get_user(target_id)
+    if not u:
+        _safe_send(chat_id, "User not found.", markup=_admin_keyboard())
+        return
+    jobs, total = user_jobs(target_id, limit=200)
+    succ = sum(1 for j in jobs if j["status"] == "COMPLETED")
+    fail = sum(1 for j in jobs if j["status"] == "FAILED")
+    last = (jobs[0]["started_at"] or "")[:16] if jobs else "—"
+    _safe_send(
+        chat_id,
+        ("👤 *USER DETAILS*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         f"Name: {md_esc(u['first_name'] or '—')}\n"
+         f"Username: @{md_esc(u['username'] or '—')}\n"
+         f"Telegram ID: `{u['user_id']}`\n"
+         f"Status: `{u['status']}`\n"
+         f"Plan: `{u.get('plan', 'FREE')}`\n\n"
+         "📊 Statistics\n"
+         f"Total Jobs: `{total}`\n"
+         f"Successful: `{succ}`\n"
+         f"Failed: `{fail}`\n"
+         f"URLs Processed: `{u.get('total_urls_processed', 0)}`\n"
+         f"Unique Numbers: `{u['total_numbers_found']}`\n\n"
+         f"🕒 Joined: `{(u['joined_at'] or '')[:16]}`\n"
+         f"🕒 Last Active: `{(u['last_active'] or '')[:16]}`\n"
+         f"🕒 Latest Job: `{last}`\n"
+         "━━━━━━━━━━━━━━━━━━━━"),
+        markup=_user_action_keyboard(target_id, u["status"]),
+    )
+
+
+def _user_action_keyboard(target_id, status):
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        types.InlineKeyboardButton("📋 History",
+                                   callback_data=f"uhist_{target_id}"),
+        types.InlineKeyboardButton("🚫 Block",
+                                   callback_data=f"ublock_{target_id}")
+        if status != "BLOCKED"
+        else types.InlineKeyboardButton("✅ Unblock",
+                                        callback_data=f"uunblock_{target_id}"),
+    )
+    if status == "PENDING":
+        mk.add(types.InlineKeyboardButton("✅ Approve",
+                                          callback_data=f"appr_{target_id}"))
+    mk.add(types.InlineKeyboardButton("◀️ Users",
+                                      callback_data="adm_users"))
+    return mk
+
+
+def _show_admin_user_history(chat_id, target_id):
+    jobs, _ = user_jobs(target_id, limit=10)
+    if not jobs:
+        _safe_send(chat_id, "No jobs.", markup=_admin_keyboard())
+        return
+    lines = [f"📋 *USER HISTORY* (`{target_id}`)", "━━━━━━━━━━━━━━━━━━━━"]
+    mk = types.InlineKeyboardMarkup()
+    for j in jobs:
+        host = urllib.parse.urlparse(j["source_url"]).hostname or "?"
+        mode = "🌐" if j["mode"] == "IP_ROTATION" else "🟢"
+        st = {"COMPLETED": "✅", "FAILED": "❌", "CANCELLED": "🛑",
+              "INTERRUPTED": "⚠️"}.get(j["status"], "⚪")
+        lines.append(
+            f"{st} `{j['job_code']}` {mode} `{md_esc(host)}` "
+            f"📱`{j['unique_numbers']}`"
+        )
+        mk.add(types.InlineKeyboardButton(
+            f"{j['job_code']}", callback_data=f"ajob_{j['job_id']}"))
+    mk.add(types.InlineKeyboardButton("◀️ Back",
+                                      callback_data=f"udetail_{target_id}"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
+
+
+def _show_admin_jobs(chat_id):
+    jobs = recent_jobs(limit=15)
+    if not jobs:
+        _safe_send(chat_id, "🚀 No extraction jobs.", markup=_admin_keyboard())
+        return
+    lines = ["🚀 *EXTRACTION LOGS*", "━━━━━━━━━━━━━━━━━━━━"]
+    mk = types.InlineKeyboardMarkup()
+    for j in jobs:
+        host = urllib.parse.urlparse(j["source_url"]).hostname or "?"
+        mode = "🌐" if j["mode"] == "IP_ROTATION" else "🟢"
+        st = {"COMPLETED": "✅", "FAILED": "❌", "CANCELLED": "🛑",
+              "INTERRUPTED": "⚠️", "RUNNING": "⏳"}.get(j["status"], "⚪")
+        ts = (j["started_at"] or "")[:16]
+        lines.append(
+            f"{st} `{j['job_code']}` {mode} `{ts}`\n"
+            f"👤 @{md_esc(j['username'] or '—')} | "
+            f"🔗 `{md_esc(host)}` | 📱 `{j['unique_numbers']}`"
+        )
+        mk.add(types.InlineKeyboardButton(
+            f"{j['job_code']}", callback_data=f"ajob_{j['job_id']}"))
+    mk.add(types.InlineKeyboardButton("◀️ Admin", callback_data="adm_panel"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
+
+
+# =========================================================
+#  Proxy Center views
+# =========================================================
+def _show_proxy_dashboard(chat_id):
+    pc = proxy_pool.count()
+    avg_q = "SELECT COALESCE(AVG(average_latency),0) a FROM proxies " \
+            "WHERE health_status IN ('WORKING','SLOW')"
+    with _db_lock:
+        conn = get_conn()
+        try:
+            avg_lat = conn.execute(avg_q).fetchone()["a"]
+            succ_q = ("SELECT COALESCE(SUM(success_count),0) s, "
+                      "COALESCE(SUM(success_count+failure_count),0) t "
+                      "FROM proxies")
+            row = conn.execute(succ_q).fetchone()
+            rate = (row["s"] / row["t"] * 100) if row["t"] else 0
+        finally:
+            conn.close()
+    last_test = "—"
+    _safe_send(
+        chat_id,
+        ("🌐 *PROXY CENTER*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         f"📊 Total: `{pc['total']}`\n"
+         f"🟢 Healthy: `{pc['working']}`\n"
+         f"🟡 Slow: `{pc['slow']}`\n"
+         f"🔵 Connected: `{pc['connected']}`\n"
+         f"🔴 Dead: `{pc['dead']}`\n"
+         f"⚪ Untested: `{pc['untested']}`\n\n"
+         f"⚡ Avg Latency: `{int(avg_lat)}ms`\n"
+         f"📊 Success Rate: `{rate:.1f}%`\n"
+         f"━━━━━━━━━━━━━━━━━━━━\n"
+         f"🧪 SOCKS5: `{'✅' if _SOCKS_OK else '❌ install PySocks'}`\n"
+         "━━━━━━━━━━━━━━━━━━━━"),
+        markup=_proxy_center_keyboard(),
+    )
+
+
+def _show_proxy_list(chat_id, status_filter=None, page=0):
+    rows, total = list_proxies(limit=10, status_filter=status_filter, page=page)
+    if not rows:
+        _safe_send(chat_id, "No proxies found.",
+                   markup=_proxy_center_keyboard())
+        return
+    title = f"📋 *PROXY LIST* ({status_filter or 'all'})"
+    lines = [title, "━━━━━━━━━━━━━━━━━━━━"]
+    mk = types.InlineKeyboardMarkup()
+    icons = {"WORKING": "🟢", "SLOW": "🟡", "CONNECTED": "🔵",
+             "TARGET_FAILED": "🟠", "AUTH_FAILED": "🟣",
+             "TCP_FAILED": "🔴", "INVALID": "⚫", "UNTESTED": "⚪"}
+    for r in rows:
         ic = icons.get(r["health_status"], "⚪")
-        # NEVER expose credentials — show host:port only
-        lines.append(f"{ic} #{r['id']} {r['protocol'].upper()} `{r['host']}:{r['port']}`")
-        lines.append(f"   Latency: `{r['average_latency']}ms` | Score: `{r['health_score']}` | Succ: `{r['success_count']}` Fail: `{r['failure_count']}`")
-        if r["last_observed_ip"]:
-            lines.append(f"   Exit IP: `{r['last_observed_ip']}`")
-        mk.add(types.InlineKeyboardButton(f"🗑 #{r['id']}", callback_data=f"pxdel_{r['id']}"))
-    mk.add(types.InlineKeyboardButton("🔙 Proxy Center", callback_data="adm_proxies"))
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=mk)
+        lines.append(
+            f"{ic} #{r['id']} {r['protocol'].upper()} "
+            f"`{md_esc(r['host'])}:{r['port']}`\n"
+            f"   Latency: `{r['average_latency']}ms` | "
+            f"Score: `{r['health_score']}` | "
+            f"S: `{r['success_count']}` F: `{r['failure_count']}`"
+        )
+        mk.add(types.InlineKeyboardButton(
+            f"🗑 #{r['id']}", callback_data=f"pxdel_{r['id']}"))
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton("◀️ Prev",
+            callback_data=f"pxpage_{status_filter or 'all'}_{page-1}"))
+    if (page + 1) * 10 < total:
+        nav.append(types.InlineKeyboardButton("▶️ Next",
+            callback_data=f"pxpage_{status_filter or 'all'}_{page+1}"))
+    if nav:
+        mk.row(*nav)
+    mk.add(types.InlineKeyboardButton("◀️ Proxy Center",
+                                      callback_data="adm_proxies"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
 
 
 def _handle_proxy_add(chat_id, admin_id, text):
     p = parse_proxy(text)
     if not p:
-        bot.send_message(chat_id, "❌ Invalid proxy format.", reply_markup=proxy_center_keyboard())
+        _safe_send(chat_id, "❌ Invalid proxy format.",
+                   markup=_proxy_center_keyboard())
         return
     pid = add_proxy_db(text)
     if pid is None:
-        bot.send_message(chat_id, "❌ Could not add.", reply_markup=proxy_center_keyboard())
+        _safe_send(chat_id, "❌ Could not add.",
+                   markup=_proxy_center_keyboard())
         return
     audit_log(admin_id, "PROXY_ADDED", str(pid), _mask(text))
-    # test immediately
     res = test_proxy(p)
     update_proxy_health(pid, res)
-    bot.send_message(
+    _safe_send(
         chat_id,
         (f"✅ Proxy `#{pid}` added.\n"
-         f"Status: {res['status']}\n"
+         f"Status: `{res['status']}`\n"
          f"Latency: `{res['latency_ms']}ms`\n"
          f"Exit IP: `{res['exit_ip'] or '—'}`"),
-        parse_mode="Markdown",
-        reply_markup=proxy_center_keyboard(),
+        markup=_proxy_center_keyboard(),
     )
 
 
@@ -2855,48 +4472,111 @@ def _handle_proxy_bulk(chat_id, admin_id, text):
         else:
             failed += 1
     audit_log(admin_id, "PROXY_BULK_ADD", f"{added} added, {failed} failed")
-    bot.send_message(
+    _safe_send(
         chat_id,
-        f"📦 Bulk add: `{added}` added, `{failed}` failed.\nRun *Health Check* to test them.",
-        parse_mode="Markdown",
-        reply_markup=proxy_center_keyboard(),
+        f"📦 Bulk add: `{added}` added, `{failed}` failed.\n"
+        f"Run *Test All* to verify them.",
+        markup=_proxy_center_keyboard(),
     )
 
 
 def _run_proxy_test(chat_id, scope="all"):
-    msg = bot.send_message(chat_id, "🧪 *Testing proxies…*\n`0%`", parse_mode="Markdown")
+    msg = bot.send_message(chat_id, "🧪 *Testing proxies…* `0%`",
+                           parse_mode="Markdown")
+    cancel_event = threading.Event()
+
     def cb(tested, total, working, slow, dead):
-        pct = int((tested/total)*100) if total else 0
-        try:
-            bot.edit_message_text(
-                chat_id=chat_id, message_id=msg.message_id,
-                text=(f"🧪 *PROXY CHECKING*\n"
-                      f"━━━━━━━━━━━━━━━━━━━━\n"
-                      f"Progress: `{pct}%`\n"
-                      f"Tested: `{tested}/{total}`\n"
-                      f"🟢 Working: `{working}`\n"
-                      f"🟡 Slow: `{slow}`\n"
-                      f"🔴 Failed: `{dead}`\n"
-                      f"━━━━━━━━━━━━━━━━━━━━"),
-                parse_mode="Markdown",
-            )
-        except Exception:
-            pass
-    result = bulk_test_proxies(progress_cb=cb)
-    try:
-        bot.edit_message_text(
-            chat_id=chat_id, message_id=msg.message_id,
-            text=(f"✅ *Proxy test complete*\n"
-                  f"━━━━━━━━━━━━━━━━━━━━\n"
-                  f"Tested: `{result['tested']}`\n"
-                  f"🟢 Working: `{result['working']}`\n"
-                  f"🟡 Slow: `{result['slow']}`\n"
-                  f"🔴 Dead: `{result['dead']}`"),
-            parse_mode="Markdown",
+        pct = int((tested / total) * 100) if total else 0
+        _safe_edit(
+            chat_id, msg.message_id,
+            ("🧪 *PROXY HEALTH CHECK*\n"
+             "━━━━━━━━━━━━━━━━━━━━\n"
+             f"Progress: `{_bar(pct)} {pct}%`\n\n"
+             f"Tested: `{tested}/{total}`\n"
+             f"🟢 Working: `{working}`\n"
+             f"🟡 Slow: `{slow}`\n"
+             f"🔴 Failed: `{dead}`\n"
+             "━━━━━━━━━━━━━━━━━━━━"),
         )
-    except Exception:
-        pass
-    bot.send_message(chat_id, "🔙", reply_markup=proxy_center_keyboard())
+
+    result = bulk_test_proxies(progress_cb=cb, cancel_event=cancel_event,
+                               scope=scope)
+    _safe_edit(
+        chat_id, msg.message_id,
+        ("✅ *PROXY TEST COMPLETE*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         f"Tested: `{result['tested']}`\n"
+         f"🟢 Working: `{result['working']}`\n"
+         f"🟡 Slow: `{result['slow']}`\n"
+         f"🔴 Dead: `{result['dead']}`\n"
+         "━━━━━━━━━━━━━━━━━━━━"),
+    )
+    _show_proxy_dashboard(chat_id)
+
+
+def _run_fetch_proxies(chat_id, admin_id):
+    msg = bot.send_message(chat_id, "⚡ *Fetching latest proxies…*",
+                           parse_mode="Markdown")
+    cancel_event = threading.Event()
+
+    def cb(sources, discovered, parsed, imported, tested, total,
+           working, slow, dead):
+        _safe_edit(
+            chat_id, msg.message_id,
+            ("⚡ *FETCHING PROXIES*\n"
+             "━━━━━━━━━━━━━━━━━━━━\n"
+             f"Sources: `{sources}`\n"
+             f"Discovered: `{discovered}`\n"
+             f"Parsed: `{parsed}`\n"
+             f"Imported: `{imported}`\n\n"
+             f"Testing: `{tested}/{total}`\n"
+             f"🟢 Working: `{working}`\n"
+             f"🟡 Slow: `{slow}`\n"
+             f"🔴 Failed: `{dead}`\n"
+             "━━━━━━━━━━━━━━━━━━━━"),
+        )
+
+    try:
+        result = fetch_latest_proxies(progress_cb=cb, cancel_event=cancel_event)
+        audit_log(admin_id, "PROXY_FETCH",
+                  f"sources={result['sources']} "
+                  f"working={result['working']}")
+        _safe_edit(
+            chat_id, msg.message_id,
+            ("⚡ *FETCH COMPLETE*\n"
+             "━━━━━━━━━━━━━━━━━━━━\n"
+             f"📥 Sources: `{result['sources']}`\n"
+             f"Discovered: `{result['discovered']}`\n"
+             f"Parsed: `{result['parsed']}`\n"
+             f"➕ Imported: `{result['imported']}`\n\n"
+             f"🧪 Tested: `{result['tested']}`\n"
+             f"🟢 Working: `{result['working']}`\n"
+             f"🟡 Slow: `{result['slow']}`\n"
+             f"🔴 Failed: `{result['dead']}`\n"
+             "━━━━━━━━━━━━━━━━━━━━"),
+        )
+    except Exception as e:
+        _safe_edit(chat_id, msg.message_id,
+                   f"❌ Fetch failed: `{str(e)[:80]}`")
+    _show_proxy_dashboard(chat_id)
+
+
+def _confirm_cleanup_dead(chat_id, admin_id):
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        types.InlineKeyboardButton("✅ Yes, Clean",
+                                   callback_data="pxcleanupconf_1"),
+        types.InlineKeyboardButton("❌ No", callback_data="adm_proxies"),
+    )
+    _safe_send(
+        chat_id,
+        ("⚠️ *CLEANUP DEAD PROXIES?*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "Removes proxies marked TCP_FAILED / AUTH_FAILED / INVALID "
+         "with 5+ consecutive failures.\n\n"
+         "This cannot be undone."),
+        markup=mk,
+    )
 
 
 def _cleanup_dead_proxies(chat_id, admin_id):
@@ -2904,7 +4584,8 @@ def _cleanup_dead_proxies(chat_id, admin_id):
         conn = get_conn()
         try:
             cur = conn.execute(
-                "DELETE FROM proxies WHERE health_status IN ('TCP_FAILED','AUTH_FAILED','INVALID') "
+                "DELETE FROM proxies WHERE health_status IN "
+                "('TCP_FAILED','AUTH_FAILED','INVALID') "
                 "AND consecutive_failures >= 5"
             )
             n = cur.rowcount
@@ -2912,154 +4593,181 @@ def _cleanup_dead_proxies(chat_id, admin_id):
         finally:
             conn.close()
     audit_log(admin_id, "PROXY_CLEANUP", f"removed {n}")
-    bot.send_message(chat_id, f"🗑 Removed `{n}` dead proxies.",
-                     parse_mode="Markdown", reply_markup=proxy_center_keyboard())
+    _safe_send(chat_id, f"🗑 Removed `{n}` dead proxies.",
+               markup=_proxy_center_keyboard())
 
 
+def _show_proxy_sources(chat_id):
+    with _db_lock:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM proxy_sources ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+    mk = types.InlineKeyboardMarkup()
+    lines = ["📦 *PROXY SOURCES*", "━━━━━━━━━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("No sources configured.")
+        lines.append("")
+        lines.append("_Add a plaintext proxy-list URL to enable "
+                     "Fetch Latest._")
+    else:
+        for r in rows:
+            lines.append(f"#{r['id']} `{md_esc(_short(r['url'], 50))}`")
+            mk.add(types.InlineKeyboardButton(
+                f"🗑 #{r['id']}", callback_data=f"pxsrcdel_{r['id']}"))
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    mk.add(types.InlineKeyboardButton("➕ Add Source",
+                                      callback_data="px_src_add"))
+    mk.add(types.InlineKeyboardButton("◀️ Proxy Center",
+                                      callback_data="adm_proxies"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
+
+
+def _handle_proxy_source_add(chat_id, admin_id, text):
+    url = text.strip()
+    if not url.startswith(("http://", "https://")):
+        _safe_send(chat_id, "❌ Send a valid http(s) URL.",
+                   markup=_proxy_center_keyboard())
+        return
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO proxy_sources(name, url) VALUES(?, ?)",
+                (_short(url, 60), url),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    audit_log(admin_id, "PROXY_SOURCE_ADDED", _mask(url))
+    _show_proxy_sources(chat_id)
+
+
+# =========================================================
+#  Channel settings & post history
+# =========================================================
 def _show_channel_settings(chat_id):
     cfg = get_settings_batch([
         "channel_logging", "channel_username", "channel_include_username",
-        "channel_include_uid", "channel_include_method", "channel_include_numbers",
-        "channel_attach_txt",
+        "channel_include_uid", "channel_include_method",
+        "channel_include_numbers", "channel_include_source",
+        "channel_attach_txt", "show_duration", "show_job_id",
     ])
-    def yn(v): return "✅ ON" if v == "1" else "❌ OFF"
+    yn = lambda v: "✅ ON" if v == "1" else "❌ OFF"
     text = (
-        f"📡 *CHANNEL SETTINGS*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Channel: `{cfg['channel_username']}`\n"
+        "📡 *CHANNEL SETTINGS*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Channel: `{md_esc(cfg['channel_username'] or '—')}`\n"
         f"Auto-post: {yn(cfg['channel_logging'])}\n"
         f"Include username: {yn(cfg['channel_include_username'])}\n"
         f"Include UID: {yn(cfg['channel_include_uid'])}\n"
         f"Include method: {yn(cfg['channel_include_method'])}\n"
+        f"Include source: {yn(cfg['channel_include_source'])}\n"
         f"Include numbers: {yn(cfg['channel_include_numbers'])}\n"
-        f"Attach .txt: {yn(cfg['channel_attach_txt'])}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"Show duration: {yn(cfg['show_duration'])}\n"
+        f"Show job ID: {yn(cfg['show_job_id'])}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
     )
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.add(
-        types.InlineKeyboardButton(f"Auto-post: {yn(cfg['channel_logging'])}", callback_data="set_channel_logging"),
-        types.InlineKeyboardButton("🧪 Test Channel", callback_data="adm_chan_test"),
-        types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"),
+        types.InlineKeyboardButton(f"Auto-post: {yn(cfg['channel_logging'])}",
+                                   callback_data="set_channel_logging"),
+        types.InlineKeyboardButton("🧪 Test Channel",
+                                   callback_data="adm_chan_test"),
+        types.InlineKeyboardButton("✏️ Set Channel",
+                                   callback_data="adm_chan_set"),
+        types.InlineKeyboardButton("◀️ Admin",
+                                   callback_data="adm_panel"),
     )
-    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=mk)
+    _safe_send(chat_id, text, markup=mk)
 
 
 def _test_channel(chat_id):
     ch = get_setting("channel_username", DEFAULT_CHANNEL)
+    if not ch:
+        _safe_send(chat_id, "❌ No channel configured.",
+                   markup=_admin_keyboard())
+        return
     try:
-        msg = bot.send_message(ch, "🧪 *Channel test*\nBot can post here ✅", parse_mode="Markdown")
-        bot.send_message(chat_id, f"✅ Channel verified. Message ID: `{msg.message_id}`",
-                         parse_mode="Markdown", reply_markup=admin_keyboard())
+        msg = bot.send_message(ch, "🧪 *Channel test*\nBot can post here ✅",
+                               parse_mode="Markdown")
+        _safe_send(chat_id,
+                   f"✅ Channel verified. Message ID: `{msg.message_id}`",
+                   markup=_admin_keyboard())
     except Exception as e:
-        bot.send_message(
+        _safe_send(
             chat_id,
-            (f"❌ *Channel posting failed*\n"
-             f"Reason: {str(e)[:120]}\n\n"
-             f"Make sure the bot is added as admin to `{ch}` with post permission."),
-            parse_mode="Markdown", reply_markup=admin_keyboard(),
+            ("❌ *CHANNEL POSTING FAILED*\n"
+             f"Reason: {md_esc(str(e)[:120])}\n\n"
+             "Make sure the bot is added as admin to the channel "
+             "with post permission."),
+            markup=_admin_keyboard(),
         )
 
 
+def _show_channel_post_history(chat_id, page=0):
+    rows, total = channel_post_rows(limit=10, page=page)
+    if not rows:
+        _safe_send(chat_id, "📡 No channel posts yet.",
+                   markup=_admin_keyboard())
+        return
+    lines = ["📡 *POST HISTORY*", "━━━━━━━━━━━━━━━━━━━━"]
+    for r in rows:
+        st = {"OK": "✅", "FAILED": "❌"}.get(r["status"], "⚪")
+        code = r.get("job_code") or f"#{r['job_id']}"
+        lines.append(f"{st} `{code}` `{(r['posted_at'] or '')[:16]}`")
+        if r["error"]:
+            lines.append(f"   err: {md_esc(r['error'][:60])}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    mk = types.InlineKeyboardMarkup()
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton("◀️ Prev",
+                                              callback_data=f"cpage_{page-1}"))
+    if (page + 1) * 10 < total:
+        nav.append(types.InlineKeyboardButton("▶️ Next",
+                                              callback_data=f"cpage_{page+1}"))
+    if nav:
+        mk.row(*nav)
+    mk.add(types.InlineKeyboardButton("◀️ Admin", callback_data="adm_panel"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
+
+
+# =========================================================
+#  Bot settings, maintenance, audit log, broadcast
+# =========================================================
 def _show_bot_settings(chat_id):
     cfg = get_settings_batch([
         "maintenance_mode", "approval_mode", "proxy_enabled", "max_visits",
         "progress_interval", "support_username", "admin_display_name",
     ])
-    def yn(v): return "✅ ON" if v == "1" else "❌ OFF"
+    yn = lambda v: "✅ ON" if v == "1" else "❌ OFF"
     text = (
-        f"⚙️ *BOT SETTINGS*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        "⚙️ *SYSTEM SETTINGS*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
         f"Maintenance: {yn(cfg['maintenance_mode'])}\n"
         f"Approval mode: {yn(cfg['approval_mode'])}\n"
         f"Proxy enabled: {yn(cfg['proxy_enabled'])}\n"
         f"Max visits: `{cfg['max_visits']}`\n"
         f"Progress interval: `{cfg['progress_interval']}s`\n"
-        f"Support username: @{cfg['support_username']}\n"
-        f"Admin display: {cfg['admin_display_name']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"Support username: @{md_esc(cfg['support_username'] or '—')}\n"
+        f"Admin display: {md_esc(cfg['admin_display_name'])}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
     )
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.add(
-        types.InlineKeyboardButton(f"Maintenance: {yn(cfg['maintenance_mode'])}", callback_data="set_maintenance_mode"),
-        types.InlineKeyboardButton(f"Approval: {yn(cfg['approval_mode'])}", callback_data="set_approval_mode"),
-        types.InlineKeyboardButton(f"Proxy: {yn(cfg['proxy_enabled'])}", callback_data="set_proxy_enabled"),
-        types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"),
+        types.InlineKeyboardButton(f"Maintenance: {yn(cfg['maintenance_mode'])}",
+                                   callback_data="set_maintenance_mode"),
+        types.InlineKeyboardButton(f"Approval: {yn(cfg['approval_mode'])}",
+                                   callback_data="set_approval_mode"),
+        types.InlineKeyboardButton(f"Proxy: {yn(cfg['proxy_enabled'])}",
+                                   callback_data="set_proxy_enabled"),
+        types.InlineKeyboardButton("◀️ Admin", callback_data="adm_panel"),
     )
-    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=mk)
-
-
-def _toggle_maintenance(chat_id, admin_id):
-    cur = get_setting("maintenance_mode", "0")
-    new = "0" if cur == "1" else "1"
-    set_setting("maintenance_mode", new)
-    global MAINTENANCE_MODE
-    MAINTENANCE_MODE = new == "1"
-    audit_log(admin_id, "MAINTENANCE_TOGGLE", new)
-    bot.send_message(
-        chat_id,
-        f"🛠 Maintenance: `{'ON' if new=='1' else 'OFF'}`",
-        parse_mode="Markdown", reply_markup=admin_keyboard(),
-    )
-
-
-def _show_admins(chat_id):
-    with _db_lock:
-        conn = get_conn()
-        try:
-            rows = conn.execute("SELECT * FROM admins WHERE is_active=1 ORDER BY role").fetchall()
-        finally:
-            conn.close()
-    lines = ["👮 *ADMINS*", "━━━━━━━━━━━━━━━━━━━━"]
-    for r in rows:
-        lines.append(f"{r['role']} @{r['username'] or '—'} (`{r['user_id']}`)")
-    lines.append(f"OWNER (env) admins: {', '.join(str(a) for a in ADMIN_IDS)}")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_Add admins via ADMIN_IDS env var or contact owner._")
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=admin_keyboard())
-
-
-def _show_pending(chat_id, admin_id):
-    users = pending_users()
-    if not users:
-        bot.send_message(chat_id, "✅ No pending users.", reply_markup=admin_keyboard())
-        return
-    mk = types.InlineKeyboardMarkup()
-    lines = ["⏳ *PENDING USERS*", "━━━━━━━━━━━━━━━━━━━━"]
-    for u in users[:15]:
-        lines.append(f"`{u['user_id']}` {u['first_name'] or '—'} @{u['username'] or '—'}")
-        mk.add(types.InlineKeyboardButton(f"✅ {u['user_id']}", callback_data=f"appr_{u['user_id']}"))
-        mk.add(types.InlineKeyboardButton(f"❌ {u['user_id']}", callback_data=f"rej_{u['user_id']}"))
-    mk.add(types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"))
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=mk)
-
-
-def _do_broadcast(chat_id, admin_id, text):
-    users = all_user_ids()
-    msg = bot.send_message(chat_id, f"📢 *Broadcasting to `{len(users)}` users…*\n`0%`",
-                           parse_mode="Markdown")
-    sent = failed = 0
-    total = len(users)
-    for i, uid in enumerate(users, 1):
-        try:
-            bot.send_message(uid, text)
-            sent += 1
-        except Exception:
-            failed += 1
-        if i % 25 == 0 or i == total:
-            try:
-                bot.edit_message_text(
-                    chat_id=chat_id, message_id=msg.message_id,
-                    text=(f"📢 *Broadcasting…*\n"
-                          f"Progress: `{int((i/total)*100)}%`\n"
-                          f"Sent: `{sent}` | Failed: `{failed}`"),
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
-        time.sleep(0.05)
-    audit_log(admin_id, "BROADCAST_SENT", f"sent={sent} failed={failed}")
-    bot.send_message(chat_id, f"✅ *Broadcast complete*\nSent: `{sent}`\nFailed: `{failed}`",
-                     parse_mode="Markdown", reply_markup=admin_keyboard())
+    _safe_send(chat_id, text, markup=mk)
 
 
 def _handle_setting_toggle(chat_id, admin_id, key):
@@ -3070,27 +4778,152 @@ def _handle_setting_toggle(chat_id, admin_id, key):
         global MAINTENANCE_MODE
         MAINTENANCE_MODE = new == "1"
     audit_log(admin_id, "SETTING_TOGGLE", f"{key}={new}")
-    # refresh view
-    if key.startswith("channel"):
+    if key.startswith("channel") or key.startswith("show_"):
         _show_channel_settings(chat_id)
     else:
         _show_bot_settings(chat_id)
 
 
+def _confirm_maintenance(chat_id, admin_id):
+    cur = get_setting("maintenance_mode", "0")
+    new = "1" if cur != "1" else "0"
+    action = "ENABLE" if new == "1" else "DISABLE"
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        types.InlineKeyboardButton(f"✅ Yes, {action}",
+                                   callback_data=f"maintconf_{new}"),
+        types.InlineKeyboardButton("❌ No", callback_data="adm_panel"),
+    )
+    _safe_send(
+        chat_id,
+        (f"⚠️ *{action} MAINTENANCE MODE?*\n"
+         "━━━━━━━━━━━━━━━━━━━━\n"
+         "When enabled, non-admin users see a maintenance screen.\n"
+         "Admins continue to have full access."),
+        markup=mk,
+    )
+
+
+def _show_audit_log(chat_id, page=0):
+    rows, total = audit_log_rows(limit=10, page=page)
+    if not rows:
+        _safe_send(chat_id, "📜 Audit log is empty.",
+                   markup=_admin_keyboard())
+        return
+    lines = ["📜 *AUDIT LOG*", "━━━━━━━━━━━━━━━━━━━━"]
+    for r in rows:
+        lines.append(
+            f"`{(r['timestamp'] or '')[:16]}` "
+            f"admin `{r['admin_id']}`\n"
+            f"   {md_esc(r['action'])} → {md_esc(r['target'] or '—')}"
+        )
+        if r["details"]:
+            lines.append(f"   _{md_esc(r['details'][:60])}_")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    mk = types.InlineKeyboardMarkup()
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton("◀️ Prev",
+                                              callback_data=f"apage_{page-1}"))
+    if (page + 1) * 10 < total:
+        nav.append(types.InlineKeyboardButton("▶️ Next",
+                                              callback_data=f"apage_{page+1}"))
+    if nav:
+        mk.row(*nav)
+    mk.add(types.InlineKeyboardButton("◀️ Admin", callback_data="adm_panel"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
+
+
+def _show_pending(chat_id, admin_id):
+    users = pending_users()
+    if not users:
+        _safe_send(chat_id, "✅ No pending users.", markup=_admin_keyboard())
+        return
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    lines = ["⏳ *PENDING USERS*", "━━━━━━━━━━━━━━━━━━━━"]
+    for u in users[:15]:
+        lines.append(f"`{u['user_id']}` "
+                     f"{md_esc(u['first_name'] or '—')} "
+                     f"@{md_esc(u['username'] or '—')}")
+        mk.add(
+            types.InlineKeyboardButton(f"✅ {u['user_id']}",
+                                        callback_data=f"appr_{u['user_id']}"),
+            types.InlineKeyboardButton(f"❌ {u['user_id']}",
+                                        callback_data=f"rej_{u['user_id']}"),
+        )
+    mk.add(types.InlineKeyboardButton("◀️ Admin", callback_data="adm_panel"))
+    _safe_send(chat_id, "\n".join(lines), markup=mk)
+
+
+def _do_broadcast(chat_id, admin_id, text):
+    users = all_user_ids()
+    if not users:
+        _safe_send(chat_id, "📢 No users to broadcast to.",
+                   markup=_admin_keyboard())
+        return
+    msg = bot.send_message(
+        chat_id,
+        f"📢 *Broadcasting to `{len(users)}` users…* `0%`",
+        parse_mode="Markdown",
+    )
+    sent = failed = 0
+    total = len(users)
+    for i, uid in enumerate(users, 1):
+        try:
+            bot.send_message(uid, text)
+            sent += 1
+        except ApiTelegramException as e:
+            low = str(e).lower()
+            if "retry after" in low or "429" in low:
+                m = re.search(r"retry after (\d+)", low)
+                time.sleep(int(m.group(1)) + 1 if m else 2)
+                try:
+                    bot.send_message(uid, text)
+                    sent += 1
+                    continue
+                except Exception:
+                    pass
+            failed += 1
+        except Exception:
+            failed += 1
+        if i % 25 == 0 or i == total:
+            _safe_edit(
+                chat_id, msg.message_id,
+                (f"📢 *Broadcasting…*\n"
+                 f"Progress: `{int((i/total)*100)}%`\n"
+                 f"Sent: `{sent}` | Failed: `{failed}`"),
+            )
+        time.sleep(0.05)
+    audit_log(admin_id, "BROADCAST_SENT", f"sent={sent} failed={failed}")
+    _safe_send(
+        chat_id,
+        f"✅ *Broadcast complete*\nSent: `{sent}`\nFailed: `{failed}`",
+        markup=_admin_keyboard(),
+    )
+
+
+# =========================================================
+#  Diagnostics  (no real channel ping unless explicit)
+# =========================================================
 def _run_diagnostics(chat_id):
-    msg = bot.send_message(chat_id, "🩺 *Running diagnostics…*", parse_mode="Markdown")
+    msg = bot.send_message(chat_id, "🩺 *Running diagnostics…*",
+                           parse_mode="Markdown")
     results = []
     # Telegram API
-    results.append(("Telegram API", "✅" if bot.get_me() else "❌"))
+    try:
+        me = bot.get_me()
+        results.append(("Telegram API", f"✅ @{me.username}"))
+    except Exception as e:
+        results.append(("Telegram API", f"❌ {str(e)[:40]}"))
     # Database
     try:
         with _db_lock:
             conn = get_conn()
             conn.execute("SELECT 1").fetchone()
             conn.close()
-        results.append(("Database", "✅"))
-    except Exception:
-        results.append(("Database", "❌"))
+        results.append(("Database", "✅ Healthy"))
+    except Exception as e:
+        results.append(("Database", f"❌ {str(e)[:40]}"))
     # Direct HTTP
     try:
         r = requests.get("https://api.ipify.org?format=text", timeout=8)
@@ -3098,55 +4931,65 @@ def _run_diagnostics(chat_id):
     except Exception:
         results.append(("Direct HTTP", "❌"))
     # Proxy parser
-    results.append(("Proxy parser", "✅" if parse_proxy("socks5://1.2.3.4:1080") else "❌"))
+    results.append(("Proxy parser",
+                    "✅" if parse_proxy("socks5://1.2.3.4:1080") else "❌"))
     # SOCKS5
     results.append(("SOCKS5 support", "✅" if _SOCKS_OK else "❌"))
-    # Channel
-    ch = get_setting("channel_username", DEFAULT_CHANNEL)
-    try:
-        bot.send_message(ch, "🩺 diag ping", parse_mode="Markdown")
-        results.append(("Channel posting", "✅"))
-    except Exception:
-        results.append(("Channel posting", "❌"))
-    # Proxy count
+    # Proxy pool
     pc = proxy_pool.count()
-    results.append((f"Proxies (working={pc['working']})", "✅" if pc['total'] > 0 else "⚠️ none"))
+    results.append((f"Proxy pool (working={pc['working']})",
+                    "✅" if pc["total"] > 0 else "⚠️ none"))
+    # Channel config (no ping)
+    ch = get_setting("channel_username", DEFAULT_CHANNEL)
+    results.append(("Channel config",
+                    f"✅ {ch}" if ch else "⚠️ not set"))
+    # Job state
+    with _state_lock:
+        n_running = len([s for s in job_state.values()
+                         if isinstance(s.get("cancel"), threading.Event)
+                         and not s["cancel"].is_set()])
+    results.append((f"Running jobs ({n_running})", "✅"))
+    # Environment
+    results.append(("BOT_TOKEN env", "✅ set" if BOT_TOKEN else "❌ missing"))
+    results.append(("ADMIN_IDS",
+                    f"✅ {len(ADMIN_IDS)} admin(s)" if ADMIN_IDS else "⚠️ none"))
 
     lines = ["🩺 *SYSTEM DIAGNOSTICS*", "━━━━━━━━━━━━━━━━━━━━"]
     for name, st in results:
-        lines.append(f"{st} {name}")
+        lines.append(f"{st} {md_esc(name)}")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    try:
-        bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id,
-                              text="\n".join(lines), parse_mode="Markdown")
-    except Exception:
-        bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+    _safe_edit(chat_id, msg.message_id, "\n".join(lines),
+               markup=_admin_keyboard())
 
 
 # =========================================================
-# Background proxy retest scheduler
+#  Background proxy retest scheduler
 # =========================================================
 def _retest_loop():
     while True:
         time.sleep(300)
         try:
-            rows = list_proxies(limit=500, status_filter="UNTESTED")
-            rows += list_proxies(limit=500, status_filter="TCP_FAILED")
+            rows, _ = list_proxies(limit=500, status_filter="UNTESTED")
+            rows2, _ = list_proxies(limit=200, status_filter="TCP_FAILED")
+            rows += rows2
             if not rows:
                 continue
             log.info("RETEST_LOOP testing %d proxies", len(rows))
-            for r in rows[:50]:
-                p = {"protocol": r["protocol"], "host": r["host"], "port": r["port"],
-                     "username": r["username"], "password": r["password"],
-                     "endpoint": r["endpoint"]}
-                res = test_proxy(p)
-                update_proxy_health(r["id"], res)
+            # concurrent retest (bounded)
+            with ThreadPoolExecutor(max_workers=PROXY_TEST_CONCURRENCY) as ex:
+                def _one(r):
+                    p = {"protocol": r["protocol"], "host": r["host"],
+                         "port": r["port"], "username": r["username"],
+                         "password": r["password"], "endpoint": r["endpoint"]}
+                    res = test_proxy(p)
+                    update_proxy_health(r["id"], res)
+                list(ex.map(_one, rows[:80]))
         except Exception as e:
             log.warning("retest loop error: %s", e)
 
 
 # =========================================================
-# Startup
+#  Startup
 # =========================================================
 def startup_self_check():
     log.info("Bot starting…")
@@ -3157,10 +5000,15 @@ def startup_self_check():
     except Exception as e:
         checks.append(f"❌ Telegram API: {e}")
     try:
-        init_db(); seed_settings()
-        checks.append("✅ Database")
+        init_db()
+        seed_settings()
+        checks.append("✅ Database initialized")
     except Exception as e:
         checks.append(f"❌ Database: {e}")
+        return checks
+    recovered = recover_interrupted_jobs()
+    if recovered:
+        checks.append(f"✅ Recovered {recovered} interrupted job(s)")
     try:
         with _db_lock:
             conn = get_conn()
@@ -3173,10 +5021,13 @@ def startup_self_check():
         checks.append(f"❌ Proxy Manager: {e}")
     checks.append(f"{'✅' if _SOCKS_OK else '❌'} SOCKS5 support")
     ch = get_setting("channel_username", DEFAULT_CHANNEL)
-    checks.append(f"📡 Channel: {ch}")
+    checks.append(f"📡 Channel: {ch or '(not set)'}")
     global MAINTENANCE_MODE
     MAINTENANCE_MODE = get_setting("maintenance_mode", "0") == "1"
-    checks.append(f"✅ Configuration loaded (maintenance={'ON' if MAINTENANCE_MODE else 'OFF'})")
+    checks.append(
+        f"✅ Configuration loaded "
+        f"(maintenance={'ON' if MAINTENANCE_MODE else 'OFF'})"
+    )
     for c in checks:
         log.info("STARTUP %s", c)
     return checks
@@ -3190,7 +5041,8 @@ def main():
             conn = get_conn()
             try:
                 conn.execute(
-                    "INSERT OR IGNORE INTO admins(user_id, role, is_active) VALUES(?, 'OWNER', 1)",
+                    "INSERT OR IGNORE INTO admins(user_id, role, is_active) "
+                    "VALUES(?, 'OWNER', 1)",
                     (BOOTSTRAP_OWNER_ID,),
                 )
                 conn.commit()
@@ -3199,7 +5051,13 @@ def main():
     # start background retester
     threading.Thread(target=_retest_loop, daemon=True).start()
     log.info("Polling started.")
-    bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
+    try:
+        bot.infinity_polling(timeout=30, long_polling_timeout=20,
+                            skip_pending=True)
+    except KeyboardInterrupt:
+        log.info("Shutdown requested.")
+    except Exception as e:
+        log.exception("Polling crashed: %s", e)
 
 
 if __name__ == "__main__":
