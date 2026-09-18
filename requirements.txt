@@ -1,3 +1,15 @@
-pyTelegramBotAPI==4.18.0
-requests==2.31.0
-pycryptodome>=3.19.0
+# DK Sharma Bot — production dependencies (Render/VPS, Python 3.10+)
+
+# Telegram Bot API — >=4.20 exposes types.CopyTextButton and
+# InlineKeyboardButton(copy_text=...) used by the channel copy buttons.
+pyTelegramBotAPI>=4.20.0,<5.0.0
+
+# HTTP engine with connection pooling / keep-alive
+requests>=2.31.0,<3.0.0
+
+# SOCKS4/SOCKS5/SOCKS5H proxy support for requests
+PySocks>=1.7.1
+
+# AES for ByetHost/InfinityFree challenge (pure-Python fallback included;
+# this just makes it faster — safe to omit on minimal hosts)
+pycryptodome>=3.19.0; python_version >= "3.8"
