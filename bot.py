@@ -420,6 +420,7 @@ class TorManager:
 
     def _fail(self, reason: str, status_cb=None, detail: str = "") -> bool:
         self._last_error = reason
+        self._last_detail = (detail or "").strip()
         self._set_state("FAILED", status_cb, detail or reason)
         log.warning("[TOR] FAILED reason=%s detail=%s", reason,
                     _mask((detail or "")[:150]))
@@ -427,6 +428,9 @@ class TorManager:
 
     def last_error(self) -> str:
         return self._last_error
+
+    def last_detail(self) -> str:
+        return getattr(self, "_last_detail", "")
 
     def state(self) -> str:
         return self._state
@@ -548,8 +552,11 @@ class TorManager:
                     tail = self._tail_log()
                     log.warning("[TOR] Process exited unexpectedly code=%s", rc)
                     self._proc = None
-                    return self._fail(TOR_ERR_PROCESS_FAILED, status_cb,
-                                      f"exit code {rc}: {tail}")
+                    return self._fail(
+                        TOR_ERR_PROCESS_FAILED, status_cb,
+                        f"exit code {rc}: {tail}" if tail else
+                        f"exit code {rc} (no log output — run tor manually: "
+                        f"{exe} -f {TORRC_PATH})")
                 if self._socks_open():
                     socks_ok = True
                     break
@@ -2847,7 +2854,9 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
             # Controlled failure: the job gets a FINAL state instead of
             # freezing on "Starting Tor engine…" forever.
             reason = tor_manager.last_error() or "TOR_PROCESS_FAILED"
-            log.warning("JOB_TOR_STARTUP_FAILED job=%s reason=%s", job_id, reason)
+            detail = tor_manager.last_detail()
+            log.warning("JOB_TOR_STARTUP_FAILED job=%s reason=%s detail=%s",
+                        job_id, reason, _mask(detail[:200]))
             duration_ms = int((time.time() - start) * 1000)
             finish_job(job_id, 0, count, 0, 0, duration_ms, "FAILED")
             st["done"] = True
@@ -2857,12 +2866,15 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                 job_state.pop(job_id, None)
                 job_cancel.pop(job_id, None)
                 job_owner.pop(job_id, None)
+            detail_line = (f"Cause: `{detail[:180]}`\n\n" if detail else
+                           f"Cause: see log `{TOR_LOG_PATH}`\n\n")
             safe_edit_message(
                 chat_id, msg_id,
                 f"⚠️ *TOR STARTUP FAILED*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🆔 Job `#{job_id:06d}`\n\n"
-                f"Reason: `{reason}`\n\n"
+                f"Reason: `{reason}`\n"
+                f"{detail_line}"
                 f"⏱ Time `{int(duration_ms / 1000) // 60:02d}:{int(duration_ms / 1000) % 60:02d}`\n\n"
                 "Fix the cause and retry, or switch to DIRECT mode.")
             return
