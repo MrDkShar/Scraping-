@@ -159,6 +159,10 @@ TOR_ROTATE_EVERY = _env_int("TOR_ROTATE_EVERY", 1, 1, 1000)
 TOR_MIN_ROTATE_INTERVAL = _env_int("TOR_MIN_ROTATE_INTERVAL", 10, 5, 600)
 TOR_IP_CHECK_URL = os.environ.get("TOR_IP_CHECK_URL", "https://checkip.amazonaws.com").strip()
 TOR_BASE_DIR = os.environ.get("TOR_HOME", os.path.join(os.path.expanduser("~"), ".fox_tor"))
+TOR_STARTUP_RETRIES = _env_int("TOR_STARTUP_RETRIES", 3, 1, 5)
+TOR_SOCKS_WAIT_TIMEOUT = _env_int("TOR_SOCKS_WAIT_TIMEOUT", 60, 10, 300)
+TOR_CONTROL_WAIT_TIMEOUT = _env_int("TOR_CONTROL_WAIT_TIMEOUT", 30, 5, 120)
+TOR_IP_CHECK_TIMEOUT = _env_int("TOR_IP_CHECK_TIMEOUT", 25, 5, 60)
 
 # Configurable latency classification (milliseconds)
 LAT_FAST_MAX = _env_int("LATENCY_FAST_MAX", 999, 100, 60000)
@@ -235,10 +239,14 @@ def _tor_write_torrc() -> None:
     os.makedirs(TOR_DATA_DIR, exist_ok=True)
     dp = TOR_DATA_DIR.replace("\\", "/")
     lp = TOR_LOG_PATH.replace("\\", "/")
+    # CookieAuthentication 1: stem authenticates via the cookie file.
+    # (Previous "CookieAuthentication 0" + no HashedControlPassword made
+    #  EVERY ControlPort authenticate() fail -> bootstrap could never be
+    #  read -> wait_until_ready always timed out.)
     content = (
         f"SocksPort {TOR_SOCKS_PORT}\n"
         f"ControlPort {TOR_CONTROL_PORT}\n"
-        f"CookieAuthentication 0\n"
+        f"CookieAuthentication 1\n"
         f"DataDirectory {dp}\n"
         f"Log notice file {lp}\n"
     )
@@ -275,7 +283,10 @@ def _tor_kill_all() -> bool:
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                creationflags=TOR_CREATE_NO_WINDOW)
         else:
-            r = subprocess.run(["pkill", "-f", "tor"],
+            # -x: exact process name "tor" only. The old "pkill -f tor" matched
+            # any command line containing "tor" (including this bot when its
+            # path contains e.g. "extractor") and could kill the bot itself.
+            r = subprocess.run(["pkill", "-x", "tor"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         killed = (r.returncode == 0)
     except Exception:
@@ -333,12 +344,46 @@ def _tor_extract(archive: str, dest: str) -> None:
         raise RuntimeError("Unsupported Tor archive type")
 
 
+# Tor startup error classification (machine-readable, user-safe reasons)
+TOR_ERR_EXE_NOT_FOUND = "TOR_EXECUTABLE_NOT_FOUND"
+TOR_ERR_PROCESS_FAILED = "TOR_PROCESS_FAILED"
+TOR_ERR_SOCKS = "SOCKS_UNAVAILABLE"
+TOR_ERR_CONTROL = "CONTROL_PORT_UNAVAILABLE"
+TOR_ERR_CONTROL_AUTH = "CONTROL_AUTH_FAILED"
+TOR_ERR_BOOTSTRAP_TIMEOUT = "BOOTSTRAP_TIMEOUT"
+TOR_ERR_BOOTSTRAP_FAILED = "BOOTSTRAP_FAILED"
+TOR_ERR_NETWORK = "TOR_NETWORK_UNAVAILABLE"
+TOR_ERR_IP_TIMEOUT = "IP_CHECK_TIMEOUT"
+TOR_ERR_IP_FAILED = "IP_CHECK_FAILED"
+TOR_ERR_DEPS = "TOR_DEPENDENCY_MISSING"
+TOR_ERR_PORT_BUSY = "TOR_PORT_BUSY"
+
+_TOR_STAGE_MSG = {
+    "CHECKING_TOR": "🧅 Checking Tor installation…",
+    "STARTING_PROCESS": "🧅 Starting Tor process…",
+    "WAITING_FOR_SOCKS": "🧅 Connecting SOCKS5…",
+    "WAITING_FOR_CONTROL_PORT": "🧅 Connecting ControlPort…",
+    "VERIFYING_TOR_NETWORK": "🧅 Verifying Tor network…",
+    "VERIFYING_EXIT_IP": "🧭 Verifying Tor exit IP…",
+    "READY": "🟢 Tor engine ready",
+    "RECOVERY": "🔄 Recovering Tor…",
+}
+
+
 class TorManager:
     """
     Single owner of the Tor lifecycle: discover/install → start → bootstrap →
     IP verify → NEWNYM rotation → health recovery → clean shutdown.
-    All public methods are thread-safe; rotation is atomic (one NEWNYM at a
-    time, rate-limited) no matter how many visit workers run in parallel.
+
+    Startup is an explicit, BOUNDED state machine:
+      IDLE → CHECKING_TOR → STARTING_PROCESS → WAITING_FOR_SOCKS →
+      WAITING_FOR_CONTROL_PORT → BOOTSTRAPPING → VERIFYING_TOR_NETWORK →
+      VERIFYING_EXIT_IP → READY   (failure → FAILED → RECOVERY → retry)
+    Every stage has a hard timeout and a classified failure reason, so a job
+    can never sit on "Starting Tor engine…" forever. All public methods are
+    thread-safe; the lifecycle lock is RE-ENTRANT because ensure_ready() and
+    recover() call start() while already holding it (the old plain
+    threading.Lock self-deadlocked there — the root cause of the hang).
     """
 
     def __init__(self):
@@ -349,11 +394,42 @@ class TorManager:
         self._last_rotate_ts = 0.0
         self._rotation_count = 0
         self._rotation_log = deque(maxlen=200)   # rotation audit records
-        self._start_lock = threading.Lock()       # startup/restart serialized
-        self._rotation_lock = threading.Lock()    # NEWNYM serialized
+        self._start_lock = threading.RLock()     # re-entrant: start() is called
+                                                 # from ensure_ready()/recover()
+                                                 # while the lock is held
+        self._rotation_lock = threading.Lock()   # NEWNYM serialized
         self._ip_lock = threading.Lock()
         self._monitor_started = False
         self._shutdown = False
+        self._state = "IDLE"
+        self._state_ts = time.time()
+        self._last_error = ""
+
+    # ---------- startup state machine ----------
+    def _set_state(self, state: str, status_cb=None, detail: str = "") -> None:
+        self._state = state
+        self._state_ts = time.time()
+        log.info("[TOR] State: %s%s", state, f" ({detail})" if detail else "")
+        if status_cb:
+            msg = _TOR_STAGE_MSG.get(state)
+            if msg:
+                try:
+                    status_cb(msg)
+                except Exception:
+                    pass
+
+    def _fail(self, reason: str, status_cb=None, detail: str = "") -> bool:
+        self._last_error = reason
+        self._set_state("FAILED", status_cb, detail or reason)
+        log.warning("[TOR] FAILED reason=%s detail=%s", reason,
+                    _mask((detail or "")[:150]))
+        return False
+
+    def last_error(self) -> str:
+        return self._last_error
+
+    def state(self) -> str:
+        return self._state
 
     # ---------- lifecycle ----------
     def exe_path(self) -> Optional[str]:
@@ -394,6 +470,15 @@ class TorManager:
         except Exception:
             return False
 
+    def _socks_handshake(self) -> bool:
+        """Real SOCKS5 greeting — a bare open port is NOT proof of Tor."""
+        try:
+            with socket.create_connection(("127.0.0.1", TOR_SOCKS_PORT), timeout=3) as s:
+                s.sendall(b"\x05\x01\x00")
+                return s.recv(2) == b"\x05\x00"
+        except Exception:
+            return False
+
     def _control_ok(self) -> bool:
         if not _STEM_OK:
             return False
@@ -404,63 +489,124 @@ class TorManager:
         except Exception:
             return False
 
-    def start(self) -> bool:
-        """Launch Tor (or adopt a running one) and wait for the SOCKS port."""
+    @staticmethod
+    def _tail_log(max_chars: int = 150) -> str:
+        """Last meaningful line of the Tor log — the real failure reason."""
+        try:
+            with open(TOR_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 4000))
+                lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+            return lines[-1][:max_chars] if lines else ""
+        except Exception:
+            return ""
+
+    def start(self, status_cb=None) -> bool:
+        """Launch Tor (or adopt a healthy running one). Bounded at every stage;
+        never returns without either a usable Tor or a classified failure."""
         with self._start_lock:
+            if self._shutdown:
+                return self._fail(TOR_ERR_PROCESS_FAILED, status_cb, "manager shut down")
             if self._proc is not None and self._proc.poll() is None:
                 return True
-            if self._socks_open() and self._control_ok():
+            self._set_state("CHECKING_TOR", status_cb)
+            # ---- fast path: reuse an already-running healthy Tor ----
+            if self._socks_handshake() and self._control_ok():
                 log.info("TOR adopted already-running instance")
                 return True
+            if self._socks_open() and not self._socks_handshake():
+                return self._fail(TOR_ERR_PORT_BUSY, status_cb,
+                                  f"port {TOR_SOCKS_PORT} in use by a non-Tor process")
             exe = self.exe_path()
             if not exe:
-                return False
+                return self._fail(TOR_ERR_EXE_NOT_FOUND, status_cb)
+            # ---- launch (stdout/stderr → log FILE: no PIPE buffer deadlock,
+            #      and the failure reason is capturable) ----
+            self._set_state("STARTING_PROCESS", status_cb, f"exe={exe}")
             try:
                 _tor_kill_all()
                 time.sleep(0.5)
                 _tor_write_torrc()
+                log_fh = open(TOR_LOG_PATH, "ab", buffering=0)
                 self._proc = subprocess.Popen(
                     [exe, "-f", TORRC_PATH],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdout=log_fh, stderr=subprocess.STDOUT,
                     creationflags=TOR_CREATE_NO_WINDOW,
                 )
-                for _ in range(90):
-                    if self._proc.poll() is not None:
-                        log.warning("TOR exited during startup — see %s", TOR_LOG_PATH)
-                        self._proc = None
-                        return False
-                    if self._socks_open():
-                        return True
-                    time.sleep(0.5)
-                log.warning("TOR SOCKS port did not open")
-                self._kill_proc()
-                return False
+                log.info("[TOR] Launching process exe=%s config=%s pid=%s",
+                         exe, TORRC_PATH, self._proc.pid)
             except Exception as e:
-                log.warning("TOR_START_FAIL err=%s", _mask(str(e)[:150]))
                 self._kill_proc()
-                return False
+                return self._fail(TOR_ERR_PROCESS_FAILED, status_cb, str(e)[:150])
+            # ---- early-exit watch + SOCKS wait (bounded) ----
+            self._set_state("WAITING_FOR_SOCKS", status_cb)
+            deadline = time.time() + TOR_SOCKS_WAIT_TIMEOUT
+            socks_ok = False
+            while time.time() < deadline:
+                rc = self._proc.poll()
+                if rc is not None:
+                    tail = self._tail_log()
+                    log.warning("[TOR] Process exited unexpectedly code=%s", rc)
+                    self._proc = None
+                    return self._fail(TOR_ERR_PROCESS_FAILED, status_cb,
+                                      f"exit code {rc}: {tail}")
+                if self._socks_open():
+                    socks_ok = True
+                    break
+                time.sleep(0.5)
+            if not socks_ok:
+                self._kill_proc()
+                return self._fail(TOR_ERR_SOCKS, status_cb,
+                                  f"SOCKS port {TOR_SOCKS_PORT} did not open within {TOR_SOCKS_WAIT_TIMEOUT}s")
+            # ---- ControlPort wait (bounded): process alive != controller ready ----
+            self._set_state("WAITING_FOR_CONTROL_PORT", status_cb)
+            deadline = time.time() + TOR_CONTROL_WAIT_TIMEOUT
+            while time.time() < deadline:
+                if self._proc is not None and self._proc.poll() is not None:
+                    tail = self._tail_log()
+                    self._proc = None
+                    return self._fail(TOR_ERR_PROCESS_FAILED, status_cb, tail)
+                if self._control_ok():
+                    return True
+                time.sleep(0.5)
+            self._kill_proc()
+            return self._fail(TOR_ERR_CONTROL, status_cb,
+                              f"ControlPort {TOR_CONTROL_PORT} unreachable or auth failed")
 
-    def wait_until_ready(self, timeout: int = None) -> tuple:
-        """Wait for bootstrap PROGRESS=100 via ControlPort."""
+    def wait_until_ready(self, timeout: int = None, status_cb=None) -> tuple:
+        """Wait for bootstrap PROGRESS=100 via ControlPort (bounded, with
+        live percentage reporting — parser reads PROGRESS=<n>, not one exact
+        log format)."""
         timeout = timeout or TOR_BOOTSTRAP_TIMEOUT
         start = time.time()
         last_phase = ""
+        last_pct = -1
         while time.time() - start < timeout:
             if self._shutdown:
-                return False, "shutdown"
+                return False, TOR_ERR_PROCESS_FAILED
             if self._proc is not None and self._proc.poll() is not None:
-                return False, "Tor exited unexpectedly"
+                return False, TOR_ERR_PROCESS_FAILED
             try:
                 with Controller.from_port(port=TOR_CONTROL_PORT) as c:
                     c.authenticate()
                     phase = c.get_info("status/bootstrap-phase", default="")
-                    if "PROGRESS=100" in phase:
+                    m = re.search(r"PROGRESS=(\d+)", phase or "")
+                    pct = int(m.group(1)) if m else 0
+                    if pct != last_pct:
+                        last_pct = pct
+                        if status_cb:
+                            try:
+                                status_cb(f"🧅 Bootstrapping Tor: {pct}%")
+                            except Exception:
+                                pass
+                    if pct >= 100:
                         return True, phase
                     last_phase = phase.strip()
             except Exception:
                 pass
             time.sleep(1)
-        return False, f"Timeout waiting for bootstrap ({last_phase or 'no progress'})"
+        log.warning("[TOR] Bootstrap timeout (last: %s)", last_phase or "no progress")
+        return False, TOR_ERR_BOOTSTRAP_TIMEOUT
 
     def get_bootstrap_status(self) -> str:
         try:
@@ -472,57 +618,77 @@ class TorManager:
 
     def ensure_ready(self, status_cb=None) -> bool:
         """
-        FULL-AUTO entry point: config check → detect/install → start →
-        SOCKS/ControlPort verify → bootstrap 100% → public IP verify → READY.
-        Called lazily by the first IP_ROTATION job; idempotent afterwards.
+        Canonical IP_ROTATION pre-flight. Returns True ONLY when: process
+        usable + SOCKS usable + ControlPort usable + bootstrap 100% + exit-IP
+        verified. Returns False with a classified last_error() otherwise.
+        Bounded: hard timeout per stage, TOR_STARTUP_RETRIES attempts with
+        full cleanup between them — never hangs, never silently swallows the
+        reason.
         """
         with self._start_lock:
             if self._ready and self.is_running():
                 return True
             self._ready = False
-            if not _SOCKS_OK:
-                log.warning("TOR not ready: PySocks missing")
-                return False
-            if not _STEM_OK:
-                log.warning("TOR not ready: stem missing")
-                return False
-            try:
-                if status_cb:
-                    status_cb("🧅 Locating Tor…")
-                if not self.exe_path():
-                    if status_cb:
-                        status_cb("🧅 Installing Tor (one-time setup)…")
-                    if not self.install():
-                        return False
-                if status_cb:
-                    status_cb("🧅 Starting Tor…")
-                if not self.start():
-                    return False
-                if status_cb:
-                    status_cb("🧅 Bootstrapping Tor network…")
-                ok, info = self.wait_until_ready()
-                if not ok:
-                    log.warning("TOR bootstrap failed: %s", info)
-                    return False
-                if status_cb:
-                    status_cb("🧅 Verifying Tor exit IP…")
+            if not _SOCKS_OK or not _STEM_OK:
+                missing = "PySocks" if not _SOCKS_OK else "stem"
+                return self._fail(TOR_ERR_DEPS, status_cb, f"{missing} not installed")
+            for attempt in range(1, TOR_STARTUP_RETRIES + 1):
                 try:
-                    self._set_ip(self.get_current_ip())
+                    self._set_state("CHECKING_TOR", status_cb)
+                    if not self.exe_path():
+                        if status_cb:
+                            try:
+                                status_cb("🧅 Installing Tor (one-time setup)…")
+                            except Exception:
+                                pass
+                        if not self.install():
+                            self._last_error = TOR_ERR_EXE_NOT_FOUND
+                            continue
+                    if not self.start(status_cb):
+                        continue  # start() already classified the failure
+                    self._set_state("BOOTSTRAPPING", status_cb)
+                    ok, info = self.wait_until_ready(status_cb=status_cb)
+                    if not ok:
+                        self._last_error = info
+                        self._kill_proc()
+                        continue
+                    self._set_state("VERIFYING_EXIT_IP", status_cb)
+                    try:
+                        self._set_ip(self.get_current_ip())
+                    except requests.exceptions.Timeout:
+                        self._last_error = TOR_ERR_IP_TIMEOUT
+                        self._kill_proc()
+                        continue
+                    except Exception as e:
+                        self._last_error = TOR_ERR_IP_FAILED
+                        log.warning("TOR initial IP check failed: %s", _mask(str(e)[:120]))
+                        self._kill_proc()
+                        continue
+                    self._ready = True
+                    self._set_state("READY", status_cb)
+                    self._start_monitor()
+                    log.info("TOR_READY ip=%s attempt=%s", self.current_ip() or "?", attempt)
+                    return True
                 except Exception as e:
-                    log.warning("TOR initial IP check failed: %s", _mask(str(e)[:120]))
-                self._ready = True
-                self._start_monitor()
-                log.info("TOR_READY ip=%s", self.current_ip() or "?")
-                return True
-            except Exception as e:
-                log.warning("TOR_READY_FAIL err=%s", _mask(str(e)[:150]))
-                return False
+                    self._last_error = TOR_ERR_PROCESS_FAILED
+                    log.warning("TOR_READY_FAIL attempt=%s err=%s", attempt, _mask(str(e)[:150]))
+                # cleanup between attempts — never reuse broken state
+                self._kill_proc()
+                if attempt < TOR_STARTUP_RETRIES and status_cb:
+                    try:
+                        status_cb(f"🔄 Recovering Tor… (attempt {attempt + 1}/{TOR_STARTUP_RETRIES})")
+                    except Exception:
+                        pass
+                    time.sleep(1)
+            return self._fail(self._last_error or TOR_ERR_PROCESS_FAILED,
+                              status_cb, "startup retries exhausted")
 
     # ---------- IP / rotation ----------
     def get_current_ip(self) -> str:
         """Live exit-IP check THROUGH Tor (never direct). Only called on
         READY/rotation — per-visit code uses the cached current_ip()."""
-        r = requests.get(TOR_IP_CHECK_URL, proxies=TOR_PROXIES, timeout=25)
+        r = requests.get(TOR_IP_CHECK_URL, proxies=TOR_PROXIES,
+                         timeout=TOR_IP_CHECK_TIMEOUT)
         r.raise_for_status()
         return r.text.strip()
 
@@ -612,21 +778,24 @@ class TorManager:
         """Adaptive recovery: restart a dead Tor, re-bootstrap, re-verify IP.
         Called on repeated transport failures — never per target failure."""
         log.warning("TOR_RECOVERY attempting controlled restart")
-        with self._start_lock:
+        with self._start_lock:  # RLock: start()/wait_until_ready() below are same-thread safe
             self._ready = False
+            self._set_state("RECOVERY")
             self._kill_proc()
             _tor_kill_all()
             time.sleep(1)
             if not self.start():
                 return False
-            ok, _info = self.wait_until_ready()
+            ok, info = self.wait_until_ready()
             if not ok:
+                self._last_error = info
                 return False
             try:
                 self._set_ip(self.get_current_ip())
             except Exception:
                 pass
             self._ready = True
+            self._set_state("READY")
             log.info("TOR_RECOVERED ip=%s", self.current_ip() or "?")
             return True
 
@@ -655,6 +824,8 @@ class TorManager:
         return {
             "running": self.is_running(),
             "ready": self._ready,
+            "state": self._state,
+            "last_error": self._last_error,
             "ip": self.current_ip(),
             "bootstrap": self.get_bootstrap_status() if self.is_running() else "stopped",
             "rotations": self._rotation_count,
@@ -677,6 +848,7 @@ class TorManager:
     def stop(self) -> None:
         with self._start_lock:
             self._ready = False
+            self._set_state("IDLE")
             self._kill_proc()
             log.info("TOR stopped")
 
@@ -2669,10 +2841,31 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
         _emit(st, "🧅 Starting Tor engine…", proxy_protocol="TOR")
         tor_ok = tor_manager.ensure_ready(status_cb=lambda s: _emit(st, s))
         if tor_ok:
-            _emit(st, "🧅 Tor ready", proxy_protocol="TOR",
+            _emit(st, "🟢 Tor engine ready", proxy_protocol="TOR",
                   exit_ip=tor_manager.current_ip())
         else:
-            _emit(st, "Tor engine unavailable")
+            # Controlled failure: the job gets a FINAL state instead of
+            # freezing on "Starting Tor engine…" forever.
+            reason = tor_manager.last_error() or "TOR_PROCESS_FAILED"
+            log.warning("JOB_TOR_STARTUP_FAILED job=%s reason=%s", job_id, reason)
+            duration_ms = int((time.time() - start) * 1000)
+            finish_job(job_id, 0, count, 0, 0, duration_ms, "FAILED")
+            st["done"] = True
+            cancel_event.set()
+            with _state_lock:
+                active_jobs.pop(user_id, None)
+                job_state.pop(job_id, None)
+                job_cancel.pop(job_id, None)
+                job_owner.pop(job_id, None)
+            safe_edit_message(
+                chat_id, msg_id,
+                f"⚠️ *TOR STARTUP FAILED*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🆔 Job `#{job_id:06d}`\n\n"
+                f"Reason: `{reason}`\n\n"
+                f"⏱ Time `{int(duration_ms / 1000) // 60:02d}:{int(duration_ms / 1000) % 60:02d}`\n\n"
+                "Fix the cause and retry, or switch to DIRECT mode.")
+            return
     tor_rot_lock = threading.Lock()
     tor_visit_counter = [0]
 
