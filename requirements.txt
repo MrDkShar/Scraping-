@@ -1,23 +1,21 @@
-# --- WhatsApp / Telegram extraction bot (fox_tor_bot.py) ---
+# DK Sharma Bot v3 — runtime dependencies
+# Install: pip install -r requirements.txt
+#
+# The bot's own code only needs these four; everything else it imports
+# (os, re, io, sys, time, json, html, random, sqlite3, threading,
+#  urllib.parse, socket, logging, shutil, subprocess, base64,
+#  collections, concurrent.futures, datetime, typing) is Python stdlib.
 
-# Telegram Bot API — telebot package
-pyTelegramBotAPI>=4.14.0
+pyTelegramBotAPI>=4.14.0   # provides `telebot` (types.CopyTextButton needs >=4.7)
+requests>=2.31.0           # HTTP / proxy fetching + redirect engine
+PySocks>=1.7.1             # SOCKS4/SOCKS5 proxy support (imported as `socks`)
+```
 
-# HTTP engine
-requests>=2.31.0
+Optional, auto-detected at runtime — the bot works without them:
 
-# SOCKS5/SOCKS5H proxy support for requests (Tor routing in IP_ROTATION mode)
-PySocks>=1.7.1
+```text
+# pycryptodome>=3.19.0     # AES for the ByetHost challenge; falls back to the
+#                          # bundled pure-Python AES, then to the `openssl` CLI
+```
 
-# Tor controller — bootstrap monitoring, ControlPort auth, NEWNYM rotation
-stem>=1.8.2
-# optional — only if you deploy behind a webhook
-# flask>=3.0.0
-
-# optional — C-accelerated JSON (drop-in, faster polling)
-# orjson>=3.9.0
-
-pyTelegramBotAPI>=4.14.0
-requests>=2.31.0
-PySocks>=1.7.1
-stem>=1.8.2
+`curl_cffi` is **not** used and not required — the v3 engine stays on `requests` (no Playwright/Selenium), which is why Cloudflare JS challenges are detected and reported honestly rather than bypassed.
