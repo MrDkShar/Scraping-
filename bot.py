@@ -1,3 +1,31 @@
+"""
+DK Sharma Bot — WhatsApp Number Extractor (Production Edition v3)
+Render/VPS compatible. Single-file deployment.
+
+v2 upgrade (audited refactor of v1):
+  • Centralized navigation state machine: every input screen has 🔙 Back and
+    ❌ Cancel; Back never cancels a running extraction job.
+  • Atomic active-job registration: active_jobs[user_id] = job_id with a
+    threading.Event cancellation primitive checked at every stage.
+  • Fast extraction: thread-local requests.Session reuse (keep-alive),
+    ThreadPoolExecutor bounded visit concurrency, no per-visit exit-IP
+    re-check (cached last_observed_ip + configurable verify interval),
+    batched DB writes, short transactions, WAL.
+  • Proxy engine: racing multi-endpoint verification (first success wins),
+    configurable latency classification, weighted pool selection,
+    proxy-vs-target failure distinction, scope-aware bulk retest,
+    configurable live proxy sources (fetch → parse → dedupe → test → pool),
+    background auto-retest with configurable interval/batch.
+  • Channel auto-post: polished result card, real clipboard CopyTextButton
+    chunks (≤256 chars), share button, optional TXT attachment, async with
+    bounded exponential-backoff retries and error classification.
+  • Safety: no hardcoded secrets, friendly error messages, credential-safe
+    logs, startup config validation, rate-limit-safe Telegram wrappers.
+
+Privacy: only fetches URLs the operator is authorized to process. No CAPTCHA
+bypass, no login bypass, no private-account scraping.
+"""
+
 import os
 import re
 import io
@@ -9,15 +37,11 @@ import random
 import sqlite3
 import threading
 import urllib.parse
-import urllib.request
-import tarfile
-import zipfile
+import base64
 import socket
-import atexit
 import logging
 import shutil
 import subprocess
-import ipaddress
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -30,13 +54,6 @@ try:
     _SOCKS_OK = True
 except Exception:
     _SOCKS_OK = False
-
-try:
-    from stem import Signal
-    from stem.control import Controller
-    _STEM_OK = True
-except Exception:
-    _STEM_OK = False
 
 import telebot
 from telebot import types
@@ -89,7 +106,7 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 3600.0) -
     return max(lo, min(hi, v))
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAEe5s3pw5mRDoTSZDIbSKtSHf-YEhCXdVs").strip()  # REQUIRED env var — a token committed to source is a compromised token
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAGiMW2k7ZLpXYdn4F2u34Xf31j5T3xoiII").strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "FATAL: BOT_TOKEN environment variable is not set.\n"
@@ -123,19 +140,6 @@ IP_MAX_PROXY_ATTEMPTS = _env_int("IP_MAX_PROXY_ATTEMPTS", 10, 1, 30)
 PROXY_RETEST_INTERVAL = _env_int("PROXY_RETEST_INTERVAL", 300, 60, 86400)
 PROXY_RETEST_BATCH = _env_int("PROXY_RETEST_BATCH", 30, 1, 200)
 PROXY_VERIFY_IP_INTERVAL = _env_int("PROXY_VERIFY_IP_INTERVAL", 300, 30, 86400)
-
-# FOX Tor engine — the official IP_ROTATION network layer (no external proxies)
-TOR_SOCKS_PORT = _env_int("TOR_SOCKS_PORT", 9050, 1024, 65535)
-TOR_CONTROL_PORT = _env_int("TOR_CONTROL_PORT", 9051, 1024, 65535)
-TOR_BOOTSTRAP_TIMEOUT = _env_int("TOR_BOOTSTRAP_TIMEOUT", 180, 30, 600)
-TOR_ROTATE_EVERY = _env_int("TOR_ROTATE_EVERY", 1, 1, 1000)
-TOR_MIN_ROTATE_INTERVAL = _env_int("TOR_MIN_ROTATE_INTERVAL", 10, 5, 600)
-TOR_IP_CHECK_URL = os.environ.get("TOR_IP_CHECK_URL", "https://checkip.amazonaws.com").strip()
-TOR_BASE_DIR = os.environ.get("TOR_HOME", os.path.join(os.path.expanduser("~"), ".fox_tor"))
-TOR_STARTUP_RETRIES = _env_int("TOR_STARTUP_RETRIES", 3, 1, 5)
-TOR_SOCKS_WAIT_TIMEOUT = _env_int("TOR_SOCKS_WAIT_TIMEOUT", 60, 10, 300)
-TOR_CONTROL_WAIT_TIMEOUT = _env_int("TOR_CONTROL_WAIT_TIMEOUT", 30, 5, 120)
-TOR_IP_CHECK_TIMEOUT = _env_int("TOR_IP_CHECK_TIMEOUT", 25, 5, 60)
 
 # Configurable latency classification (milliseconds)
 LAT_FAST_MAX = _env_int("LATENCY_FAST_MAX", 999, 100, 60000)
@@ -185,681 +189,6 @@ job_cancel: dict = {}             # job_id -> threading.Event
 job_owner: dict = {}              # job_id -> user_id
 proxy_test_jobs: dict = {}        # admin_id -> threading.Event (cancel bulk tests)
 proxy_fetch_jobs: dict = {}       # admin_id -> threading.Event (cancel fetches)
-
-# =========================================================
-# FOX TOR ENGINE — centralized TorManager service
-# (ported from IP-FOX: binary discovery, auto-install, torrc,
-#  process control, bootstrap monitor, NEWNYM rotation,
-#  IP verification — GUI removed, thread-safe, single source
-#  of truth for the IP_ROTATION network layer)
-# =========================================================
-TOR_IS_WINDOWS = os.name == "nt"
-TOR_CREATE_NO_WINDOW = 0x08000000 if TOR_IS_WINDOWS else 0
-TOR_BUNDLE_DIR = os.path.join(TOR_BASE_DIR, "tor_bundle")
-TOR_DATA_DIR = os.path.join(TOR_BASE_DIR, "tor_data")
-TORRC_PATH = os.path.join(TOR_BASE_DIR, "torrc")
-TOR_LOG_PATH = os.path.join(TOR_BASE_DIR, "tor.log")
-TOR_DOWNLOAD_DIR = os.path.join(TOR_BASE_DIR, "downloads")
-
-TOR_PROXIES = {
-    "http": f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}",
-    "https": f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}",
-}
-
-
-def _tor_write_torrc() -> None:
-    os.makedirs(TOR_BASE_DIR, exist_ok=True)
-    os.makedirs(TOR_DATA_DIR, exist_ok=True)
-    dp = TOR_DATA_DIR.replace("\\", "/")
-    lp = TOR_LOG_PATH.replace("\\", "/")
-    # CookieAuthentication 1: stem authenticates via the cookie file.
-    # (Previous "CookieAuthentication 0" + no HashedControlPassword made
-    #  EVERY ControlPort authenticate() fail -> bootstrap could never be
-    #  read -> wait_until_ready always timed out.)
-    content = (
-        f"SocksPort {TOR_SOCKS_PORT}\n"
-        f"ControlPort {TOR_CONTROL_PORT}\n"
-        f"CookieAuthentication 1\n"
-        f"DataDirectory {dp}\n"
-        f"Log notice file {lp}\n"
-    )
-    with open(TORRC_PATH, "w", encoding="utf-8") as f:
-        f.write(content)
-
-
-def _tor_find_exe() -> Optional[str]:
-    exe_name = "tor.exe" if TOR_IS_WINDOWS else "tor"
-    if os.path.isdir(TOR_BUNDLE_DIR):
-        for root, _dirs, files in os.walk(TOR_BUNDLE_DIR):
-            if exe_name in files:
-                return os.path.join(root, exe_name)
-    candidates = [
-        "/usr/bin/tor",
-        "/usr/local/bin/tor",
-        "/usr/sbin/tor",
-        os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")),
-                     "Desktop", "Tor Browser", "Browser", "TorBrowser", "Tor", "tor.exe"),
-        r"C:\Program Files\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
-        r"C:\Program Files (x86)\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return shutil.which("tor")
-
-
-def _tor_kill_all() -> bool:
-    killed = False
-    try:
-        if TOR_IS_WINDOWS:
-            r = subprocess.run(["taskkill", "/F", "/IM", "tor.exe"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               creationflags=TOR_CREATE_NO_WINDOW)
-        else:
-            # -x: exact process name "tor" only. The old "pkill -f tor" matched
-            # any command line containing "tor" (including this bot when its
-            # path contains e.g. "extractor") and could kill the bot itself.
-            r = subprocess.run(["pkill", "-x", "tor"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        killed = (r.returncode == 0)
-    except Exception:
-        pass
-    if killed:
-        log.info("TOR killed lingering process(es)")
-    return killed
-
-
-def _tor_latest_url() -> tuple:
-    json_url = "https://aus1.torproject.org/torbrowser/update_3/release/downloads.json"
-    try:
-        req = urllib.request.Request(json_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = json.load(r)
-        version = data.get("version")
-        if version:
-            if TOR_IS_WINDOWS:
-                name = f"tor-expert-bundle-windows-x86_64-{version}.tar.gz"
-            elif sys.platform == "darwin":
-                name = f"tor-expert-bundle-macos-x86_64-{version}.tar.gz"
-            else:
-                name = f"tor-expert-bundle-linux-x86_64-{version}.tar.gz"
-            url = f"https://archive.torproject.org/tor-package-archive/torbrowser/{version}/{name}"
-            return url, version
-    except Exception:
-        pass
-    v = "13.5.4"
-    name = (f"tor-expert-bundle-windows-x86_64-{v}.tar.gz" if TOR_IS_WINDOWS
-            else f"tor-expert-bundle-linux-x86_64-{v}.tar.gz")
-    return f"https://archive.torproject.org/tor-package-archive/torbrowser/{v}/{name}", v
-
-
-def _tor_download(url: str, dest: str) -> str:
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=180) as r, open(dest, "wb") as f:
-        while True:
-            chunk = r.read(65536)
-            if not chunk:
-                break
-            f.write(chunk)
-    return dest
-
-
-def _tor_extract(archive: str, dest: str) -> None:
-    os.makedirs(dest, exist_ok=True)
-    dest_real = os.path.realpath(dest)
-
-    def _safe_member(member_name: str) -> bool:
-        p = os.path.realpath(os.path.join(dest, member_name))
-        return p == dest_real or p.startswith(dest_real + os.sep)
-
-    if archive.endswith((".tar.gz", ".tgz")):
-        with tarfile.open(archive, "r:gz") as tar:
-            try:
-                tar.extractall(dest, filter="data")  # Python >= 3.12
-            except TypeError:
-                for m in tar.getmembers():
-                    if not _safe_member(m.name):
-                        raise RuntimeError("Unsafe path in Tor archive")
-                tar.extractall(dest)
-    elif archive.endswith(".zip"):
-        with zipfile.ZipFile(archive) as z:
-            for n in z.namelist():
-                if not _safe_member(n):
-                    raise RuntimeError("Unsafe path in Tor archive")
-            z.extractall(dest)
-    else:
-        raise RuntimeError("Unsupported Tor archive type")
-
-
-# Tor startup error classification (machine-readable, user-safe reasons)
-TOR_ERR_EXE_NOT_FOUND = "TOR_EXECUTABLE_NOT_FOUND"
-TOR_ERR_PROCESS_FAILED = "TOR_PROCESS_FAILED"
-TOR_ERR_SOCKS = "SOCKS_UNAVAILABLE"
-TOR_ERR_CONTROL = "CONTROL_PORT_UNAVAILABLE"
-TOR_ERR_CONTROL_AUTH = "CONTROL_AUTH_FAILED"
-TOR_ERR_BOOTSTRAP_TIMEOUT = "BOOTSTRAP_TIMEOUT"
-TOR_ERR_BOOTSTRAP_FAILED = "BOOTSTRAP_FAILED"
-TOR_ERR_NETWORK = "TOR_NETWORK_UNAVAILABLE"
-TOR_ERR_IP_TIMEOUT = "IP_CHECK_TIMEOUT"
-TOR_ERR_IP_FAILED = "IP_CHECK_FAILED"
-TOR_ERR_DEPS = "TOR_DEPENDENCY_MISSING"
-TOR_ERR_PORT_BUSY = "TOR_PORT_BUSY"
-
-_TOR_STAGE_MSG = {
-    "CHECKING_TOR": "🧅 Checking Tor installation…",
-    "STARTING_PROCESS": "🧅 Starting Tor process…",
-    "WAITING_FOR_SOCKS": "🧅 Connecting SOCKS5…",
-    "WAITING_FOR_CONTROL_PORT": "🧅 Connecting ControlPort…",
-    "VERIFYING_TOR_NETWORK": "🧅 Verifying Tor network…",
-    "VERIFYING_EXIT_IP": "🧭 Verifying Tor exit IP…",
-    "READY": "🟢 Tor engine ready",
-    "RECOVERY": "🔄 Recovering Tor…",
-}
-
-
-class TorManager:
-    """
-    Single owner of the Tor lifecycle: discover/install → start → bootstrap →
-    IP verify → NEWNYM rotation → health recovery → clean shutdown.
-
-    Startup is an explicit, BOUNDED state machine:
-      IDLE → CHECKING_TOR → STARTING_PROCESS → WAITING_FOR_SOCKS →
-      WAITING_FOR_CONTROL_PORT → BOOTSTRAPPING → VERIFYING_TOR_NETWORK →
-      VERIFYING_EXIT_IP → READY   (failure → FAILED → RECOVERY → retry)
-    Every stage has a hard timeout and a classified failure reason, so a job
-    can never sit on "Starting Tor engine…" forever. All public methods are
-    thread-safe; the lifecycle lock is RE-ENTRANT because ensure_ready() and
-    recover() call start() while already holding it (the old plain
-    threading.Lock self-deadlocked there — the root cause of the hang).
-    """
-
-    def __init__(self):
-        self._proc = None
-        self._exe = None
-        self._ready = False
-        self._current_ip = ""
-        self._last_rotate_ts = 0.0
-        self._rotation_count = 0
-        self._rotation_log = deque(maxlen=200)   # rotation audit records
-        self._start_lock = threading.RLock()     # re-entrant: start() is called
-                                                 # from ensure_ready()/recover()
-                                                 # while the lock is held
-        self._rotation_lock = threading.Lock()   # NEWNYM serialized
-        self._ip_lock = threading.Lock()
-        self._monitor_started = False
-        self._shutdown = False
-        self._state = "IDLE"
-        self._state_ts = time.time()
-        self._last_error = ""
-
-    # ---------- startup state machine ----------
-    def _set_state(self, state: str, status_cb=None, detail: str = "") -> None:
-        self._state = state
-        self._state_ts = time.time()
-        log.info("[TOR] State: %s%s", state, f" ({detail})" if detail else "")
-        if status_cb:
-            msg = _TOR_STAGE_MSG.get(state)
-            if msg:
-                try:
-                    status_cb(msg)
-                except Exception:
-                    pass
-
-    def _fail(self, reason: str, status_cb=None, detail: str = "") -> bool:
-        self._last_error = reason
-        self._last_detail = (detail or "").strip()
-        self._set_state("FAILED", status_cb, detail or reason)
-        log.warning("[TOR] FAILED reason=%s detail=%s", reason,
-                    _mask((detail or "")[:150]))
-        return False
-
-    def last_error(self) -> str:
-        return self._last_error
-
-    def last_detail(self) -> str:
-        return getattr(self, "_last_detail", "")
-
-    def state(self) -> str:
-        return self._state
-
-    # ---------- lifecycle ----------
-    def exe_path(self) -> Optional[str]:
-        if self._exe and os.path.exists(self._exe):
-            return self._exe
-        self._exe = _tor_find_exe()
-        return self._exe
-
-    def install(self) -> Optional[str]:
-        """Auto-setup: download + extract the Tor Expert Bundle (from IP-FOX)."""
-        try:
-            url, ver = _tor_latest_url()
-            log.info("TOR_INSTALL version=%s url=%s", ver, url)
-            archive = os.path.join(TOR_DOWNLOAD_DIR, os.path.basename(url))
-            _tor_download(url, archive)
-            _tor_extract(archive, TOR_BUNDLE_DIR)
-            exe = _tor_find_exe()
-            if exe:
-                self._exe = exe
-                log.info("TOR_INSTALL_OK exe=%s", exe)
-            else:
-                log.warning("TOR_INSTALL extracted but binary not found")
-            return exe
-        except Exception as e:
-            log.warning("TOR_INSTALL_FAIL err=%s", _mask(str(e)[:150]))
-            return None
-
-    def is_running(self) -> bool:
-        if self._proc is not None and self._proc.poll() is None:
-            return True
-        # adopt an already-running Tor that owns our SOCKS port
-        return self._socks_open()
-
-    def _socks_open(self) -> bool:
-        try:
-            with socket.create_connection(("127.0.0.1", TOR_SOCKS_PORT), timeout=1.5):
-                return True
-        except Exception:
-            return False
-
-    def _socks_handshake(self) -> bool:
-        """Real SOCKS5 greeting — a bare open port is NOT proof of Tor."""
-        try:
-            with socket.create_connection(("127.0.0.1", TOR_SOCKS_PORT), timeout=3) as s:
-                s.sendall(b"\x05\x01\x00")
-                return s.recv(2) == b"\x05\x00"
-        except Exception:
-            return False
-
-    def _control_ok(self) -> bool:
-        if not _STEM_OK:
-            return False
-        try:
-            with Controller.from_port(port=TOR_CONTROL_PORT) as c:
-                c.authenticate()
-            return True
-        except Exception:
-            return False
-
-    @staticmethod
-    def _tail_log(max_chars: int = 150) -> str:
-        """Last meaningful line of the Tor log — the real failure reason."""
-        try:
-            with open(TOR_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(0, os.SEEK_END)
-                f.seek(max(0, f.tell() - 4000))
-                lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
-            return lines[-1][:max_chars] if lines else ""
-        except Exception:
-            return ""
-
-    def start(self, status_cb=None) -> bool:
-        """Launch Tor (or adopt a healthy running one). Bounded at every stage;
-        never returns without either a usable Tor or a classified failure."""
-        with self._start_lock:
-            if self._shutdown:
-                return self._fail(TOR_ERR_PROCESS_FAILED, status_cb, "manager shut down")
-            if self._proc is not None and self._proc.poll() is None:
-                return True
-            self._set_state("CHECKING_TOR", status_cb)
-            # ---- fast path: reuse an already-running healthy Tor ----
-            if self._socks_handshake() and self._control_ok():
-                log.info("TOR adopted already-running instance")
-                return True
-            if self._socks_open() and not self._socks_handshake():
-                return self._fail(TOR_ERR_PORT_BUSY, status_cb,
-                                  f"port {TOR_SOCKS_PORT} in use by a non-Tor process")
-            exe = self.exe_path()
-            if not exe:
-                return self._fail(TOR_ERR_EXE_NOT_FOUND, status_cb)
-            # ---- launch (stdout/stderr → log FILE: no PIPE buffer deadlock,
-            #      and the failure reason is capturable) ----
-            self._set_state("STARTING_PROCESS", status_cb, f"exe={exe}")
-            try:
-                _tor_kill_all()
-                time.sleep(0.5)
-                _tor_write_torrc()
-                log_fh = open(TOR_LOG_PATH, "ab", buffering=0)
-                self._proc = subprocess.Popen(
-                    [exe, "-f", TORRC_PATH],
-                    stdout=log_fh, stderr=subprocess.STDOUT,
-                    creationflags=TOR_CREATE_NO_WINDOW,
-                )
-                log.info("[TOR] Launching process exe=%s config=%s pid=%s",
-                         exe, TORRC_PATH, self._proc.pid)
-            except Exception as e:
-                self._kill_proc()
-                return self._fail(TOR_ERR_PROCESS_FAILED, status_cb, str(e)[:150])
-            # ---- early-exit watch + SOCKS wait (bounded) ----
-            self._set_state("WAITING_FOR_SOCKS", status_cb)
-            deadline = time.time() + TOR_SOCKS_WAIT_TIMEOUT
-            socks_ok = False
-            while time.time() < deadline:
-                rc = self._proc.poll()
-                if rc is not None:
-                    tail = self._tail_log()
-                    log.warning("[TOR] Process exited unexpectedly code=%s", rc)
-                    self._proc = None
-                    return self._fail(
-                        TOR_ERR_PROCESS_FAILED, status_cb,
-                        f"exit code {rc}: {tail}" if tail else
-                        f"exit code {rc} (no log output — run tor manually: "
-                        f"{exe} -f {TORRC_PATH})")
-                if self._socks_open():
-                    socks_ok = True
-                    break
-                time.sleep(0.5)
-            if not socks_ok:
-                self._kill_proc()
-                return self._fail(TOR_ERR_SOCKS, status_cb,
-                                  f"SOCKS port {TOR_SOCKS_PORT} did not open within {TOR_SOCKS_WAIT_TIMEOUT}s")
-            # ---- ControlPort wait (bounded): process alive != controller ready ----
-            self._set_state("WAITING_FOR_CONTROL_PORT", status_cb)
-            deadline = time.time() + TOR_CONTROL_WAIT_TIMEOUT
-            while time.time() < deadline:
-                if self._proc is not None and self._proc.poll() is not None:
-                    tail = self._tail_log()
-                    self._proc = None
-                    return self._fail(TOR_ERR_PROCESS_FAILED, status_cb, tail)
-                if self._control_ok():
-                    return True
-                time.sleep(0.5)
-            self._kill_proc()
-            return self._fail(TOR_ERR_CONTROL, status_cb,
-                              f"ControlPort {TOR_CONTROL_PORT} unreachable or auth failed")
-
-    def wait_until_ready(self, timeout: int = None, status_cb=None) -> tuple:
-        """Wait for bootstrap PROGRESS=100 via ControlPort (bounded, with
-        live percentage reporting — parser reads PROGRESS=<n>, not one exact
-        log format)."""
-        timeout = timeout or TOR_BOOTSTRAP_TIMEOUT
-        start = time.time()
-        last_phase = ""
-        last_pct = -1
-        while time.time() - start < timeout:
-            if self._shutdown:
-                return False, TOR_ERR_PROCESS_FAILED
-            if self._proc is not None and self._proc.poll() is not None:
-                return False, TOR_ERR_PROCESS_FAILED
-            try:
-                with Controller.from_port(port=TOR_CONTROL_PORT) as c:
-                    c.authenticate()
-                    phase = c.get_info("status/bootstrap-phase", default="")
-                    m = re.search(r"PROGRESS=(\d+)", phase or "")
-                    pct = int(m.group(1)) if m else 0
-                    if pct != last_pct:
-                        last_pct = pct
-                        if status_cb:
-                            try:
-                                status_cb(f"🧅 Bootstrapping Tor: {pct}%")
-                            except Exception:
-                                pass
-                    if pct >= 100:
-                        return True, phase
-                    last_phase = phase.strip()
-            except Exception:
-                pass
-            time.sleep(1)
-        log.warning("[TOR] Bootstrap timeout (last: %s)", last_phase or "no progress")
-        return False, TOR_ERR_BOOTSTRAP_TIMEOUT
-
-    def get_bootstrap_status(self) -> str:
-        try:
-            with Controller.from_port(port=TOR_CONTROL_PORT) as c:
-                c.authenticate()
-                return c.get_info("status/bootstrap-phase", default="unknown")
-        except Exception:
-            return "unavailable"
-
-    def ensure_ready(self, status_cb=None) -> bool:
-        """
-        Canonical IP_ROTATION pre-flight. Returns True ONLY when: process
-        usable + SOCKS usable + ControlPort usable + bootstrap 100% + exit-IP
-        verified. Returns False with a classified last_error() otherwise.
-        Bounded: hard timeout per stage, TOR_STARTUP_RETRIES attempts with
-        full cleanup between them — never hangs, never silently swallows the
-        reason.
-        """
-        with self._start_lock:
-            if self._ready and self.is_running():
-                return True
-            self._ready = False
-            if not _SOCKS_OK or not _STEM_OK:
-                missing = "PySocks" if not _SOCKS_OK else "stem"
-                return self._fail(TOR_ERR_DEPS, status_cb, f"{missing} not installed")
-            for attempt in range(1, TOR_STARTUP_RETRIES + 1):
-                try:
-                    self._set_state("CHECKING_TOR", status_cb)
-                    if not self.exe_path():
-                        if status_cb:
-                            try:
-                                status_cb("🧅 Installing Tor (one-time setup)…")
-                            except Exception:
-                                pass
-                        if not self.install():
-                            self._last_error = TOR_ERR_EXE_NOT_FOUND
-                            continue
-                    if not self.start(status_cb):
-                        continue  # start() already classified the failure
-                    self._set_state("BOOTSTRAPPING", status_cb)
-                    ok, info = self.wait_until_ready(status_cb=status_cb)
-                    if not ok:
-                        self._last_error = info
-                        self._kill_proc()
-                        continue
-                    self._set_state("VERIFYING_EXIT_IP", status_cb)
-                    try:
-                        self._set_ip(self.get_current_ip())
-                    except requests.exceptions.Timeout:
-                        self._last_error = TOR_ERR_IP_TIMEOUT
-                        self._kill_proc()
-                        continue
-                    except Exception as e:
-                        self._last_error = TOR_ERR_IP_FAILED
-                        log.warning("TOR initial IP check failed: %s", _mask(str(e)[:120]))
-                        self._kill_proc()
-                        continue
-                    self._ready = True
-                    self._set_state("READY", status_cb)
-                    self._start_monitor()
-                    log.info("TOR_READY ip=%s attempt=%s", self.current_ip() or "?", attempt)
-                    return True
-                except Exception as e:
-                    self._last_error = TOR_ERR_PROCESS_FAILED
-                    log.warning("TOR_READY_FAIL attempt=%s err=%s", attempt, _mask(str(e)[:150]))
-                # cleanup between attempts — never reuse broken state
-                self._kill_proc()
-                if attempt < TOR_STARTUP_RETRIES and status_cb:
-                    try:
-                        status_cb(f"🔄 Recovering Tor… (attempt {attempt + 1}/{TOR_STARTUP_RETRIES})")
-                    except Exception:
-                        pass
-                    time.sleep(1)
-            return self._fail(self._last_error or TOR_ERR_PROCESS_FAILED,
-                              status_cb, "startup retries exhausted")
-
-    # ---------- IP / rotation ----------
-    def get_current_ip(self) -> str:
-        """Live exit-IP check THROUGH Tor (never direct). Only called on
-        READY/rotation — per-visit code uses the cached current_ip()."""
-        r = requests.get(TOR_IP_CHECK_URL, proxies=TOR_PROXIES,
-                         timeout=TOR_IP_CHECK_TIMEOUT)
-        r.raise_for_status()
-        return r.text.strip()
-
-    def current_ip(self) -> str:
-        with self._ip_lock:
-            return self._current_ip
-
-    def _set_ip(self, ip: str) -> None:
-        with self._ip_lock:
-            self._current_ip = ip
-
-    def request_newnym(self) -> None:
-        if not _STEM_OK:
-            raise RuntimeError("stem not installed")
-        with Controller.from_port(port=TOR_CONTROL_PORT) as c:
-            c.authenticate()
-            c.signal(Signal.NEWNYM)
-        time.sleep(3)  # let Tor build the fresh circuit
-
-    def rotate_and_verify(self, cancel_event: Optional[threading.Event] = None,
-                          force: bool = False) -> bool:
-        """
-        Atomic rotation: lock → previous IP → health → NEWNYM → wait →
-        verify public IP → record. Serialized across ALL workers and
-        rate-limited to respect Tor's NEWNYM constraints. Never fakes a
-        success: if the exit IP did not change, that is recorded honestly.
-        """
-        with self._rotation_lock:
-            now = time.time()
-            wait = TOR_MIN_ROTATE_INTERVAL - (now - self._last_rotate_ts)
-            if wait > 0 and not force:
-                # A circuit was rotated moments ago — reuse it rather than
-                # spam NEWNYM (Tor rate-limits it anyway).
-                if cancel_event is not None and cancel_event.wait(timeout=wait):
-                    return False
-                if cancel_event is None:
-                    time.sleep(wait)
-            if not self.health_check():
-                if not self.recover():
-                    return False
-            old_ip = self.current_ip()
-            try:
-                self.request_newnym()
-            except Exception as e:
-                log.warning("TOR_NEWNYM_FAIL err=%s", _mask(str(e)[:120]))
-                return False
-            self._last_rotate_ts = time.time()
-            self._rotation_count += 1
-            try:
-                new_ip = self.get_current_ip()
-            except Exception as e:
-                log.warning("TOR verify-after-rotate failed: %s", _mask(str(e)[:100]))
-                new_ip = ""
-            changed = bool(new_ip) and new_ip != old_ip
-            self._rotation_log.append({
-                "ts": datetime.utcnow().isoformat(timespec="seconds"),
-                "rotation_id": self._rotation_count,
-                "old_ip": old_ip or "-", "new_ip": new_ip or "-",
-                "changed": changed,
-            })
-            if new_ip:
-                self._set_ip(new_ip)
-            log.info("TOR_ROTATE id=%s old=%s new=%s changed=%s",
-                     self._rotation_count, old_ip or "-", new_ip or "-", changed)
-            return True
-
-    def proxy_dict(self) -> dict:
-        """Drop-in proxy dict for Scraper/proxy_to_requests — routes through
-        local Tor SOCKS5H (remote DNS). This is the ONLY network path used
-        by IP_ROTATION visits; no external proxy pool involvement."""
-        return {"protocol": "socks5h", "host": "127.0.0.1", "port": TOR_SOCKS_PORT,
-                "username": "", "password": "",
-                "endpoint": f"127.0.0.1:{TOR_SOCKS_PORT}"}
-
-    # ---------- health / recovery ----------
-    def health_check(self) -> bool:
-        """Process alive + SOCKS reachable (+ ControlPort when we own it)."""
-        if self._proc is not None and self._proc.poll() is not None:
-            return False
-        if not self._socks_open():
-            return False
-        if self._proc is not None and not self._control_ok():
-            return False
-        return True
-
-    def recover(self) -> bool:
-        """Adaptive recovery: restart a dead Tor, re-bootstrap, re-verify IP.
-        Called on repeated transport failures — never per target failure."""
-        log.warning("TOR_RECOVERY attempting controlled restart")
-        with self._start_lock:  # RLock: start()/wait_until_ready() below are same-thread safe
-            self._ready = False
-            self._set_state("RECOVERY")
-            self._kill_proc()
-            _tor_kill_all()
-            time.sleep(1)
-            if not self.start():
-                return False
-            ok, info = self.wait_until_ready()
-            if not ok:
-                self._last_error = info
-                return False
-            try:
-                self._set_ip(self.get_current_ip())
-            except Exception:
-                pass
-            self._ready = True
-            self._set_state("READY")
-            log.info("TOR_RECOVERED ip=%s", self.current_ip() or "?")
-            return True
-
-    def _start_monitor(self) -> None:
-        if self._monitor_started:
-            return
-        self._monitor_started = True
-
-        def _loop():
-            fails = 0
-            while not self._shutdown:
-                time.sleep(30)
-                if self._shutdown or not self._ready:
-                    continue
-                if self.health_check():
-                    fails = 0
-                    continue
-                fails += 1
-                log.warning("TOR_MONITOR degraded (%s/2)", fails)
-                if fails >= 2:
-                    self.recover()
-                    fails = 0
-        threading.Thread(target=_loop, daemon=True, name="tor-monitor").start()
-
-    def status_dict(self) -> dict:
-        return {
-            "running": self.is_running(),
-            "ready": self._ready,
-            "state": self._state,
-            "last_error": self._last_error,
-            "ip": self.current_ip(),
-            "bootstrap": self.get_bootstrap_status() if self.is_running() else "stopped",
-            "rotations": self._rotation_count,
-            "exe": self._exe or "",
-        }
-
-    # ---------- shutdown ----------
-    def _kill_proc(self) -> None:
-        try:
-            if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=6)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
-        except Exception:
-            pass
-        self._proc = None
-
-    def stop(self) -> None:
-        with self._start_lock:
-            self._ready = False
-            self._set_state("IDLE")
-            self._kill_proc()
-            log.info("TOR stopped")
-
-    def restart(self) -> bool:
-        self.stop()
-        time.sleep(0.5)
-        return self.ensure_ready()
-
-    def shutdown(self) -> None:
-        """Clean shutdown: stop monitor + terminate the Tor process we own."""
-        self._shutdown = True
-        self._ready = False
-        self._kill_proc()
-
-
-tor_manager = TorManager()
 
 # =========================================================
 # Database
@@ -1043,6 +372,19 @@ def init_db() -> None:
                 """
             )
 
+            # v3 migration — extraction attempt intelligence fields
+            for _v3_sql in (
+                "ALTER TABLE extraction_attempts ADD COLUMN protection_type TEXT",
+                "ALTER TABLE extraction_attempts ADD COLUMN final_url TEXT",
+                "ALTER TABLE extraction_attempts ADD COLUMN telegram_username TEXT",
+                "ALTER TABLE extraction_attempts ADD COLUMN extraction_layers TEXT",
+            ):
+                try:
+                    conn.execute(_v3_sql)
+                except sqlite3.Error:
+                    pass  # column already exists
+            conn.commit()
+
             migrations = [
                 ("users", "status", "TEXT DEFAULT 'APPROVED'"),
                 ("users", "blocked", "INTEGER DEFAULT 0"),
@@ -1098,6 +440,18 @@ _DEFAULT_SETTINGS = {
     "latency_fast_max": str(LAT_FAST_MAX),
     "latency_working_max": str(LAT_WORKING_MAX),
     "latency_slow_max": str(LAT_SLOW_MAX),
+    # v3 — deep extraction engine
+    "ex_layer_url_chain": "1",
+    "ex_layer_raw_html": "1",
+    "ex_layer_meta": "1",
+    "ex_layer_js_vars": "1",
+    "ex_layer_encoded": "1",
+    "ex_layer_telegram": "1",
+    "false_positive_filter": "1",
+    "telegram_redirect_mode": "extract_only",   # extract_only | report_username | skip
+    "cloudflare_behavior": "skip",              # skip | retry_proxies | count_as_failed
+    "number_min_len": str(NUM_MIN_LEN),
+    "number_max_len": str(NUM_MAX_LEN),
 }
 
 
@@ -1428,7 +782,8 @@ def save_numbers_batch(rows: list) -> None:
 
 
 def save_attempts_batch(rows: list) -> None:
-    """rows: [(job_id, cycle, proxy_id, exit_ip, status, latency_ms, error), ...]"""
+    """rows: [(job_id, cycle, proxy_id, exit_ip, status, latency_ms, error,
+               protection_type, final_url, telegram_username, layers_json), ...]"""
     if not rows:
         return
     with _db_lock:
@@ -1436,8 +791,9 @@ def save_attempts_batch(rows: list) -> None:
         try:
             conn.executemany(
                 """INSERT INTO extraction_attempts
-                   (job_id, cycle, proxy_id, exit_ip, request_status, latency_ms, error)
-                   VALUES(?,?,?,?,?,?,?)""",
+                   (job_id, cycle, proxy_id, exit_ip, request_status, latency_ms, error,
+                    protection_type, final_url, telegram_username, extraction_layers)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 rows,
             )
             conn.commit()
@@ -1807,21 +1163,13 @@ def _verify_exit_ip(p: dict, timeout: float) -> tuple:
             r = requests.get(ep, proxies=proxies, timeout=timeout,
                              headers={"User-Agent": _TEST_UA})
             latency = int((time.time() - t0) * 1000)
-            if r.status_code == 407:
-                auth_failed.set()
-                return
             if r.status_code == 200:
                 ip = r.text.strip()
                 if _IP_RE.match(ip) and "ip" not in result:
                     result["ip"] = ip
                     result["latency"] = latency
-        except requests.exceptions.ProxyError as e:
-            # requests has no ProxyAuthenticationRequired — the old except clause
-            # raised AttributeError the moment ANY network error reached it
-            if "407" in str(e):
-                auth_failed.set()
-        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout):
-            result["timeouts"] = result.get("timeouts", 0) + 1
+        except requests.exceptions.ProxyAuthenticationRequired:
+            auth_failed.set()
         except Exception:
             pass
 
@@ -1842,8 +1190,6 @@ def _verify_exit_ip(p: dict, timeout: float) -> tuple:
         return None, -407
     if "ip" in result:
         return result["ip"], result["latency"]
-    if result.get("timeouts", 0) >= 2:
-        return None, -2   # verification endpoints consistently timed out
     return None, -1
 
 
@@ -1877,11 +1223,6 @@ def test_proxy(p: dict, timeout: Optional[int] = None) -> dict:
                 "error": "host:port unreachable"}
 
     ip, latency = _verify_exit_ip(p, t)
-    if latency == -2:
-        # TIMEOUT is a real status now — before this it could never be returned,
-        # so the retest loop / cleanup branches keyed on it were dead code
-        return {"status": "TIMEOUT", "latency_ms": 0, "exit_ip": "",
-                "error": "proxy timed out during exit-ip verification"}
     if latency == -407:
         return {"status": "AUTH_FAILED", "latency_ms": 0, "exit_ip": "",
                 "error": "HTTP 407 proxy auth required"}
@@ -2185,7 +1526,8 @@ class ProxyPool:
             finally:
                 conn.close()
 
-    def select(self, count: int = 1, exclude: Optional[set] = None) -> list:
+    def select(self, count: int = 1, exclude: Optional[set] = None,
+               exclude_subnet: Optional[str] = None) -> list:
         """Lease up to `count` distinct healthy proxies (weighted, no immediate reuse)."""
         with self._lock:
             avail = self.healthy_proxies()
@@ -2296,7 +1638,8 @@ def bulk_test_proxies(scope: str = "all", progress_cb=None,
             sep=" ", timespec="seconds")
         rows += [r for r in list_proxies(limit=500, statuses=HEALTHY_STATUSES)
                  if (r["last_tested"] or "") < stale_cutoff]
-    # scope "all": every stored proxy is eligible — the old filter was a no-op
+    if scope == "all":
+        rows = [r for r in rows if r["health_status"] != "WORKING" or True]
     # de-dupe ids
     seen_ids = set()
     pending = []
@@ -2480,9 +1823,18 @@ _JS_LOCATION_RE = re.compile(
 
 def _looks_like_false_positive(digits: str) -> bool:
     """Reject timestamps, IDs, order numbers and random long numeric strings."""
+    if get_setting("false_positive_filter", "1") != "1":
+        n0 = len(digits or "")
+        return not (6 <= n0 <= 16)
     n = len(digits)
-    if n < NUM_MIN_LEN or n > NUM_MAX_LEN:
+    try:
+        lo = int(get_setting("number_min_len", str(NUM_MIN_LEN)))
+        hi = int(get_setting("number_max_len", str(NUM_MAX_LEN)))
+    except (ValueError, TypeError):
+        lo, hi = NUM_MIN_LEN, NUM_MAX_LEN
+    if n < lo or n > hi:
         return True
+
     # unix timestamps (s/ms/us) — 10 digits starting 1xxx for plausible years
     if n == 10 and digits[0] == "1" and digits[1] in "0123456789":
         try:
@@ -2549,6 +1901,293 @@ def extract_from_url_chain(urls: list) -> list:
                 seen.add(n)
                 out.append((n, method))
     return out
+
+
+
+# =========================================================
+# Deep Extraction Engine v3 — 6-layer pipeline + protection detection
+# =========================================================
+_TG_HOSTS = ("t.me", "telegram.me", "telesco.pe", "telegram.dog")
+_TG_USER_RE = re.compile(r"@([A-Za-z0-9_]{4,64})")
+_TG_SUPPORT_RE = re.compile(
+    r"(?:contact|support|help|admin|booking|order)[^@\n]{0,40}?@([A-Za-z0-9_]{4,64})",
+    re.IGNORECASE)
+_META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_ATTR_VAL_RE = re.compile(r"""([\w:-]+)\s*=\s*["']([^"']*)["']""")
+_JS_PHONE_RE = re.compile(
+    r"""["']?[A-Za-z_]*(?:phone|mobile|whatsapp|number|tel|contact)[A-Za-z_]*["']?"""
+    r"""\s*[:=]\s*["'](\+?\d{9,15})["']""",
+    re.IGNORECASE)
+_DATA_ATTR_RE = re.compile(r"""data-[\w-]+\s*=\s*["']([^"']{6,300})["']""", re.IGNORECASE)
+_B64_CHARS_RE = re.compile(r"^[A-Za-z0-9+/=\s]{8,400}$")
+_HEX_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]{18,40}$")
+_DIGITS_RUN_RE = re.compile(r"\+?\d{9,15}")
+_RAW_PHONE_RE = re.compile(r"(?<![\d/])(\+?\d[\d\s().-]{8,18}\d)(?![\d/])")
+
+_PROTECTION_STAGES = {
+    "telegram_redirect": "📱 Telegram redirect — extracting preview",
+    "rate_limited": "⏳ Rate-limited — rotating exit IP",
+    "geo_blocked": "🌍 Geo-block — rotating region",
+    "byethost": "🔓 Solving host challenge",
+    "meta_redirect_only": "🔁 Following redirect chain",
+}
+
+
+def _layer_on(name: str) -> bool:
+    """Per-layer on/off switch from admin settings (default ON)."""
+    return get_setting(f"ex_layer_{name}", "1") == "1"
+
+
+def _is_telegram_url(url: str) -> bool:
+    try:
+        host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) for h in _TG_HOSTS)
+
+
+def _meta_fields(body: str) -> dict:
+    """Parse all <meta> tags into {name/property(lower): content}."""
+    fields = {}
+    for tag in _META_TAG_RE.findall(body or ""):
+        attrs = {}
+        for k, v in _ATTR_VAL_RE.findall(tag):
+            attrs[k.lower()] = v
+        key = attrs.get("property") or attrs.get("name")
+        content = html.unescape(attrs.get("content", "") or "")
+        if key and content and key.lower() not in fields:
+            fields[key.lower()] = content
+    return fields
+
+
+def _rot13(s: str) -> str:
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if 65 <= o <= 90:
+            out.append(chr(65 + (o - 65 + 13) % 26))
+        elif 97 <= o <= 122:
+            out.append(chr(97 + (o - 97 + 13) % 26))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _decoded_variants(val: str) -> list:
+    """Yield decodings of a data-* value: url-decode, base64, hex, rot13."""
+    variants = set()
+    try:
+        variants.add(urllib.parse.unquote(val))
+        variants.add(urllib.parse.unquote(urllib.parse.unquote(val)))
+    except Exception:
+        pass
+    if _B64_CHARS_RE.match(val.strip()):
+        for cand in (val.strip(), val.strip() + "=" * (-len(val.strip()) % 4)):
+            try:
+                dec = base64.b64decode(cand, validate=False).decode("utf-8", errors="ignore")
+                if dec:
+                    variants.add(dec)
+            except Exception:
+                pass
+    if _HEX_RE.match(val.strip()):
+        try:
+            hx = val.strip()[2:] if val.strip().lower().startswith("0x") else val.strip()
+            dec = bytes.fromhex(hx).decode("utf-8", errors="ignore")
+            if dec:
+                variants.add(dec)
+        except Exception:
+            pass
+    variants.add(_rot13(val))
+    return [v for v in variants if v and v != val]
+
+
+def detect_protection(body: str, status_code: int, final_url: str) -> dict:
+    """Classify bot-protection on a fetched page. Never claims bypass it can't do."""
+    b = (body or "")[:300000]
+    bl = b.lower()
+
+    if status_code == 429:
+        return {"type": "rate_limited",
+                "detail": "Target rate-limited the request (HTTP 429)",
+                "bypassable": True}
+    if _is_telegram_url(final_url):
+        return {"type": "telegram_redirect",
+                "detail": "Redirect chain ends at a public Telegram preview page",
+                "bypassable": True}
+    if ("cf-browser-verification" in bl or "checking your browser" in bl
+            or "__cf_bm" in bl or "cf-ray" in bl
+            or (status_code == 403 and "cloudflare" in bl)):
+        return {"type": "cloudflare_js",
+                "detail": "Cloudflare JS challenge — a real browser engine is required",
+                "bypassable": False}
+    if "cf_chl_prog" in bl or "cf-challenge" in bl or "cf_chl_opt" in bl:
+        return {"type": "cloudflare_iuam",
+                "detail": "Cloudflare IUAM challenge — a real browser engine is required",
+                "bypassable": False}
+    if "g-recaptcha" in bl or "recaptcha/api" in bl or "www.recaptcha" in bl:
+        return {"type": "recaptcha",
+                "detail": "reCAPTCHA present — cannot be bypassed",
+                "bypassable": False}
+    if "hcaptcha.com" in bl or "h-captcha" in bl:
+        return {"type": "hcaptcha",
+                "detail": "hCaptcha present — cannot be bypassed",
+                "bypassable": False}
+    if "slowaes" in bl or ("tonumbers(" in bl and "__test=" in bl):
+        return {"type": "byethost",
+                "detail": "ByetHost/InfinityFree AES challenge — solved internally",
+                "bypassable": True}
+    if status_code == 403 and ("not available in your country" in bl
+                               or "not available in your region" in bl
+                               or "geo-block" in bl or "geoblock" in bl):
+        return {"type": "geo_blocked",
+                "detail": "Geo-restriction — rotating to another region may help",
+                "bypassable": True}
+    if 0 < len(b) < 2048 and (
+            _META_REFRESH_RE.search(b) or _JS_LOCATION_RE.search(b)):
+        return {"type": "meta_redirect_only",
+                "detail": "Thin redirect page — followed automatically",
+                "bypassable": True}
+    return {"type": "none", "detail": "", "bypassable": True}
+
+
+def extract_deep(body: str, final_url: str, visited: list,
+                 cancel_event: Optional[threading.Event] = None) -> dict:
+    """6-layer deep extraction pipeline. All layers run; results merged + deduped.
+
+    Returns {
+      "numbers": [(normalized, method, source), ...],
+      "layers":  [layer names that produced at least one hit],
+      "telegram": {"is_telegram": bool, "username": str, "invite": str,
+                   "channel": str},
+      "protection-independent": False,
+    }
+    """
+    out, seen = [], set()
+    layers_hit = []
+
+    def _cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
+    def _add(raw, method, src):
+        n = _normalize(raw)
+        if n and n not in seen:
+            seen.add(n)
+            out.append((n, method, src))
+            return True
+        return False
+
+    body = body or ""
+    fields = {}
+
+    # ---- LAYER 1 — URL chain ----
+    if not _cancelled() and _layer_on("url_chain"):
+        hits = 0
+        for n, m in extract_from_url_chain(visited or [final_url]):
+            if _add(n, m, (visited or [final_url])[-1]):
+                hits += 1
+        if hits:
+            layers_hit.append("url_chain")
+            log.debug("LAYER_HIT layer=url_chain hits=%s", hits)
+
+    # ---- LAYER 2 — raw HTML regex (existing _WA_PATTERNS + JSON/attrs) ----
+    if not _cancelled() and _layer_on("raw_html"):
+        hits = 0
+        for n, m in extract_numbers(body, final_url, default_method="html"):
+            if _add(n, m, final_url):
+                hits += 1
+        if hits:
+            layers_hit.append("raw_html")
+            log.debug("LAYER_HIT layer=raw_html hits=%s", hits)
+
+    # ---- LAYER 3 — OG / meta tag extraction ----
+    if not _cancelled() and _layer_on("meta"):
+        fields = _meta_fields(body)
+        hits = 0
+        for key in ("og:description", "twitter:description", "description",
+                    "og:title", "twitter:title", "og:url",
+                    "twitter:app:url:googleplay"):
+            content = fields.get(key, "")
+            if not content:
+                continue
+            for n, m in extract_numbers(content, final_url,
+                                        default_method="og_meta"):
+                if _add(n, "og_meta", final_url):
+                    hits += 1
+            for m in _RAW_PHONE_RE.findall(content):
+                if _add(m, "og_meta", final_url):
+                    hits += 1
+        if hits:
+            layers_hit.append("og_meta")
+            log.debug("LAYER_HIT layer=og_meta hits=%s", hits)
+    else:
+        fields = fields or (_meta_fields(body) if _is_telegram_url(final_url) else {})
+
+    # ---- LAYER 4 — JavaScript variable extraction ----
+    if not _cancelled() and _layer_on("js_vars"):
+        hits = 0
+        for m in _JS_PHONE_RE.findall(body):
+            if _add(m, "js_variable", final_url):
+                hits += 1
+        if hits:
+            layers_hit.append("js_vars")
+            log.debug("LAYER_HIT layer=js_vars hits=%s", hits)
+
+    # ---- LAYER 5 — data-attribute / encoded extraction ----
+    if not _cancelled() and _layer_on("encoded"):
+        hits = 0
+        for val in _DATA_ATTR_RE.findall(body):
+            for variant in _decoded_variants(val):
+                for run in _DIGITS_RUN_RE.findall(variant):
+                    if _add(run, "encoded_data", final_url):
+                        hits += 1
+                        break
+        if hits:
+            layers_hit.append("encoded")
+            log.debug("LAYER_HIT layer=encoded hits=%s", hits)
+
+    # ---- LAYER 6 — Telegram-specific intelligence ----
+    tg = {"is_telegram": False, "username": "", "invite": "", "channel": ""}
+    if not _cancelled() and _layer_on("telegram") and _is_telegram_url(final_url):
+        if not fields:
+            fields = _meta_fields(body)
+        tg["is_telegram"] = True
+        tg["channel"] = (fields.get("og:title") or "").strip()
+        desc = " ".join([fields.get("og:description", ""),
+                         fields.get("twitter:description", ""),
+                         fields.get("description", "")])
+        # support/contact @username gets priority over any other @mention
+        m = _TG_SUPPORT_RE.search(desc)
+        if not m:
+            m = _TG_USER_RE.search(desc)
+        if m:
+            tg["username"] = m.group(1)
+        # invite link from og:url or the final URL itself
+        ogurl = fields.get("og:url", "") or ""
+        for cand in (ogurl, final_url, fields.get("twitter:app:url:googleplay", "") or ""):
+            if cand and _is_telegram_url(cand):
+                path = urllib.parse.urlparse(cand).path or ""
+                if "/+" in path or path.startswith("/joinchat/"):
+                    tg["invite"] = cand
+                elif not tg["username"]:
+                    slug = path.strip("/").split("/")[0]
+                    if slug and re.match(r"^[A-Za-z0-9_]{4,64}$", slug):
+                        tg["username"] = slug
+                if tg["invite"]:
+                    break
+        hits = 0
+        # any phone / wa.me inside the Telegram preview counts as a real result
+        for n, meth in extract_numbers(desc, final_url, default_method="telegram_bio"):
+            if _add(n, "telegram_bio", final_url):
+                hits += 1
+        for m2 in _RAW_PHONE_RE.findall(desc):
+            if _add(m2, "telegram_bio", final_url):
+                hits += 1
+        # title matched @-less channel slugs still yield a username via og:url
+        layers_hit.append("telegram")
+        log.debug("LAYER_HIT layer=telegram hits=%s user=%s",
+                  hits, tg.get("username"))
+
+    return {"numbers": out, "layers": layers_hit, "telegram": tg}
 
 
 # =========================================================
@@ -2744,6 +2383,11 @@ def _new_job_state(job_id: int, total: int, mode: str, url: str,
         "last_event_ts": time.time(), "done": False,
         "speed_window": deque(maxlen=20),   # (ts, visits) rolling speed
         "lock": threading.Lock(),
+        # v3 — protection / telegram intelligence
+        "protection": "none", "prot_counts": {},
+        "telegram_username": "", "telegram_invite": "",
+        "telegram_channel": "", "telegram_redirects": 0,
+        "hard_block_streak": 0, "hard_blocked": False,
     }
 
 
@@ -2762,36 +2406,45 @@ def _rolling_speed(st: dict) -> float:
 
 def _progress_text(st: dict) -> str:
     pct = int((st["visit"] / st["total"]) * 100) if st["total"] else 0
-    done = pct // 10
-    bar = "█" * done + "░" * (10 - done)
+    done = max(0, min(20, pct // 5))
+    bar = "▓" * done + "░" * (20 - done)
     elapsed = int(time.time() - st["started_at"])
     mm, ss = divmod(elapsed, 60)
     speed = _rolling_speed(st)
-    proxy_line = ""
+    mode_lbl = "IP ROTATION" if st["mode"] == "IP_ROTATION" else "DIRECT"
+    prot = st.get("protection", "none")
+    prot_lbl = {
+        "none": "None", "telegram_redirect": "Telegram ↪",
+        "cloudflare_js": "Cloudflare JS", "cloudflare_iuam": "Cloudflare IUAM",
+        "recaptcha": "reCAPTCHA", "hcaptcha": "hCaptcha",
+        "byethost": "ByetHost", "meta_redirect_only": "Redirect only",
+        "rate_limited": "Rate limited", "geo_blocked": "Geo blocked",
+    }.get(prot, prot)
+    rows = [
+        "╔══════════════════════════════╗",
+        "║  ⚡ EXTRACTION ENGINE v3",
+        "╠══════════════════════════════╣",
+        f"║  JOB #{st['job_id']:06d}  │  {mode_lbl}",
+        "╠══════════════════════════════╣",
+        f"  {bar}  {pct}%",
+        "╠══════════════════════════════╣",
+        f"║  🔄 Visits     {st['visit']} / {st['total']}",
+        f"║  ✅ Success    {st['successful']}",
+        f"║  ❌ Failed     {st['failed']}",
+        f"║  📞 Numbers    {st['unique_numbers']} found",
+        "╠══════════════════════════════╣",
+    ]
+    if st.get("telegram_username"):
+        rows.append(f"║  📱 Telegram    @{st['telegram_username']}")
+    else:
+        rows.append(f"║  🛡 Protection  {prot_lbl}")
     if st["mode"] == "IP_ROTATION":
-        if st["proxy_protocol"]:
-            proxy_line = (f"\n🌐 Proxy: *{st['proxy_protocol']}*\n"
-                          f"🧭 Exit IP: `{st['exit_ip'] or '—'}`\n"
-                          f"⚡ Latency: `{st['latency_ms']} ms`\n")
-        else:
-            proxy_line = "\n🌐 Proxy: _selecting…_\n"
-    return (
-        f"⚡ *EXTRACTION ENGINE*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 Job `#{st['job_id']:06d}`\n"
-        f"🌐 Mode: *{'IP ROTATION' if st['mode'] == 'IP_ROTATION' else 'DIRECT'}*\n\n"
-        f"`[{bar}] {pct}%`\n\n"
-        f"🔄 Visits      `{st['visit']}/{st['total']}`\n"
-        f"✅ Successful  `{st['successful']}`\n"
-        f"❌ Failed      `{st['failed']}`\n\n"
-        f"📱 Numbers     `{st['unique_numbers']}`\n"
-        f"🆕 New         `{st['new_numbers']}`\n"
-        f"{proxy_line}\n"
-        f"⏱ Time         `{mm:02d}:{ss:02d}`\n"
-        f"🚀 Speed       `{speed:.2f} visits/s`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔎 _{st['stage']}_"
-    )
+        rows.append(f"║  🌐 Proxy       {st['proxy_protocol'] or 'selecting…'}")
+        rows.append(f"║  🧭 Exit IP     {st['exit_ip'] or '—'}")
+    rows.append(f"║  ⚡ Speed       {speed:.1f} vis/s")
+    rows.append(f"║  ⏱ Time        {mm:02d}:{ss:02d}")
+    rows.append("╚══════════════════════════════╝")
+    return "```\n" + "\n".join(rows) + "\n```\n" + f"🔎 _{st['stage']}_"
 
 
 def _progress_updater(st: dict, cancel_event: threading.Event) -> None:
@@ -2844,45 +2497,6 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
     log.info("JOB_START job=%s user=%s mode=%s visits=%s url=%s",
              job_id, user_id, mode, count, _mask(url))
 
-    # --- FULL-AUTO Tor pre-flight: install/start/bootstrap/verify on demand ---
-    tor_ok = True
-    if mode == "IP_ROTATION":
-        _emit(st, "🧅 Starting Tor engine…", proxy_protocol="TOR")
-        tor_ok = tor_manager.ensure_ready(status_cb=lambda s: _emit(st, s))
-        if tor_ok:
-            _emit(st, "🟢 Tor engine ready", proxy_protocol="TOR",
-                  exit_ip=tor_manager.current_ip())
-        else:
-            # Controlled failure: the job gets a FINAL state instead of
-            # freezing on "Starting Tor engine…" forever.
-            reason = tor_manager.last_error() or "TOR_PROCESS_FAILED"
-            detail = tor_manager.last_detail()
-            log.warning("JOB_TOR_STARTUP_FAILED job=%s reason=%s detail=%s",
-                        job_id, reason, _mask(detail[:200]))
-            duration_ms = int((time.time() - start) * 1000)
-            finish_job(job_id, 0, count, 0, 0, duration_ms, "FAILED")
-            st["done"] = True
-            cancel_event.set()
-            with _state_lock:
-                active_jobs.pop(user_id, None)
-                job_state.pop(job_id, None)
-                job_cancel.pop(job_id, None)
-                job_owner.pop(job_id, None)
-            detail_line = (f"Cause: `{detail[:180]}`\n\n" if detail else
-                           f"Cause: see log `{TOR_LOG_PATH}`\n\n")
-            safe_edit_message(
-                chat_id, msg_id,
-                f"⚠️ *TOR STARTUP FAILED*\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🆔 Job `#{job_id:06d}`\n\n"
-                f"Reason: `{reason}`\n"
-                f"{detail_line}"
-                f"⏱ Time `{int(duration_ms / 1000) // 60:02d}:{int(duration_ms / 1000) % 60:02d}`\n\n"
-                "Fix the cause and retry, or switch to DIRECT mode.")
-            return
-    tor_rot_lock = threading.Lock()
-    tor_visit_counter = [0]
-
     if mode == "IP_ROTATION":
         max_workers = max(1, int(get_setting("ip_turbo_concurrency",
                                              str(IP_TURBO_CONCURRENCY))))
@@ -2894,6 +2508,16 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
     def do_visit(visit: int) -> None:
         if cancel_event.is_set():
             return
+        with st["lock"]:
+            if st.get("hard_blocked"):
+                st["visit"] += 1
+                st["failed"] += 1
+                st["speed_window"].append((time.time(), st["visit"]))
+                pending_attempts.append((job_id, visit, None, "",
+                                         "PROTECTED_UNBYPASSABLE", 0,
+                                         "unbypassable protection — visit skipped",
+                                         st.get("protection", "none"), url, "", "[]"))
+                return
         attempt_status = "UNKNOWN"
         attempt_err = ""
         attempt_proxy_id = None
@@ -2906,62 +2530,86 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
         status_code = 0
 
         if mode == "IP_ROTATION":
-            # Official network layer: TorManager → SOCKS5H → target.
-            # No external proxy list, no provider, no proxy_pool involvement.
-            if not tor_ok:
+            proxies = proxy_pool.select(count=1)
+            if not proxies:
                 with st["lock"]:
                     st["visit"] += 1
                     st["failed"] += 1
                     st["speed_window"].append((time.time(), st["visit"]))
-                pending_attempts.append((job_id, visit, None, "", "TOR_UNAVAILABLE", 0,
-                                         "Tor engine not ready"))
+                pending_attempts.append((job_id, visit, None, "", "NO_PROXY", 0,
+                                         "no verified proxy available"))
                 return
-            # Rotation policy — MODE A: rotate every N visits.
-            # Rotation itself is atomic + rate-limited inside TorManager.
-            rotate_every = max(1, int(get_setting("tor_rotate_every", str(TOR_ROTATE_EVERY))))
-            with tor_rot_lock:
-                tor_visit_counter[0] += 1
-                due = tor_visit_counter[0] > 1 and (tor_visit_counter[0] - 1) % rotate_every == 0
-            if due and not cancel_event.is_set():
-                _emit(st, "🧅 Rotating Tor circuit…")
-                tor_manager.rotate_and_verify(cancel_event)
-                _emit(st, "🧅 Circuit ready", exit_ip=tor_manager.current_ip())
-            _emit(st, "Fetching via Tor…", proxy_protocol="TOR",
-                  exit_ip=tor_manager.current_ip())
+            proxy_row = proxies[0]
+            proxy_dict = {k: proxy_row[k] for k in
+                          ("protocol", "host", "port", "username", "password", "endpoint")}
+            attempt_proxy_id = proxy_row["id"]
+            # Always use cached IP — NEVER make an extra IP-check request per visit
+            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
+            _emit(st, "Fetching via proxy…",
+                  proxy_protocol=proxy_row["protocol"].upper(),
+                  exit_ip=attempt_exit_ip)
+
+            # TURBO: keep rotating through fresh proxies until one works.
+            # Each failed proxy is auto-marked and never retried in this visit.
+            max_attempts = max(3, int(get_setting("ip_max_proxy_attempts",
+                                                  str(IP_MAX_PROXY_ATTEMPTS))))
+            tried_ids = set()
             last_status = "REQUEST_FAILED"
-            for attempt in range(max_retries + 1):
+            for attempt in range(max_attempts):
                 if cancel_event.is_set():
+                    proxy_pool.release(proxy_row["id"])
                     return
                 t0 = time.time()
                 try:
-                    # Session isolation: fresh session per visit — no cross-target
-                    # cookies and no stale connections surviving a circuit rotation.
-                    scraper = Scraper(proxy=tor_manager.proxy_dict(), session=_new_session())
+                    scraper = Scraper(proxy=proxy_dict)
                     final_url, body, visited, status_code = scraper.fetch(
                         url, cancel_event=cancel_event)
                     attempt_latency = int((time.time() - t0) * 1000)
-                    attempt_exit_ip = tor_manager.current_ip()
+                    # Use cached IP — zero extra network calls per visit
+                    attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
                     ok = True
                     break
                 except JobCancelled:
+                    proxy_pool.release(proxy_row["id"])
                     return
                 except Exception as e:
                     attempt_latency = int((time.time() - t0) * 1000)
                     attempt_err = str(e)[:120]
                     last_status = _classify_err(e)
                     status_code = 0
+                    # proxy-layer failure → mark proxy; target failure → keep proxy
+                    if _is_proxy_error(last_status):
+                        proxy_pool.mark_used_failure(
+                            proxy_row["id"],
+                            "AUTH_FAILED" if last_status == "AUTH_FAILED" else "TCP_FAILED",
+                            attempt_err)
+                    else:
+                        update_proxy_health(proxy_row["id"],
+                                            {"status": "TARGET_FAILED", "latency_ms": 0,
+                                             "exit_ip": "", "error": attempt_err})
+                        proxy_pool.release(proxy_row["id"])
+                    tried_ids.add(proxy_row["id"])
+                    # permanent target-level failures are not retried
                     if last_status == "DNS_FAILED":
-                        break  # permanent target failure — never retried
-                    if attempt < max_retries:
-                        # transport failure → check Tor health, recover, back off
-                        if not tor_manager.health_check():
-                            _emit(st, "🧅 Tor degraded — recovering…")
-                            tor_manager.recover()
-                        time.sleep(min(2 ** attempt, 8))  # bounded exponential backoff
-                        continue
+                        break
+                    # retry with a DIFFERENT fresh proxy — always, not just "safely"
+                    if attempt < max_attempts - 1:
+                        nxt = proxy_pool.select(count=1, exclude=tried_ids)
+                        if nxt:
+                            proxy_row = nxt[0]
+                            proxy_dict = {k: proxy_row[k] for k in
+                                          ("protocol", "host", "port", "username",
+                                           "password", "endpoint")}
+                            attempt_proxy_id = proxy_row["id"]
+                            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
+                            _emit(st, "Rotating to fresh proxy…")
+                            continue
                     break
             if ok:
                 attempt_status = "OK" if attempt == 0 else "OK_RETRY"
+                # Mark success WITHOUT verifying exit IP (no network call = fast)
+                proxy_pool.mark_used_success(proxy_row["id"], attempt_latency,
+                                             attempt_exit_ip)
             else:
                 attempt_status = last_status
         else:
@@ -2981,27 +2629,36 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                 attempt_status = _classify_err(e)
                 attempt_latency = int((time.time() - t0) * 1000)
 
-        # --- Tor mode: target blocked the exit IP (403/429/5xx) → NEWNYM & retry ---
+        # --- IP mode: target blocked the exit IP (403/429/5xx) → rotate & retry ---
         if ok and mode == "IP_ROTATION" and (
                 status_code in (403, 429) or 500 <= status_code < 600):
             for _ in range(3):
                 if cancel_event.is_set():
                     break
-                _emit(st, "🧅 Target blocked — rotating circuit…")
-                if not tor_manager.rotate_and_verify(cancel_event, force=True):
+                nxt = proxy_pool.select(count=1)
+                if not nxt:
                     break
+                nrow = nxt[0]
+                ndict = {k: nrow[k] for k in
+                         ("protocol", "host", "port", "username",
+                          "password", "endpoint")}
                 try:
-                    scraper = Scraper(proxy=tor_manager.proxy_dict(), session=_new_session())
+                    scraper = Scraper(proxy=ndict)
                     final_url, body, visited, status_code = scraper.fetch(
                         url, cancel_event=cancel_event)
-                    attempt_exit_ip = tor_manager.current_ip()
+                    proxy_pool.mark_used_success(
+                        nrow["id"], 0, nrow.get("last_observed_ip") or "")
                     if status_code < 400:
-                        _emit(st, "🧅 Rotated past target block…")
+                        attempt_proxy_id = nrow["id"]
+                        attempt_exit_ip = nrow.get("last_observed_ip") or ""
+                        _emit(st, "Rotated past target block…")
                         break
                 except JobCancelled:
+                    proxy_pool.release(nrow["id"])
                     return
                 except Exception:
-                    pass
+                    proxy_pool.mark_used_failure(nrow["id"], "TCP_FAILED",
+                                                 "block-rotate retry failed")
 
         # --- target-level permanent failures are NOT retried (404 etc.) ---
         if ok and status_code >= 400:
@@ -3009,23 +2666,83 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
             attempt_err = f"target returned HTTP {status_code}"
             ok = False
 
-        # --- extract numbers from this visit ---
+        # --- protection detection (runs on every fetched response) ---
+        prot = detect_protection(body or "", status_code, final_url)
+        prot_type = prot["type"]
+        tg_info = {"is_telegram": False, "username": "", "invite": "", "channel": ""}
+        layers_fired = []
         new_this_visit = 0
+
+        with st["lock"]:
+            st["protection"] = prot_type
+            st["prot_counts"][prot_type] = st["prot_counts"].get(prot_type, 0) + 1
+
+        if ok and not prot["bypassable"]:
+            log.warning("PROTECTION_BLOCK job=%s type=%s detail=%s",
+                        job_id, prot_type, prot["detail"])
+            with st["lock"]:
+                st["hard_block_streak"] += 1
+                if st["hard_block_streak"] >= 3:
+                    st["hard_blocked"] = True
+            # cloudflare_behavior setting: skip / retry_proxies / count_as_failed —
+            # all three stop extraction here; proxy rotation can't beat a JS challenge
+            ok = False
+            attempt_status = f"PROTECTION:{prot_type}"
+            attempt_err = prot["detail"][:120]
+        elif ok:
+            with st["lock"]:
+                st["hard_block_streak"] = 0
+
+        if ok and prot_type == "telegram_redirect" and \
+                get_setting("telegram_redirect_mode", "extract_only") == "skip":
+            ok = False
+            attempt_status = "TELEGRAM_SKIPPED"
+            attempt_err = "telegram redirect skipped by settings"
+
+        # --- 6-layer deep extraction pipeline ---
         if ok:
-            cycle_numbers = []
-            for n, m in extract_from_url_chain(visited):
-                cycle_numbers.append((n, m, visited[-1]))
-            for n, m in extract_numbers(body, final_url, default_method="html"):
-                cycle_numbers.append((n, m, final_url))
+            res = extract_deep(body, final_url, visited, cancel_event=cancel_event)
+            layers_fired = res["layers"]
+            tg_info = res["telegram"]
             with found_lock:
-                for n, m, src in cycle_numbers:
+                for n, m, src_url in res["numbers"]:
                     if n in found:
                         dup_count[0] += 1
                     else:
-                        found[n] = (m, src, visit)
+                        found[n] = (m, src_url, visit)
                         new_this_visit += 1
                         pending_numbers.append(
-                            (job_id, user_id, n, src, m, visit))
+                            (job_id, user_id, n, src_url, m, visit))
+            if tg_info.get("is_telegram"):
+                with st["lock"]:
+                    st["telegram_redirects"] += 1
+                    if tg_info.get("username"):
+                        st["telegram_username"] = tg_info["username"]
+                    if tg_info.get("invite"):
+                        st["telegram_invite"] = tg_info["invite"]
+                    if tg_info.get("channel"):
+                        st["telegram_channel"] = tg_info["channel"]
+                log.info("TELEGRAM_REDIRECT job=%s user=@%s invite=%s",
+                         job_id, tg_info.get("username") or "—",
+                         _mask(tg_info.get("invite") or "—"))
+                if (new_this_visit == 0 and tg_info.get("username")
+                        and get_setting("telegram_redirect_mode",
+                                        "extract_only") == "report_username"):
+                    uname = tg_info["username"]
+                    with found_lock:
+                        if uname not in found:
+                            found[uname] = ("TELEGRAM_ONLY", final_url, visit)
+                            new_this_visit += 1
+                            pending_numbers.append(
+                                (job_id, user_id, uname, final_url,
+                                 "TELEGRAM_ONLY", visit))
+                _emit(st, "📱 Telegram redirect — extracting from preview")
+                if attempt_status in ("OK", "OK_RETRY"):
+                    attempt_status = "TELEGRAM_REDIRECT"
+            elif prot_type in _PROTECTION_STAGES:
+                _emit(st, _PROTECTION_STAGES[prot_type])
+
+
 
         with st["lock"]:
             st["visit"] += 1
@@ -3044,7 +2761,11 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
 
         pending_attempts.append((job_id, visit, attempt_proxy_id, attempt_exit_ip,
                                  attempt_status, attempt_latency,
-                                 "" if ok else attempt_err))
+                                 "" if ok else attempt_err,
+                                 prot_type, final_url,
+                                 st.get("telegram_username", ""),
+                                 json.dumps(layers_fired)))
+
 
     # --- run visits in a bounded pool ---
     workers = min(max_workers, count)
@@ -3089,17 +2810,28 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
              "CANCELLED" if cancelled else ("SUCCESS" if status == "COMPLETED" else "FAILED"),
              job_id, unique_count, dup_count[0], duration_ms)
 
+    tg_meta = {
+        "username": st.get("telegram_username", ""),
+        "invite": st.get("telegram_invite", ""),
+        "channel": st.get("telegram_channel", ""),
+        "redirects": st.get("telegram_redirects", 0),
+        "protection": st.get("protection", "none"),
+        "prot_counts": dict(st.get("prot_counts", {})),
+    }
     _send_final_result(chat_id, user_id, username, job_id, url, mode, count,
                        st["successful"], st["failed"], unique_count, dup_count[0],
-                       duration_ms, found, cancelled)
+                       duration_ms, found, cancelled, tg_meta)
+
 
     # channel publishing AFTER the user-facing result — async, non-blocking
     threading.Thread(
         target=_channel_post_safe,
         args=(job_id, user_id, username, url, mode, count, st["successful"],
-              st["failed"], unique_count, dup_count[0], duration_ms, found),
+              st["failed"], unique_count, dup_count[0], duration_ms, found,
+              tg_meta),
         daemon=True,
     ).start()
+
 
 
 # =========================================================
@@ -3184,7 +2916,6 @@ def friendly_error(status: str) -> str:
         "HTTP_404": "🔎 Target returned 404 (not found)",
         "HTTP_429": "⏳ Target rate-limited (429)",
         "NO_PROXY": "🌐 No verified proxy available",
-        "TOR_UNAVAILABLE": "🧅 Tor engine unavailable",
         "TARGET_FAILED": "🎯 Target request failed",
     }.get(status, "❌ Request failed")
 
@@ -3275,43 +3006,70 @@ def _numbers_txt_content(job_id, username, user_id, url, mode, count,
 
 
 def _send_final_result(chat_id, user_id, username, job_id, url, mode, count,
-                       success, failed, unique, dup, dur_ms, found, cancelled):
+                       success, failed, unique, dup, dur_ms, found, cancelled,
+                       tg_meta=None):
+    tg_meta = tg_meta or {}
     host = urllib.parse.urlparse(url).hostname or url
-    mode_label = "🌐 IP Rotation" if mode == "IP_ROTATION" else "🟢 Direct"
+    mode_label = "🌐 IP ROTATION" if mode == "IP_ROTATION" else "🟢 DIRECT"
     elapsed_s = max(dur_ms / 1000, 0.1)
     done_visits = success + failed
     speed = done_visits / elapsed_s
+    phones = sorted(n for n in found if found[n][0] != "TELEGRAM_ONLY")
+    tg_users = sorted(n for n in found if found[n][0] == "TELEGRAM_ONLY")
+    tg_user = tg_meta.get("username") or (tg_users[0] if tg_users else "")
+    prot = tg_meta.get("protection", "none")
+    date_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
 
-    if cancelled:
-        text = (
-            f"🛑 *EXTRACTION CANCELLED*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🆔 Job `#{job_id:06d}`\n"
-            f"🔗 Source: `{host}`\n\n"
-            f"🔄 Completed Visits: `{done_visits}/{count}`\n"
-            f"✅ Successful: `{success}`\n"
-            f"❌ Failed: `{failed}`\n"
-            f"📱 Numbers Found: `{unique}`\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
+    rows = ["╔══════════════════════════════╗"]
+    rows.append("║  🛑 EXTRACTION CANCELLED  │  v3" if cancelled
+                else "║  📊 EXTRACTION COMPLETE  │  v3")
+    rows.append("╠══════════════════════════════╣")
+    rows.append(f"║  JOB #{job_id:06d}  │  {date_str}")
+    rows.append("╠══════════════════════════════╣")
+    rows.append(f"║  Source: {host[:24]}")
+    rows.append(f"║  Mode: {mode_label}")
+    rows.append("╠══════════════════════════════╣")
+    if unique > 0:
+        rows.append(f"║  📞 {unique} Result(s) Found")
+        for n in phones[:8]:
+            rows.append(f"║  +{n}")
+        for uname in tg_users[:3]:
+            rows.append(f"║  📱 @{uname}")
+        if len(phones) > 8:
+            rows.append(f"║  … +{len(phones) - 8} more in file")
     else:
-        text = (
-            f"{'✅' if success > 0 else '❌'} *EXTRACTION {'COMPLETED' if success > 0 else 'FAILED'}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🆔 Job `#{job_id:06d}`\n"
-            f"🔗 Source: `{host}`\n\n"
-            f"⚙️ Mode:\n{mode_label}\n\n"
-            f"🔄 Visits: `{done_visits}/{count}`\n"
-            f"✅ Successful: `{success}`\n"
-            f"❌ Failed: `{failed}`\n\n"
-            f"📱 Unique: `{unique}`\n"
-            f"♻️ Duplicate: `{dup}`\n\n"
-            f"⚡ Speed: `{speed:.2f} visits/s`\n"
-            f"⏱ Duration: `{_fmt_duration(dur_ms)}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        if unique == 0 and success > 0:
-            text += "\n🔎 _No numbers found on this target._"
+        rows.append("║  📞 No numbers found")
+    if tg_user or tg_meta.get("invite") or tg_meta.get("channel"):
+        rows.append("╠══════════════════════════════╣")
+        rows.append("║  📱 Telegram Redirect Detected")
+        if tg_meta.get("channel"):
+            rows.append(f"║  → {tg_meta['channel'][:26]}")
+        if tg_user:
+            rows.append(f"║  → @{tg_user}")
+        if tg_meta.get("invite"):
+            rows.append(f"║  → {tg_meta['invite'][:26]}")
+    if prot not in ("none", "telegram_redirect"):
+        rows.append("╠══════════════════════════════╣")
+        rows.append(f"║  🛡 Protection: {prot}")
+    rows.append("╠══════════════════════════════╣")
+    rows.append(f"║  ✅ {success} success  │  ❌ {failed} failed")
+    rows.append(f"║  ⚡ {speed:.1f} vis/s  │  🕐 {_fmt_duration(dur_ms)}")
+    rows.append("╚══════════════════════════════╝")
+    text = "```\n" + "\n".join(rows) + "\n```"
+
+    # context-aware guidance (never a bare "0 numbers" message)
+    if cancelled:
+        text += "\n🛑 _Job cancelled — partial results above._"
+    elif unique == 0 and tg_user:
+        text += (f"\n📱 *No WhatsApp number found.* This link redirects to Telegram:\n"
+                 f"@{tg_user} — check the channel for contact info.")
+    elif prot.startswith("cloudflare"):
+        text += ("\n🛡 *Protected by Cloudflare JS.* A browser engine is required "
+                 "to bypass this. IP rotation cannot help.")
+    elif unique == 0 and success > 0:
+        text += (f"\n📭 *No numbers found after {done_visits} visits.* The page may "
+                 "require JavaScript rendering or login. Try IP Rotation mode if "
+                 "you used Direct mode.")
 
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.add(
@@ -3321,16 +3079,15 @@ def _send_final_result(chat_id, user_id, username, job_id, url, mode, count,
     safe_send_message(chat_id, text, reply_markup=mk)
 
     if unique > 0:
-        sorted_nums = sorted(found.keys())
         # copy buttons (real clipboard copy via CopyTextButton, ≤256 chars each)
-        copy_mk = _copy_markup(sorted_nums)
+        copy_mk = _copy_markup(phones if phones else sorted(found.keys()))
         if copy_mk:
             safe_send_message(chat_id,
                               f"📋 *Copy Numbers — Job #{job_id:06d}*",
                               reply_markup=copy_mk)
         # inline number display (chunked, message-limit safe)
         if unique <= 60:
-            lines = [f"+{n}" for n in sorted_nums]
+            lines = [f"+{n}" for n in phones] + [f"📱 @{u}" for u in tg_users]
             chunks, cur = [], ""
             for ln in lines:
                 if len(cur) + len(ln) + 1 > 3800:
@@ -3358,7 +3115,7 @@ def _send_final_result(chat_id, user_id, username, job_id, url, mode, count,
             safe_send_document(
                 chat_id, content, f"job_{job_id:06d}_numbers.txt",
                 caption=(f"📁 *Numbers File — Job #{job_id:06d}*\n"
-                         f"📱 `{unique}` unique numbers"))
+                         f"📱 `{unique}` unique results"))
         except Exception as e:
             log.warning("FILE_SEND_FAILED job=%s err=%s", job_id, e)
 
@@ -3367,10 +3124,10 @@ def _send_final_result(chat_id, user_id, username, job_id, url, mode, count,
 
 
 def _channel_post_safe(job_id, user_id, username, url, mode, count, success,
-                       failed, unique, dup, dur_ms, found):
+                       failed, unique, dup, dur_ms, found, tg_meta=None):
     try:
         _channel_post(job_id, user_id, username, url, mode, count, success,
-                      failed, unique, dup, dur_ms, found)
+                      failed, unique, dup, dur_ms, found, tg_meta)
     except Exception as e:
         log.warning("CHANNEL_POST_FAILED job=%s err=%s", job_id, _mask(str(e)[:150]))
 
@@ -3387,7 +3144,7 @@ def _classify_channel_error(err: str) -> str:
 
 
 def _channel_post(job_id, user_id, username, url, mode, count, success,
-                  failed, unique, dup, dur_ms, found):
+                  failed, unique, dup, dur_ms, found, tg_meta=None):
     cfg = get_settings_batch([
         "channel_logging", "channel_username", "channel_include_username",
         "channel_include_uid", "channel_include_method", "channel_include_numbers",
@@ -3433,6 +3190,24 @@ def _channel_post(job_id, user_id, username, url, mode, count, success,
         ips = [a["exit_ip"] for a in attempts if a.get("exit_ip")]
         if ips:
             lines.append(f"🧭 Exit IPs: `{len(set(ips))}` unique")
+
+    # v3 — telegram destination section
+    tg_meta = tg_meta or {}
+    if tg_meta.get("username") or tg_meta.get("invite"):
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("📱 TELEGRAM DESTINATION")
+        if tg_meta.get("channel"):
+            lines.append(f"Channel: {tg_meta['channel']}")
+        if tg_meta.get("username"):
+            lines.append(f"Username: @{tg_meta['username']}")
+        if tg_meta.get("invite"):
+            lines.append(f"Invite: {tg_meta['invite']}")
+    prot_counts = tg_meta.get("prot_counts") or {}
+    bad_prot = {k: v for k, v in prot_counts.items()
+                if k not in ("none", "telegram_redirect")}
+    if bad_prot:
+        lines.append("🛡 Protection seen: " +
+                     ", ".join(f"{k}×{v}" for k, v in bad_prot.items()))
 
     # numbers section — small lists inline, large lists summarized
     sorted_nums = sorted(found.keys())
@@ -3617,15 +3392,17 @@ def _cancel_job_markup() -> types.InlineKeyboardMarkup:
 # =========================================================
 def main_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     mk = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    mk.add(
+    mk.row(
         types.KeyboardButton("🔗 Extract Numbers"),
         types.KeyboardButton("📊 My Statistics"),
+    )
+    mk.row(
         types.KeyboardButton("📋 My History"),
         types.KeyboardButton("❓ Help"),
-        types.KeyboardButton("📞 Support"),
     )
+    mk.row(types.KeyboardButton("📞 Support"))
     if is_admin(user_id):
-        mk.add(types.KeyboardButton("🔐 Admin Panel"))
+        mk.row(types.KeyboardButton("🔐 Admin Panel"))
     return mk
 
 
@@ -3738,17 +3515,6 @@ def validate_url(text: str) -> Optional[str]:
     if host != "localhost" and "." not in host and not re.match(
             r"^\d{1,3}(\.\d{1,3}){3}$", host):
         return None
-    # SSRF hardening: never fetch loopback / private / reserved targets.
-    # (The old regex explicitly ACCEPTED localhost and any IP literal.)
-    if host.lower() == "localhost" or host.lower().endswith(".local"):
-        return None
-    try:
-        _ip = ipaddress.ip_address(host)
-        if (_ip.is_private or _ip.is_loopback or _ip.is_reserved
-                or _ip.is_link_local or _ip.is_multicast):
-            return None
-    except ValueError:
-        pass  # DNS hostname, not an IP literal
     if p.port is not None and not (1 <= p.port <= 65535):
         return None
     return t
@@ -3911,6 +3677,19 @@ def _show_admin_panel(chat_id):
     )
 
 
+@bot.message_handler(commands=["job"])
+def cmd_job(message: types.Message):
+    if not is_admin(message.from_user.id):
+        safe_send_message(message.chat.id, "❌ *Access Denied.*")
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("#").isdigit():
+        safe_send_message(message.chat.id, "Usage: `/job 123`")
+        return
+    _show_job_detail(message.chat.id, int(parts[1].lstrip("#")),
+                     viewer_id=message.from_user.id, admin_view=True)
+
+
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(message: types.Message):
     uid = message.from_user.id
@@ -3933,11 +3712,6 @@ def _start_job(chat_id, user, url, mode, visits):
     if not msg:
         safe_send_message(chat_id, "⚠️ Could not start the job. Please try again.")
         return
-    with _state_lock:
-        # Reserve the user's job slot BEFORE the worker thread starts so a fast
-        # double-tap can't launch a second job; the worker replaces this
-        # placeholder (-1) with the real job_id atomically on startup.
-        active_jobs[user.id] = -1
     threading.Thread(
         target=extraction_worker,
         args=(chat_id, user.id, user.username, url, visits, mode, msg.message_id),
@@ -4264,17 +4038,9 @@ def on_callback(c: types.CallbackQuery):
     chat_id = c.message.chat.id
     msg_id = c.message.message_id
 
-    # Access control — SAME policy as the message gate: restriction is active
-    # when Allow-All is OFF *or* the allowed-users list is non-empty (the old
-    # gate only checked Allow-All, so granted-list mode leaked every callback).
+    # Access control — "Allow All" OFF locks callbacks too
     if not is_admin(u.id):
-        cu = get_user(u.id)
-        if cu and (cu["blocked"] or cu["status"] != "APPROVED"):
-            safe_answer_callback(c.id, "🚫 Access blocked.", show_alert=True)
-            return
-        allow_all = get_setting("allow_all", "1") == "1"
-        restricted = (not allow_all) or bool(list_allowed_users(limit=1))
-        if restricted and not is_allowed_user(u.id):
+        if get_setting("allow_all", "1") != "1" and not is_allowed_user(u.id):
             safe_answer_callback(c.id, "🚫 Access restricted by admin.",
                                  show_alert=True)
             return
@@ -4651,6 +4417,11 @@ def on_callback(c: types.CallbackQuery):
             return
 
         # ---------- settings toggles ----------
+        if data.startswith("set_cycle_"):
+            _handle_setting_cycle(chat_id, u.id, data[len("set_cycle_"):])
+            safe_answer_callback(c.id)
+            return
+
         if data.startswith("set_toggle_"):
             key = data[len("set_toggle_"):]
             _handle_setting_toggle(chat_id, u.id, key)
@@ -4752,7 +4523,12 @@ _SETTING_INPUTS = {
     "support_username": {"label": "Support username (without @)",
                          "type": "text"},
     "admin_display_name": {"label": "Admin display name", "type": "text"},
+    "number_min_len": {"label": "Min number length", "type": "int",
+                       "min": 6, "max": 15},
+    "number_max_len": {"label": "Max number length", "type": "int",
+                       "min": 6, "max": 16},
 }
+
 
 
 # =========================================================
@@ -4762,24 +4538,37 @@ def _show_admin_dashboard(chat_id):
     d = admin_dashboard_stats()
     running = sum(1 for st in job_state.values() if not st["done"])
     pc = proxy_counts()
-    safe_send_message(
-        chat_id,
-        (f"📊 *BOT DASHBOARD*\n"
-         f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"👥 Users: `{d['total_users']}`\n"
-         f"🟢 Active Today: `{d['active_today']}`\n\n"
-         f"🔄 Total Jobs: `{d['total_jobs']}`\n"
-         f"✅ Successful: `{d['successful_jobs']}`\n"
-         f"❌ Failed: `{d['failed_jobs']}`\n\n"
-         f"📱 Numbers Found: `{d['total_numbers']}`\n"
-         f"📅 Today: `{d['numbers_today']}`\n\n"
-         f"⚡ Running Jobs: `{running}`\n"
-         f"📅 Jobs Today: `{d['jobs_today']}`\n\n"
-         f"🌐 Proxies — 🟢 `{pc['fast'] + pc['working']}` "
-         f"🟡 `{pc['slow']}` 🔴 `{pc['dead']}` ⚪ `{pc['untested']}`\n\n"
-         f"⏱ Avg Job Time: `{_fmt_duration(int(d['avg_duration']))}`\n"
-         f"━━━━━━━━━━━━━━━━━━━━"),
-        reply_markup=admin_keyboard())
+    rows = [
+        "╔══════════════════════════════╗",
+        "║  📊 ADMIN DASHBOARD  │  v3",
+        "╠══════════════════════════════╣",
+        "║  OVERVIEW",
+        f"║  👥 Users        {d['total_users']}",
+        f"║  🔄 Total Jobs   {d['total_jobs']}",
+        f"║  ✅ Completed    {d['successful_jobs']}",
+        f"║  ❌ Failed       {d['failed_jobs']}",
+        f"║  📱 Numbers      {d['total_numbers']}",
+        "╠══════════════════════════════╣",
+        "║  TODAY",
+        f"║  🟢 Active       {d['active_today']}",
+        f"║  📅 Jobs         {d['jobs_today']}",
+        f"║  📱 Numbers      {d['numbers_today']}",
+        f"║  ⚡ Running      {running}",
+        "╠══════════════════════════════╣",
+        "║  PROXY POOL",
+        f"║  🟢 Good         {pc['fast'] + pc['working']}",
+        f"║  🟡 Slow         {pc['slow']}",
+        f"║  🔴 Dead         {pc['dead']}",
+        f"║  ⚪ Untested     {pc['untested']}",
+        f"║  🎯 Success      {pc['success_rate']}%",
+        "╠══════════════════════════════╣",
+        "║  SYSTEM HEALTH",
+        f"║  ⏱ Avg Job      {_fmt_duration(int(d['avg_duration']))}",
+        f"║  🛠 Maintenance {'ON' if MAINTENANCE_MODE else 'OFF'}",
+        "╚══════════════════════════════╝",
+    ]
+    safe_send_message(chat_id, "```\n" + "\n".join(rows) + "\n```",
+                      reply_markup=admin_keyboard())
 
 
 def _show_admin_users(chat_id, page=0):
@@ -4957,25 +4746,52 @@ def _show_job_detail(chat_id, job_id, viewer_id=None, admin_view=False):
         "━━━━━━━━━━━━━━━━━━━━",
     ]
     if admin_view:
-        attempts = job_attempts(job_id, limit=20)
+        attempts = job_attempts(job_id, limit=200)
         if attempts:
-            lines.append("🔄 Attempts:")
+            prot_agg = {}
+            tg_count = 0
+            cf_count = 0
+            for a in attempts:
+                p = a.get("protection_type") or "?"
+                prot_agg[p] = prot_agg.get(p, 0) + 1
+                if p == "telegram_redirect":
+                    tg_count += 1
+                if p.startswith("cloudflare"):
+                    cf_count += 1
+            lines.append("🛡 *Protection summary:*")
+            for k, v in sorted(prot_agg.items(), key=lambda kv: -kv[1]):
+                lines.append(f"  `{k}` × {v}")
+            lines.append(f"📱 Telegram redirects: `{tg_count}`  ·  "
+                         f"CF blocks: `{cf_count}`")
+            lines.append("━━━━━━━━━━━━━━━━━━━━")
+            lines.append("🔄 *Attempts:*")
             for a in attempts[:15]:
                 pid = f"#{a['proxy_id']}" if a["proxy_id"] else "direct"
                 ip = a["exit_ip"] or "—"
+                pt = a.get("protection_type") or "—"
+                lyr = a.get("extraction_layers") or "[]"
                 lines.append(f"  v{a['cycle']}: {pid} ip=`{ip}` "
-                             f"{a['request_status']} {a['latency_ms']}ms")
+                             f"{a['request_status']} {a['latency_ms']}ms "
+                             f"🛡`{pt}` layers=`{lyr}`")
+                if a.get("final_url"):
+                    lines.append(f"      → `{a['final_url'][:70]}`")
+                if a.get("telegram_username"):
+                    lines.append(f"      📱 @{a['telegram_username']}")
             lines.append("━━━━━━━━━━━━━━━━━━━━")
     nums = job_numbers(job_id, limit=30)
     if nums:
         lines.append("📱 Numbers:")
         for n in nums[:20]:
-            lines.append(f"+{n['number']} ({n['extraction_method']}, v{n['visit_number']})")
+            if n["extraction_method"] == "TELEGRAM_ONLY":
+                lines.append(f"📱 @{n['number']} (telegram, v{n['visit_number']})")
+            else:
+                lines.append(f"+{n['number']} ({n['extraction_method']}, v{n['visit_number']})")
         if j["unique_numbers"] > 20:
             lines.append(f"_…and {j['unique_numbers'] - 20} more_")
     mk = types.InlineKeyboardMarkup(row_width=2)
     if j["unique_numbers"] > 0:
-        sorted_nums = sorted(n["number"] for n in job_numbers(job_id, limit=500))
+        sorted_nums = sorted(n["number"] for n in job_numbers(job_id, limit=500)
+                             if n["extraction_method"] != "TELEGRAM_ONLY")
         copy_mk = _copy_markup(sorted_nums, max_buttons=4)
         if copy_mk:
             for row in copy_mk.keyboard:
@@ -5092,22 +4908,16 @@ def _handle_proxy_add(chat_id, admin_id, text):
     audit_log(admin_id, "PROXY_ADDED", str(pid), text)
     clear_user_state(admin_id)
     safe_send_message(chat_id, f"✅ Proxy `#{pid}` added. Testing…")
-
-    def _bg_test():
-        # TCP + HTTP verification can take 10–20s — never block a telebot
-        # handler thread on it
-        res = test_proxy(p)
-        update_proxy_health(pid, res)
-        safe_send_message(
-            chat_id,
-            (f"🧪 *Test result — Proxy #{pid}*\n"
-             f"━━━━━━━━━━━━━━━━━━━━\n"
-             f"Status: `{res['status']}`\n"
-             f"Latency: `{res['latency_ms']}ms`\n"
-             f"Exit IP: `{res['exit_ip'] or '—'}`"),
-            reply_markup=proxy_center_keyboard())
-
-    threading.Thread(target=_bg_test, daemon=True).start()
+    res = test_proxy(p)
+    update_proxy_health(pid, res)
+    safe_send_message(
+        chat_id,
+        (f"🧪 *Test result — Proxy #{pid}*\n"
+         f"━━━━━━━━━━━━━━━━━━━━\n"
+         f"Status: `{res['status']}`\n"
+         f"Latency: `{res['latency_ms']}ms`\n"
+         f"Exit IP: `{res['exit_ip'] or '—'}`"),
+        reply_markup=proxy_center_keyboard())
 
 
 def _handle_proxy_bulk(chat_id, admin_id, text):
@@ -5151,8 +4961,8 @@ def _show_proxy_sources(chat_id, edit_msg=False):
         v = cfg[f"proxy_source_{i}"]
         lines.append(f"Source {i}: `{_mask(v)[:45] if v else '— not set —'}`")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("Sources must return a plain-text proxy list (or a provider API "
-                 "configured with the `PROXY_PROVIDER_TOKEN` env var).")
+    lines.append("_Sources must return a plain-text proxy list (or a provider API "
+                 "configured with PROXY\\_PROVIDER\\_TOKEN env var)._")
     mk = types.InlineKeyboardMarkup(row_width=3)
     mk.add(*[types.InlineKeyboardButton(f"🔌 Source {i}", callback_data=f"pxsrc_{i}")
              for i in (1, 2, 3)])
@@ -5187,7 +4997,6 @@ def _proxy_test_worker(chat_id, admin_id, scope, cancel_ev):
          f"━━━━━━━━━━━━━━━━━━━━\n`0%`"),
         reply_markup=mk)
     if not msg:
-        proxy_test_jobs.pop(admin_id, None)  # don't leave a phantom running entry
         return
     last_edit = [0.0]
 
@@ -5268,7 +5077,6 @@ def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev):
          "Fetching from configured sources…"),
         reply_markup=mk)
     if not msg:
-        proxy_fetch_jobs.pop(admin_id, None)  # don't leave a phantom running entry
         return
 
     sources = configured_proxy_sources()
@@ -5468,6 +5276,10 @@ def _show_bot_settings(chat_id):
         "proxy_retest_interval", "proxy_retest_batch",
         "latency_fast_max", "latency_working_max", "latency_slow_max",
         "support_username", "admin_display_name",
+        "ex_layer_url_chain", "ex_layer_raw_html", "ex_layer_meta",
+        "ex_layer_js_vars", "ex_layer_encoded", "ex_layer_telegram",
+        "false_positive_filter", "telegram_redirect_mode", "cloudflare_behavior",
+        "number_min_len", "number_max_len",
     ])
     def yn(v): return "✅ ON" if v == "1" else "❌ OFF"
     text = (
@@ -5486,6 +5298,18 @@ def _show_bot_settings(chat_id):
         f"{cfg['latency_working_max']}/{cfg['latency_slow_max']} ms`\n"
         f"Support: @{cfg['support_username'] or '—'}\n"
         f"Admin display: {cfg['admin_display_name']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"*🧬 Deep Extraction Layers*\n"
+        f"URL chain: {yn(cfg['ex_layer_url_chain'])}  ·  "
+        f"Raw HTML: {yn(cfg['ex_layer_raw_html'])}\n"
+        f"OG/Meta: {yn(cfg['ex_layer_meta'])}  ·  "
+        f"JS vars: {yn(cfg['ex_layer_js_vars'])}\n"
+        f"Encoded: {yn(cfg['ex_layer_encoded'])}  ·  "
+        f"Telegram: {yn(cfg['ex_layer_telegram'])}\n"
+        f"FP filter: {yn(cfg['false_positive_filter'])}\n"
+        f"Telegram mode: `{cfg['telegram_redirect_mode']}`\n"
+        f"Cloudflare: `{cfg['cloudflare_behavior']}`\n"
+        f"Number length: `{cfg['number_min_len']}–{cfg['number_max_len']}`\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
     mk = types.InlineKeyboardMarkup(row_width=2)
@@ -5518,6 +5342,37 @@ def _show_bot_settings(chat_id):
                                    callback_data="set_value_support_username"),
         types.InlineKeyboardButton("✏️ Display Name",
                                    callback_data="set_value_admin_display_name"),
+        types.InlineKeyboardButton(
+            f"L1 URL Chain: {yn(cfg['ex_layer_url_chain'])}",
+            callback_data="set_toggle_ex_layer_url_chain"),
+        types.InlineKeyboardButton(
+            f"L2 Raw HTML: {yn(cfg['ex_layer_raw_html'])}",
+            callback_data="set_toggle_ex_layer_raw_html"),
+        types.InlineKeyboardButton(
+            f"L3 OG/Meta: {yn(cfg['ex_layer_meta'])}",
+            callback_data="set_toggle_ex_layer_meta"),
+        types.InlineKeyboardButton(
+            f"L4 JS Vars: {yn(cfg['ex_layer_js_vars'])}",
+            callback_data="set_toggle_ex_layer_js_vars"),
+        types.InlineKeyboardButton(
+            f"L5 Encoded: {yn(cfg['ex_layer_encoded'])}",
+            callback_data="set_toggle_ex_layer_encoded"),
+        types.InlineKeyboardButton(
+            f"L6 Telegram: {yn(cfg['ex_layer_telegram'])}",
+            callback_data="set_toggle_ex_layer_telegram"),
+        types.InlineKeyboardButton(
+            f"FP Filter: {yn(cfg['false_positive_filter'])}",
+            callback_data="set_toggle_false_positive_filter"),
+        types.InlineKeyboardButton(
+            f"📱 TG Mode: {cfg['telegram_redirect_mode']}",
+            callback_data="set_cycle_telegram_redirect_mode"),
+        types.InlineKeyboardButton(
+            f"🛡 CF: {cfg['cloudflare_behavior']}",
+            callback_data="set_cycle_cloudflare_behavior"),
+        types.InlineKeyboardButton("📏 Min Num Len",
+                                   callback_data="set_value_number_min_len"),
+        types.InlineKeyboardButton("📏 Max Num Len",
+                                   callback_data="set_value_number_max_len"),
         types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"),
     )
     safe_send_message(chat_id, text, reply_markup=mk)
@@ -5533,6 +5388,23 @@ def _toggle_maintenance(chat_id, admin_id):
     safe_send_message(chat_id,
                       f"🛠 Maintenance: `{'ON' if new == '1' else 'OFF'}`",
                       reply_markup=admin_keyboard())
+
+
+_SETTING_CYCLES = {
+    "telegram_redirect_mode": ["extract_only", "report_username", "skip"],
+    "cloudflare_behavior": ["skip", "retry_proxies", "count_as_failed"],
+}
+
+
+def _handle_setting_cycle(chat_id, admin_id, key):
+    opts = _SETTING_CYCLES.get(key)
+    if not opts:
+        return
+    cur = get_setting(key, opts[0])
+    nxt = opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else opts[0]
+    set_setting(key, nxt)
+    audit_log(admin_id, "SETTING_CYCLE", f"{key}={nxt}")
+    _show_bot_settings(chat_id)
 
 
 def _handle_setting_toggle(chat_id, admin_id, key):
@@ -5562,7 +5434,7 @@ def _show_admins(chat_id):
         lines.append(f"{r['role']} @{r['username'] or '—'} (`{r['user_id']}`)")
     lines.append(f"OWNER (env) admins: {', '.join(str(a) for a in ADMIN_IDS) or '—'}")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("Add admins via the `ADMIN_IDS` env var.")
+    lines.append("_Add admins via ADMIN\\_IDS env var._")
     safe_send_message(chat_id, "\n".join(lines), reply_markup=admin_keyboard())
 
 
@@ -5810,8 +5682,6 @@ def startup_self_check():
     except Exception as e:
         checks.append(f"❌ Proxy Manager: {e}")
     checks.append(f"{'✅' if _SOCKS_OK else '❌'} SOCKS5 support")
-    checks.append(f"{'✅' if _STEM_OK else '❌'} Tor control (stem)")
-    checks.append(f"🧅 Tor binary: {tor_manager.exe_path() or 'auto-installs on first IP Rotation job'}")
     ch = get_setting("channel_username", DEFAULT_CHANNEL)
     checks.append(f"📡 Channel: {ch or 'not configured'}")
     srcs = configured_proxy_sources()
@@ -5827,7 +5697,6 @@ def startup_self_check():
 
 
 def main():
-    atexit.register(tor_manager.shutdown)  # clean Tor shutdown on exit
     checks = startup_self_check()
     if not any("Telegram API: @" in c for c in checks):
         sys.stderr.write("FATAL: Telegram API unreachable at startup. "
